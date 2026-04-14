@@ -877,7 +877,6 @@ class DeleteUPCResponse(BaseModel):
     sku: str
     upc: str
     error: Optional[str] = None
-    sellercloud_warning: Optional[str] = None
 
 
 # ============================================================================

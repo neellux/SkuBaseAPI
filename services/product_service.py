@@ -192,15 +192,16 @@ class ProductService:
                             f"Source alias delete for {upc} from {child_sku} non-fatal: {src_del_err}"
                         )
 
-                    await conn.execute_query(
-                        "DELETE FROM child_upcs WHERE upc = $1", [upc]
-                    )
-
                     if not is_placeholder:
                         await sellercloud_internal_service.sync_add_alias(
                             target_child_sku, upc, is_primary=False
                         )
 
+                    # DB swap only after SC ops succeed — prevents losing the row
+                    # if the target add fails after the source delete
+                    await conn.execute_query(
+                        "DELETE FROM child_upcs WHERE upc = $1", [upc]
+                    )
                     await conn.execute_query(
                         "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)",
                         [upc, target_child_sku],
@@ -223,15 +224,15 @@ class ProductService:
                             f"Source keyword delete for {keyword} from {child_sku} non-fatal: {src_del_err}"
                         )
 
-                    await conn.execute_query(
-                        "UPDATE child_products SET keywords = array_remove(keywords, $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
-                        [keyword, child_sku],
-                    )
-
                     await sellercloud_internal_service.sync_add_alias(
                         target_child_sku, keyword, is_primary=False
                     )
 
+                    # DB swap only after SC ops succeed
+                    await conn.execute_query(
+                        "UPDATE child_products SET keywords = array_remove(keywords, $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
+                        [keyword, child_sku],
+                    )
                     await conn.execute_query(
                         "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
                         [keyword, target_child_sku],
@@ -2099,6 +2100,14 @@ class ProductService:
         try:
             conn = await ProductService._get_connection()
 
+            # Verify the UPC actually exists for this SKU before touching SellerCloud
+            exists = await conn.execute_query_dict(
+                "SELECT 1 FROM child_upcs WHERE child_sku = $1 AND upc = $2",
+                [sku, upc],
+            )
+            if not exists:
+                return {"success": False, "error": f"UPC '{upc}' not found for SKU '{sku}'"}
+
             # Fetch the current primary so we know what to demote in SellerCloud
             current_primary_rows = await conn.execute_query_dict(
                 "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE",
@@ -2168,25 +2177,25 @@ class ProductService:
             if upc_check[0]["is_primary_upc"]:
                 return {"success": False, "error": "Cannot delete primary UPC. Set a different primary first."}
 
-            await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [upc])
-
-            response: Dict[str, Any] = {"success": True, "sku": sku, "upc": upc}
+            # Sync to SellerCloud first — leave DB untouched on failure so the UI can retry
             try:
                 await sellercloud_internal_service.sync_delete_alias(sku, upc)
             except SellercloudPermanentError as e:
-                logger.warning(
-                    f"Permanent SellerCloud failure deleting {upc} from {sku}: {e}"
-                )
-                response["sellercloud_warning"] = str(e)
+                logger.info(f"Permanent SellerCloud failure deleting {upc} from {sku}: {e}")
+                return {"success": False, "error": str(e)}
             except Exception as e:
                 logger.error(
                     f"Transient SellerCloud failure deleting {upc} from {sku}: {e}",
                     exc_info=True,
                 )
-                response["sellercloud_warning"] = (
-                    "Removed locally but SellerCloud sync failed — will need manual cleanup."
-                )
-            return response
+                return {
+                    "success": False,
+                    "error": "SellerCloud is temporarily unavailable. Please try again.",
+                }
+
+            await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [upc])
+
+            return {"success": True, "sku": sku, "upc": upc}
 
         except Exception as e:
             logger.error(f"Error deleting UPC {upc} from {sku}: {e}")
