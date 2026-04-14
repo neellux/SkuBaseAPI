@@ -1,0 +1,348 @@
+name: Deploy API to Dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to deploy (e.g., develop, feature/xyz)"
+        required: true
+        default: "develop"
+        type: string
+      version:
+        description: "Version to deploy"
+        required: false
+        default: "latest"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      APP_DIR: ${{ vars.APP_DIR }}
+      APP_PORT: ${{ vars.APP_PORT }}
+      SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+      PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
+      PYTHON_VERSION_SHORT: ""
+    steps:
+      - uses: actions/checkout@v4.1.7
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Set PYTHON_VERSION_SHORT
+        run: |
+          echo "PYTHON_VERSION_SHORT=$(echo "${{ vars.PYTHON_VERSION }}" | cut -d. -f1,2 | tr '.' '_')" >> $GITHUB_ENV
+
+      - name: Create systemd service file
+        run: |
+          cat > ${{ env.SERVICE_NAME }}.service << EOF
+          [Unit]
+          Description=FastAPI Dev Application
+          After=network.target
+          [Service]
+          User=${{ secrets.PROD_SERVER_USER }}
+          WorkingDirectory=${{ vars.APP_DIR }}
+          ExecStart=${{ vars.APP_DIR }}/venv_${{ env.PYTHON_VERSION_SHORT }}/bin/uvicorn app:app --host 0.0.0.0 --port ${{ vars.APP_PORT }}
+          Restart=on-failure
+          RestartSec=30
+          TimeoutStartSec=60
+          TimeoutStopSec=60
+          StartLimitInterval=30
+          StartLimitBurst=3
+          StandardOutput=append:${{ vars.APP_DIR }}/app.log
+          StandardError=append:${{ vars.APP_DIR }}/app.log
+          Environment=LD_LIBRARY_PATH=/usr/local/lib
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+      - name: Setup App Directory
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          CONFIG: ${{ secrets.CONFIG }}
+          SELLERCLOUD_USER: ${{ vars.SELLERCLOUD_USER }}
+          SELLERCLOUD_PASS: ${{ secrets.SELLERCLOUD_PASS }}
+          SELLERCLOUD_API_ENDPOINT: ${{ vars.SELLERCLOUD_API_ENDPOINT }}
+          SELLERCLOUD_INTERNAL_API_ENDPOINT: ${{ vars.SELLERCLOUD_INTERNAL_API_ENDPOINT }}
+          SERVICE_ACCOUNT: ${{ secrets.SERVICE_ACCOUNT }}
+        with:
+          host: ${{ vars.PROD_SERVER_IP }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          password: ${{ secrets.PROD_SERVER_PASS }}
+          port: 22
+          envs: CONFIG,SELLERCLOUD_USER,SELLERCLOUD_PASS,SELLERCLOUD_API_ENDPOINT,SELLERCLOUD_INTERNAL_API_ENDPOINT,SERVICE_ACCOUNT
+          script: |
+            mkdir -p ${{ vars.APP_DIR }}
+            cd ${{ vars.APP_DIR }}
+            find . -mindepth 1 ! -name '*.log' ! -path './venv_*' -exec rm -rf {} +
+
+            if [ -n "$CONFIG" ]; then
+              echo "$CONFIG" | base64 --decode > config.toml
+
+              if [ -n "$SELLERCLOUD_USER" ] && [ -n "$SELLERCLOUD_PASS" ]; then
+                {
+                  echo ""
+                  echo "[sellercloud]"
+                  echo "sellercloud_baseurl = \"$SELLERCLOUD_API_ENDPOINT\""
+                  echo "sellercloud_username = \"$SELLERCLOUD_USER\""
+                  echo "sellercloud_password = \"$SELLERCLOUD_PASS\""
+                  echo ""
+                  echo "[sellercloud_internal]"
+                  echo "sellercloud_baseurl = \"$SELLERCLOUD_INTERNAL_API_ENDPOINT\""
+                  echo "sellercloud_username = \"$SELLERCLOUD_USER\""
+                  echo "sellercloud_password = \"$SELLERCLOUD_PASS\""
+                } >> config.toml
+              fi
+            fi
+
+            if [ -n "$SERVICE_ACCOUNT" ]; then
+              echo "$SERVICE_ACCOUNT" | base64 --decode > service-account.json
+            fi
+
+      - name: Copy files to server
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ vars.PROD_SERVER_IP }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          password: ${{ secrets.PROD_SERVER_PASS }}
+          port: 22
+          source: "./*,${{ env.SERVICE_NAME }}.service"
+          target: "${{ vars.APP_DIR }}"
+
+      - name: Install Python and setup application
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          PYTHON_VERSION: ${{ vars.PYTHON_VERSION }}
+          PYTHON_VERSION_SHORT: ${{ env.PYTHON_VERSION_SHORT }}
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          APP_DIR: ${{ vars.APP_DIR }}
+        with:
+          host: ${{ vars.PROD_SERVER_IP }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          password: ${{ secrets.PROD_SERVER_PASS }}
+          port: 22
+          envs: PYTHON_VERSION,PYTHON_VERSION_SHORT,SERVICE_NAME,APP_DIR
+          script: |
+            cd $APP_DIR
+
+            touch ~/.bashrc
+            sudo chown $(whoami):$(whoami) ~/.bashrc
+
+            if ! command -v pyenv >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y --no-install-recommends make build-essential libssl-dev zlib1g-dev libbz2-dev \
+                libreadline-dev libsqlite3-dev wget curl llvm libncurses5-dev libncursesw5-dev \
+                xz-utils tk-dev libffi-dev liblzma-dev git
+
+              curl -fsSL https://pyenv.run | bash
+
+              echo 'export PYENV_ROOT="$HOME/.pyenv"' >> ~/.bashrc
+              echo 'export PATH="$PYENV_ROOT/bin:$PATH"' >> ~/.bashrc
+              echo 'eval "$(pyenv init --path)"' >> ~/.bashrc
+              echo 'eval "$(pyenv init -)"' >> ~/.bashrc
+
+              export PYENV_ROOT="$HOME/.pyenv"
+              export PATH="$PYENV_ROOT/bin:$PATH"
+              eval "$(pyenv init --path)"
+              eval "$(pyenv init -)"
+            fi
+
+            export PYENV_ROOT="$HOME/.pyenv"
+            if [ -d "$PYENV_ROOT/bin" ]; then
+              export PATH="$PYENV_ROOT/bin:$PATH"
+            fi
+            if command -v pyenv >/dev/null 2>&1; then
+              eval "$(pyenv init --path)"
+              eval "$(pyenv init -)"
+            else
+              exit 1
+            fi
+
+            if ! pyenv versions --bare | grep -q "^${PYTHON_VERSION}$"; then
+              PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install $PYTHON_VERSION
+            fi
+
+            pyenv local $PYTHON_VERSION
+
+            if [ ! -d "venv_${PYTHON_VERSION_SHORT}" ]; then
+              python -m venv venv_${PYTHON_VERSION_SHORT}
+            fi
+            source venv_${PYTHON_VERSION_SHORT}/bin/activate
+
+            pip install --upgrade pip
+            pip install -r requirements.txt
+
+            echo "$APP_DIR/app.log {
+              size 10M
+              rotate 5
+              missingok
+              notifempty
+              compress
+              delaycompress
+              copytruncate
+            }
+            $APP_DIR/error.log {
+              size 10M
+              rotate 5
+              missingok
+              notifempty
+              compress
+              delaycompress
+              copytruncate
+            }" | sudo tee /etc/logrotate.d/$SERVICE_NAME
+
+            if [ ! -f /etc/systemd/system/${SERVICE_NAME}.service ]; then
+              sudo mv ${SERVICE_NAME}.service /etc/systemd/system/
+              sudo systemctl daemon-reload
+              sudo systemctl enable $SERVICE_NAME
+            else
+              sudo cp ${SERVICE_NAME}.service /etc/systemd/system/
+              sudo systemctl daemon-reload
+            fi
+            sudo systemctl restart $SERVICE_NAME
+
+      - name: Configure Caddy server for API
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          API_DOMAINS: ${{ vars.API_DOMAINS }}
+        with:
+          host: ${{ vars.PROD_SERVER_IP }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          password: ${{ secrets.PROD_SERVER_PASS }}
+          port: 22
+          envs: SERVICE_NAME,APP_PORT,API_DOMAINS
+          script: |
+            if ! command -v caddy >/dev/null 2>&1; then
+              sudo apt update
+              sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+              curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+                | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+              curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+                | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+              sudo apt update && sudo apt install -y caddy
+            fi
+
+            sudo tee /etc/caddy/Caddyfile >/dev/null <<'EOF'
+            {
+              admin off
+            }
+
+            import /etc/caddy/UI/*
+            import /etc/caddy/API/*
+            EOF
+
+            sudo mkdir -p /etc/caddy/UI /etc/caddy/API
+
+            echo "$API_DOMAINS" > /tmp/api_domains
+            IFS=',' read -ra DOMAINS < /tmp/api_domains
+
+            for d in "${DOMAINS[@]}"; do
+              d=$(echo "$d" | xargs) || true
+              [ -z "$d" ] && continue
+
+              if grep -lq "$d" /etc/caddy/API/* 2>/dev/null \
+                   | grep -v "/etc/caddy/API/${SERVICE_NAME}" >/dev/null; then
+                echo "Domain $d already defined elsewhere – aborting."; exit 1
+              fi
+            done
+
+            cfg=""
+            for d in "${DOMAINS[@]}"; do
+              d=$(echo "$d" | xargs) || true
+              [ -z "$d" ] && continue
+
+              cfg+="$(cat <<EOF
+
+            https://$d {
+              route * {
+                reverse_proxy 127.0.0.1:${APP_PORT}
+              }
+            }
+            EOF
+            )"
+            done
+
+            echo "$cfg" > /tmp/${SERVICE_NAME}_caddy_config
+
+            if ! sudo caddy validate --config /tmp/${SERVICE_NAME}_caddy_config --adapter caddyfile; then
+              echo "Generated Caddy config is invalid"; exit 1
+            fi
+
+            if [ -f "/etc/caddy/API/${SERVICE_NAME}" ] \
+                 && diff -q "/tmp/${SERVICE_NAME}_caddy_config" \
+                           "/etc/caddy/API/${SERVICE_NAME}" >/dev/null; then
+              rm /tmp/${SERVICE_NAME}_caddy_config
+            else
+              sudo mv /tmp/${SERVICE_NAME}_caddy_config /etc/caddy/API/${SERVICE_NAME}
+              sudo chown root:root /etc/caddy/API/${SERVICE_NAME}
+              sudo chmod 644      /etc/caddy/API/${SERVICE_NAME}
+              sudo systemctl reload caddy
+            fi
+
+            rm -f /tmp/api_domains
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.2.5
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          APP_DIR: ${{ vars.APP_DIR }}
+          API_DOMAINS: ${{ vars.API_DOMAINS }}
+          PYTHON_VERSION_SHORT: ${{ env.PYTHON_VERSION_SHORT }}
+          BRANCH: ${{ github.event.inputs.branch }}
+        with:
+          host: ${{ vars.PROD_SERVER_IP }}
+          username: ${{ secrets.PROD_SERVER_USER }}
+          password: ${{ secrets.PROD_SERVER_PASS }}
+          port: 22
+          envs: SERVICE_NAME,APP_PORT,APP_DIR,API_DOMAINS,PYTHON_VERSION_SHORT,BRANCH
+          script: |
+            if sudo systemctl is-active $SERVICE_NAME >/dev/null; then
+              echo "✔ $SERVICE_NAME service is running"
+            else
+              echo "✖ $SERVICE_NAME service is NOT running"; exit 1
+            fi
+
+            if sudo systemctl is-active caddy >/dev/null; then
+              echo "✔ Caddy is running"
+            else
+              echo "✖ Caddy is NOT running"; exit 1
+            fi
+
+            API_LIVE=false
+            for i in $(seq 1 10); do
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${APP_PORT}/health 2>/dev/null || echo "000")
+              if [ "$HTTP_CODE" = "000" ]; then
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:${APP_PORT}/ 2>/dev/null || echo "000")
+              fi
+
+              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 500 ]; then
+                echo "✔ API responding on port ${APP_PORT} (HTTP $HTTP_CODE)"
+                API_LIVE=true
+                break
+              fi
+              if [ $i -lt 10 ]; then
+                sleep 5
+              fi
+            done
+
+            if [ "$API_LIVE" = false ]; then
+              echo "✖ API failed to respond after 10 attempts"
+              exit 1
+            fi
+
+            echo ""
+            echo "Deployment complete!"
+            echo "Branch deployed: $BRANCH"
+            echo "API domains:"
+            IFS=',' read -ra DOMS <<< "$API_DOMAINS"
+            for d in "${DOMS[@]}"; do
+              d=$(echo "$d" | xargs)
+              [ -n "$d" ] && echo " • https://$d"
+            done
+
+            echo "Python version in use:"
+            source ${APP_DIR}/venv_${PYTHON_VERSION_SHORT}/bin/activate && python --version
+
+            echo "Service logs (last 10 lines):"
+            sudo journalctl -u $SERVICE_NAME --no-pager -n 10
