@@ -155,7 +155,10 @@ async def get_app_users():
     users = [
         {"id": user_id, "name": user_data["name"]}
         for user_id, user_data in app_users.items()
-        if any(role.startswith(config["auth"]["short_name"] + "_") for role in user_data["roles"])
+        if any(
+            role.startswith(config["auth"]["short_name"] + "_")
+            for role in user_data["roles"]
+        )
         and not any(role.endswith("_dev") for role in user_data["roles"])
     ]
     return users
