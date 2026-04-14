@@ -44,7 +44,9 @@ class SellerCloudService:
 
         cleaned = html_content
 
-        cleaned = re.sub(r"<li>\s*<p>(.*?)</p>\s*</li>", r"<li>\1</li>", cleaned, flags=re.DOTALL)
+        cleaned = re.sub(
+            r"<li>\s*<p>(.*?)</p>\s*</li>", r"<li>\1</li>", cleaned, flags=re.DOTALL
+        )
 
         cleaned = re.sub(r"<p>\s*</p>", "", cleaned)
 
@@ -78,7 +80,9 @@ class SellerCloudService:
             else:
                 logger.info("Creating new client without Authorization header")
 
-            self.client = httpx.AsyncClient(timeout=httpx.Timeout(30.0), headers=headers)
+            self.client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0), headers=headers
+            )
         return self.client
 
     async def _is_token_valid(self) -> bool:
@@ -126,14 +130,14 @@ class SellerCloudService:
                         if ".expires" in creds:
                             expires_str = creds[".expires"]
                             expires_str = expires_str.split(".")[0]
-                            self.token_expires_at = datetime.fromisoformat(expires_str).replace(
-                                tzinfo=timezone.utc
-                            )
+                            self.token_expires_at = datetime.fromisoformat(
+                                expires_str
+                            ).replace(tzinfo=timezone.utc)
                         else:
                             expires_in = creds.get("expires_in", 3600)
-                            self.token_expires_at = datetime.now(timezone.utc) + timedelta(
-                                seconds=int(expires_in)
-                            )
+                            self.token_expires_at = datetime.now(
+                                timezone.utc
+                            ) + timedelta(seconds=int(expires_in))
 
                         client = await self._get_client()
                         client.headers.update(
@@ -181,7 +185,9 @@ class SellerCloudService:
         while True:
             try:
                 if self._shutdown_event and self._shutdown_event.is_set():
-                    logger.info("Shutdown event detected, stopping background token refresh")
+                    logger.info(
+                        "Shutdown event detected, stopping background token refresh"
+                    )
                     break
 
                 try:
@@ -190,7 +196,9 @@ class SellerCloudService:
                             self._shutdown_event.wait(),
                             timeout=self._token_refresh_interval,
                         )
-                        logger.info("Shutdown signaled, stopping background token refresh")
+                        logger.info(
+                            "Shutdown signaled, stopping background token refresh"
+                        )
                         break
                     else:
                         await asyncio.sleep(self._token_refresh_interval)
@@ -220,7 +228,9 @@ class SellerCloudService:
             if self._shutdown_event is None:
                 self._shutdown_event = asyncio.Event()
 
-            self._token_refresh_task = asyncio.create_task(self._background_token_refresh())
+            self._token_refresh_task = asyncio.create_task(
+                self._background_token_refresh()
+            )
             logger.info("Background token refresh task started")
 
     async def _make_request(
@@ -277,7 +287,9 @@ class SellerCloudService:
             return response
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error {e.response.status_code}: {method} {url} - {e.response.text}")
+            logger.error(
+                f"HTTP error {e.response.status_code}: {method} {url} - {e.response.text}"
+            )
             raise
         except Exception as e:
             logger.error(f"Request failed: {method} {url} - {e}")
@@ -314,7 +326,11 @@ class SellerCloudService:
                     )
 
                 product = next(
-                    (item for item in products if item.get("PARENT_ID") == parent_product_id),
+                    (
+                        item
+                        for item in products
+                        if item.get("PARENT_ID") == parent_product_id
+                    ),
                     None,
                 )
 
@@ -350,7 +366,9 @@ class SellerCloudService:
                 page_number += 1
 
             except Exception as e:
-                logger.error(f"Error fetching product {product_id} on page {page_number}: {e}")
+                logger.error(
+                    f"Error fetching product {product_id} on page {page_number}: {e}"
+                )
                 raise
 
         logger.warning(f"Product with ID {product_id} not found")
@@ -359,7 +377,9 @@ class SellerCloudService:
     async def get_product_images(self, product_id: str) -> List[str]:
         try:
             parent_product_id = (
-                "/".join(product_id.split("/")[:-1]) if "/" in product_id else product_id
+                "/".join(product_id.split("/")[:-1])
+                if "/" in product_id
+                else product_id
             )
 
             semaphore = asyncio.Semaphore(5)
@@ -400,7 +420,9 @@ class SellerCloudService:
                         logger.debug(f"Error checking washtag image {washtag_url}: {e}")
                         return index, washtag_url, False
 
-            logger.info(f"Checking GCS for images 1-8 and washtags for product {parent_product_id}")
+            logger.info(
+                f"Checking GCS for images 1-8 and washtags for product {parent_product_id}"
+            )
 
             image_checks = [check_image_exists(i) for i in range(1, 9)]
             washtag_checks = [check_washtag_exists(i) for i in range(1, 4)]
@@ -459,8 +481,12 @@ class SellerCloudService:
                         logger.error(f"Error checking image {url}: {e}")
                         return url, False
 
-            logger.info(f"Validating {len(image_urls)} images for product {product_id} on GCS")
-            results = await asyncio.gather(*[check_image_exists(url) for url in image_urls])
+            logger.info(
+                f"Validating {len(image_urls)} images for product {product_id} on GCS"
+            )
+            results = await asyncio.gather(
+                *[check_image_exists(url) for url in image_urls]
+            )
 
             for url, exists in results:
                 if not exists:
@@ -507,7 +533,7 @@ class SellerCloudService:
         upc: str,
     ) -> Dict[str, Any]:
         payload = {
-            "CompanyId": 253,
+            "CompanyId": 182,
             "ProductName": product_name,
             "ProductSKU": product_sku,
             "ProductTypeName": product_type_name,
@@ -523,9 +549,13 @@ class SellerCloudService:
         target_product_id: str,
         overrides: Optional[Dict[str, str]] = None,
     ) -> None:
-        source_data = await self.get_product_by_id(source_product_id, only_required_fields=False)
+        source_data = await self.get_product_by_id(
+            source_product_id, only_required_fields=False
+        )
         if not source_data:
-            raise Exception(f"Source product {source_product_id} not found for custom column copy")
+            raise Exception(
+                f"Source product {source_product_id} not found for custom column copy"
+            )
 
         custom_columns = source_data.get("CustomColumns", [])
         columns_to_copy = []
@@ -592,12 +622,15 @@ class SellerCloudService:
             product = items[0]
 
             fields = [
-                {"ID": field, "tags": []} for field in product.keys() if field != "CustomColumns"
+                {"ID": field, "tags": []}
+                for field in product.keys()
+                if field != "CustomColumns"
             ]
 
             custom_columns = product.get("CustomColumns", {})
             custom_fields = [
-                {"ID": field["ColumnName"], "tags": ["custom"]} for field in custom_columns
+                {"ID": field["ColumnName"], "tags": ["custom"]}
+                for field in custom_columns
             ]
 
             return fields + custom_fields
@@ -615,9 +648,13 @@ class SellerCloudService:
             gender = data.get("gender")
             if not gender:
                 logger.error(f"Gender not found for ProductType: {product_type}")
-                raise HTTPException(status_code=404, detail="Gender not found in Listing Options")
+                raise HTTPException(
+                    status_code=404, detail="Gender not found in Listing Options"
+                )
 
-            logger.info(f"Successfully fetched gender '{gender}' for ProductType: {product_type}")
+            logger.info(
+                f"Successfully fetched gender '{gender}' for ProductType: {product_type}"
+            )
             return gender
 
         except HTTPException:
@@ -633,7 +670,6 @@ class SellerCloudService:
             return
         if color.lower() == brand_color.lower():
             return
-
 
         color_info = await listing_options_service.get_color_info(color)
         if not color_info.get("color"):
@@ -721,7 +757,9 @@ class SellerCloudService:
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error adding alias to color '{color}': {traceback.format_exc()}")
+            logger.error(
+                f"Error adding alias to color '{color}': {traceback.format_exc()}"
+            )
             raise HTTPException(status_code=500, detail="Internal server error")
 
     async def get_product_children(
@@ -787,7 +825,9 @@ class SellerCloudService:
         first_product = all_children[0]
         sellercloud_product_type = first_product.get("ProductType")
 
-        product_type = override_product_type if override_product_type else sellercloud_product_type
+        product_type = (
+            override_product_type if override_product_type else sellercloud_product_type
+        )
 
         custom_columns = first_product.get("CustomColumns", [])
         custom_columns_map = {}
@@ -799,7 +839,9 @@ class SellerCloudService:
         sellercloud_sizing_scheme = custom_columns_map.get("SIZING_SCHEME")
 
         sizing_scheme = (
-            override_sizing_scheme if override_sizing_scheme else sellercloud_sizing_scheme
+            override_sizing_scheme
+            if override_sizing_scheme
+            else sellercloud_sizing_scheme
         )
 
         children_data = []
@@ -861,7 +903,9 @@ class SellerCloudService:
                         "PUT", "/Catalog/AdvancedInfo", data=normal_payload
                     )
 
-                    logger.info(f"Successfully updated normal fields for product {product_id}")
+                    logger.info(
+                        f"Successfully updated normal fields for product {product_id}"
+                    )
 
                 if custom_fields:
                     custom_payload = {
@@ -872,8 +916,12 @@ class SellerCloudService:
                     logger.info(
                         f"Updating {len(custom_fields)} custom columns for product {product_id} (attempt {attempt + 1}/{max_retries})"
                     )
-                    await self._make_request("PUT", "/Products/CustomColumns", data=custom_payload)
-                    logger.info(f"Successfully updated custom columns for product {product_id}")
+                    await self._make_request(
+                        "PUT", "/Products/CustomColumns", data=custom_payload
+                    )
+                    logger.info(
+                        f"Successfully updated custom columns for product {product_id}"
+                    )
 
                 logger.info(
                     f"Successfully submitted listing for product {product_id} to SellerCloud"
@@ -890,7 +938,9 @@ class SellerCloudService:
                     logger.info(f"Retrying in {wait_time} seconds...")
                     await asyncio.sleep(wait_time)
                 else:
-                    logger.error(f"Max retries reached for product {product_id}. Giving up.")
+                    logger.error(
+                        f"Max retries reached for product {product_id}. Giving up."
+                    )
                     raise Exception(
                         f"Failed to update product {product_id} after {max_retries} attempts: {e}"
                     )
@@ -910,7 +960,9 @@ class SellerCloudService:
 
         platform_templates = settings.field_templates.get(platform_id, {})
         template = (
-            platform_templates.get("description") if isinstance(platform_templates, dict) else None
+            platform_templates.get("description")
+            if isinstance(platform_templates, dict)
+            else None
         )
 
         if not template:
@@ -952,13 +1004,20 @@ class SellerCloudService:
                 field_value = GENDER_MAPPING[field_value]
 
             if field_name == "MATERIAL" and field_value:
-                lines = [line.strip() for line in str(field_value).split("\n") if line.strip()]
+                lines = [
+                    line.strip()
+                    for line in str(field_value).split("\n")
+                    if line.strip()
+                ]
                 processed_lines = [
-                    re.sub(r"^Main:", "Shell:", line, flags=re.IGNORECASE) for line in lines
+                    re.sub(r"^Main:", "Shell:", line, flags=re.IGNORECASE)
+                    for line in lines
                 ]
                 field_value = "".join(f"<div>{line}</div>" for line in processed_lines)
 
-            populated_template = populated_template.replace(f"{{{field_name}}}", str(field_value))
+            populated_template = populated_template.replace(
+                f"{{{field_name}}}", str(field_value)
+            )
 
         if missing_fields:
             raise HTTPException(
@@ -1014,14 +1073,20 @@ class SellerCloudService:
                     transformed_form_data[key] = value
 
             form_data = transformed_form_data
-            logger.debug(f"Transformed {len(sc_field_mapping)} fields to SellerCloud field IDs")
+            logger.debug(
+                f"Transformed {len(sc_field_mapping)} fields to SellerCloud field IDs"
+            )
 
             if "LongDescription" in form_data and form_data["LongDescription"]:
-                form_data["LongDescription"] = self._clean_html(form_data["LongDescription"])
+                form_data["LongDescription"] = self._clean_html(
+                    form_data["LongDescription"]
+                )
                 logger.info("Cleaned HTML from LongDescription field")
 
             if "ProductType" not in form_data or not form_data["ProductType"]:
-                raise Exception("Product Type is required in form_data to fetch gender information")
+                raise Exception(
+                    "Product Type is required in form_data to fetch gender information"
+                )
 
             logger.info("Validating required fields and fetching gender data")
 
@@ -1040,7 +1105,9 @@ class SellerCloudService:
             )
 
             parent_product_id = (
-                "/".join(product_id.split("/")[:-1]) if "/" in product_id else product_id
+                "/".join(product_id.split("/")[:-1])
+                if "/" in product_id
+                else product_id
             )
 
             logger.info(f"Fetching children for parent product {parent_product_id}")
@@ -1106,7 +1173,9 @@ class SellerCloudService:
                     continue
 
                 if field_name in CUSTOM_COLUMN_FIELDS:
-                    custom_fields.append({"ColumnName": field_name, "Value": field_value})
+                    custom_fields.append(
+                        {"ColumnName": field_name, "Value": field_value}
+                    )
                     continue
 
                 sc_mapping = sellercloud_field_map.get(field_name)
@@ -1116,15 +1185,21 @@ class SellerCloudService:
                     is_custom = sc_mapping["is_custom"]
 
                     if is_custom:
-                        custom_fields.append({"ColumnName": sc_field_id, "Value": field_value})
+                        custom_fields.append(
+                            {"ColumnName": sc_field_id, "Value": field_value}
+                        )
                     else:
                         if sc_field_id == "ShippingWeight":
                             try:
                                 total_oz = int(field_value)
                                 lbs = total_oz // 16
                                 oz = total_oz % 16
-                                normal_fields.append({"Name": "PackageWeightLbs", "Value": lbs})
-                                normal_fields.append({"Name": "PackageWeightOz", "Value": oz})
+                                normal_fields.append(
+                                    {"Name": "PackageWeightLbs", "Value": lbs}
+                                )
+                                normal_fields.append(
+                                    {"Name": "PackageWeightOz", "Value": oz}
+                                )
                                 continue
                             except (ValueError, TypeError) as e:
                                 logger.error(
@@ -1134,11 +1209,17 @@ class SellerCloudService:
                                     f"ShippingWeight must be convertible to integer, got: {field_value}"
                                 )
 
-                        target_field_name = FIELD_NAME_OVERRIDES.get(sc_field_id, sc_field_id)
-                        normal_fields.append({"Name": target_field_name, "Value": field_value})
+                        target_field_name = FIELD_NAME_OVERRIDES.get(
+                            sc_field_id, sc_field_id
+                        )
+                        normal_fields.append(
+                            {"Name": target_field_name, "Value": field_value}
+                        )
                 else:
                     if field_name not in CUSTOM_COLUMN_FIELDS:
-                        target_field_name = FIELD_NAME_OVERRIDES.get(field_name, field_name)
+                        target_field_name = FIELD_NAME_OVERRIDES.get(
+                            field_name, field_name
+                        )
 
                         if field_name == "ShippingWeight":
                             try:
@@ -1146,9 +1227,13 @@ class SellerCloudService:
                                 lbs = total_oz // 16
                                 oz = total_oz % 16
 
-                                normal_fields.append({"Name": "PackageWeightLbs", "Value": lbs})
+                                normal_fields.append(
+                                    {"Name": "PackageWeightLbs", "Value": lbs}
+                                )
 
-                                normal_fields.append({"Name": "PackageWeightOz", "Value": oz})
+                                normal_fields.append(
+                                    {"Name": "PackageWeightOz", "Value": oz}
+                                )
 
                                 continue
                             except (ValueError, TypeError) as e:
@@ -1159,7 +1244,9 @@ class SellerCloudService:
                                     f"ShippingWeight must be convertible to integer, got: {field_value}"
                                 )
 
-                        normal_fields.append({"Name": target_field_name, "Value": field_value})
+                        normal_fields.append(
+                            {"Name": target_field_name, "Value": field_value}
+                        )
 
             semaphore = asyncio.Semaphore(max_workers)
 
@@ -1170,19 +1257,24 @@ class SellerCloudService:
                     ]
 
                     child_custom_fields = [
-                        {"ColumnName": f["ColumnName"], "Value": f["Value"]} for f in custom_fields
+                        {"ColumnName": f["ColumnName"], "Value": f["Value"]}
+                        for f in custom_fields
                     ]
 
                     size = size_map.get(pid, "")
                     if size and list_price:
                         for field in child_normal_fields:
                             if field["Name"] == "ProductName":
-                                field["Value"] = f"{field['Value']} SIZE {size} ${list_price}"
+                                field["Value"] = (
+                                    f"{field['Value']} SIZE {size} ${list_price}"
+                                )
                                 break
 
                     if size:
                         print({"ColumnName": "SIZE", "Value": size})
-                        child_custom_fields.append({"ColumnName": "SIZE", "Value": size})
+                        child_custom_fields.append(
+                            {"ColumnName": "SIZE", "Value": size}
+                        )
 
                     await self._update_single_product_with_retry(
                         pid, child_normal_fields, child_custom_fields
@@ -1202,7 +1294,9 @@ class SellerCloudService:
             logger.error(f"Failed to submit listing to SellerCloud: {e}")
             raise e
         except Exception:
-            logger.error(f"Failed to submit listing to SellerCloud: {traceback.format_exc()}")
+            logger.error(
+                f"Failed to submit listing to SellerCloud: {traceback.format_exc()}"
+            )
             raise Exception("Failed to submit to SellerCloud")
 
     async def disable_product(self, product_id: str) -> bool:
@@ -1213,13 +1307,17 @@ class SellerCloudService:
 
             logger.info(f"Disabling product {product_id} with payload: {payload}")
 
-            response = await self._make_request("PUT", "/Catalog/BasicInfo", data=payload)
+            response = await self._make_request(
+                "PUT", "/Catalog/BasicInfo", data=payload
+            )
 
             logger.info(f"Successfully disabled product {product_id}")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to disable product {product_id}: {traceback.format_exc()}")
+            logger.error(
+                f"Failed to disable product {product_id}: {traceback.format_exc()}"
+            )
             raise Exception(f"Failed to make product {product_id} inactive")
 
     async def initialize(self):
@@ -1239,7 +1337,9 @@ class SellerCloudService:
                 await asyncio.wait_for(self._token_refresh_task, timeout=5.0)
                 logger.info("Background token refresh task stopped gracefully")
             except asyncio.TimeoutError:
-                logger.warning("Background token refresh task did not stop in time, cancelling...")
+                logger.warning(
+                    "Background token refresh task did not stop in time, cancelling..."
+                )
                 self._token_refresh_task.cancel()
                 try:
                     await self._token_refresh_task
