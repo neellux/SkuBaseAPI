@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.post("/create_batch", response_model=BatchResponse)
+@router.post("/create_batch", response_model=BatchResponse, include_in_schema=False)
 async def create_batch_public(request_data: CreateBatchRequest):
     created_by = "system"
 

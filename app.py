@@ -44,7 +44,6 @@ api_app = FastAPI(
     title="Listing Public API",
     description="Publicly accessible endpoints.",
     version="1.0.0",
-    docs_url=None,
     redoc_url=None,
     default_response_class=ORJSONResponse,
 )
