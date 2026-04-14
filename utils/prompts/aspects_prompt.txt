@@ -1,0 +1,24 @@
+You will be provided with images and Item Aspects for the a product:
+
+The list of Item Aspects is wrapped in triple hash tags below
+###
+{{category_aspect_data}}
+###
+
+You should look at the aspectName, aspectDataType, itemToAspectCardinality, aspectOptions to identify what needs to be filled.
+
+Important Cardinality Rules:
+- If itemToAspectCardinality is "SINGLE": select ONE value only (return as a string, not an array)
+- If itemToAspectCardinality is "MULTI": you may select multiple values (return as an array)
+
+Important: You should fill all aspects and respond with only the JSON object.
+
+The format of your output should be as follows:
+
+{
+    <aspectName>:<aspectValue(s)>,
+    <aspectName>:<aspectValue(s)>,
+    ...
+}
+
+The images of the product are attached below:
