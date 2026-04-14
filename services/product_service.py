@@ -7,7 +7,10 @@ import traceback
 from typing import Dict, List, Any, Optional
 from tortoise import connections
 
-from services.sellercloud_internal_service import sellercloud_internal_service
+from services.sellercloud_internal_service import (
+    SellercloudPermanentError,
+    sellercloud_internal_service,
+)
 from services.sellercloud_service import sellercloud_service
 
 logger = logging.getLogger(__name__)
@@ -85,25 +88,24 @@ class ProductService:
     async def _execute_transfer_upcs_keywords_job(
         child_sku: str, target_child_sku: str, is_placeholder: bool = False, **kwargs
     ) -> Dict[str, Any]:
-        MAX_RETRIES = 3
-        RETRY_DELAY = 1
+        transferred_upcs: List[str] = []
+        transferred_keywords: List[str] = []
 
-        transferred_upcs = []
-        transferred_keywords = []
-        errors = []
-
-        async def retry_operation(operation_name: str, operation_func, *args, **op_kwargs):
-            last_error = None
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    result = await operation_func(*args, **op_kwargs)
-                    return result
-                except Exception as e:
-                    last_error = e
-                    logger.warning(f"{operation_name} attempt {attempt}/{MAX_RETRIES} failed: {e}")
-                    if attempt < MAX_RETRIES:
-                        await asyncio.sleep(RETRY_DELAY)
-            raise last_error
+        def _failure(label: str, value: str, exc: Exception) -> Dict[str, Any]:
+            if isinstance(exc, SellercloudPermanentError):
+                user_message = str(exc)
+            else:
+                user_message = (
+                    "SellerCloud temporarily unavailable — please retry the reassignment"
+                )
+            logger.error(f"Failed to transfer {label} {value}: {exc}")
+            return {
+                "success": False,
+                "error": f"Failed to transfer {label} {value}: {exc}",
+                "user_message": user_message,
+                "transferred_upcs": transferred_upcs,
+                "transferred_keywords": transferred_keywords,
+            }
 
         try:
             conn = await ProductService._get_connection()
@@ -136,63 +138,37 @@ class ProductService:
 
             if primary_upc:
                 try:
-                    await retry_operation(
-                        f"Clear primary UPC {primary_upc} from {child_sku}",
-                        sellercloud_service.update_product_upc,
-                        child_sku,
-                        "",
+                    # Clear BasicInfo UPC on source — direct call, not alias management
+                    clear_result = await sellercloud_service.update_product_upc(
+                        child_sku, ""
                     )
+                    if not clear_result.get("success"):
+                        raise Exception(
+                            f"Failed to clear BasicInfo UPC on {child_sku}: {clear_result}"
+                        )
                     logger.info(f"Cleared primary UPC from {child_sku} in SellerCloud")
 
+                    # Best-effort: remove the alias from source. The primary may not
+                    # exist as an alias on source (it lives in BasicInfo), so tolerate
+                    # both permanent and transient failures here.
                     try:
-                        delete_alias_result = await retry_operation(
-                            f"Delete alias {primary_upc} from source {child_sku}",
-                            sellercloud_internal_service.save_alias,
-                            child_sku,
-                            primary_upc,
-                            "delete",
+                        await sellercloud_internal_service.sync_delete_alias(
+                            child_sku, primary_upc
                         )
-                        if delete_alias_result.get("Success"):
-                            logger.info(f"Deleted alias {primary_upc} from source {child_sku}")
-                        else:
-                            logger.debug(
-                                f"Alias {primary_upc} delete from source returned: {delete_alias_result}"
-                            )
-                    except Exception as alias_del_err:
+                    except Exception as src_del_err:
                         logger.debug(
-                            f"Alias delete for {primary_upc} from source (non-fatal): {alias_del_err}"
+                            f"Alias delete for {primary_upc} from source (non-fatal): {src_del_err}"
                         )
 
                     if not is_placeholder:
-                        validation = await retry_operation(
-                            f"Validate {primary_upc} for {target_child_sku}",
-                            sellercloud_internal_service.validate_alias,
-                            target_child_sku,
-                            primary_upc,
+                        # Add to target as a non-primary alias (matches DB shape below)
+                        await sellercloud_internal_service.sync_add_alias(
+                            target_child_sku, primary_upc, is_primary=False
                         )
-                        if not validation.get("IsValid"):
-                            already_used = validation.get("AlreadyUsedForProduct")
-                            error_msg = (
-                                f"UPC {primary_upc} already used by {already_used}"
-                                if already_used
-                                else f"UPC {primary_upc} cannot be added to {target_child_sku}"
-                            )
-                            raise Exception(error_msg)
 
-                        alias_result = await retry_operation(
-                            f"Add {primary_upc} as alias to {target_child_sku}",
-                            sellercloud_internal_service.save_alias,
-                            target_child_sku,
-                            primary_upc,
-                            "add",
-                        )
-                        if not alias_result.get("Success"):
-                            raise Exception(
-                                f"Failed to add alias: {alias_result.get('Notification', {}).get('Message', 'Unknown error')}"
-                            )
-
-                    await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [primary_upc])
-
+                    await conn.execute_query(
+                        "DELETE FROM child_upcs WHERE upc = $1", [primary_upc]
+                    )
                     await conn.execute_query(
                         "INSERT INTO child_upcs (upc, child_sku, is_primary_upc) VALUES ($1, $2, FALSE)",
                         [primary_upc, target_child_sku],
@@ -202,59 +178,28 @@ class ProductService:
                     logger.info(f"Transferred primary UPC {primary_upc} to {target_child_sku}")
 
                 except Exception as e:
-                    errors.append(f"Primary UPC {primary_upc}: {str(e)}")
-                    logger.error(f"Failed to transfer primary UPC {primary_upc}: {e}")
-                    return {
-                        "success": False,
-                        "error": f"Failed to transfer primary UPC: {str(e)}",
-                        "user_message": f"Failed to transfer primary UPC {primary_upc}",
-                        "transferred_upcs": transferred_upcs,
-                        "transferred_keywords": transferred_keywords,
-                    }
+                    return _failure("primary UPC", primary_upc, e)
 
             for upc in secondary_upcs:
                 try:
-                    delete_result = await retry_operation(
-                        f"Delete {upc} from {child_sku}",
-                        sellercloud_internal_service.save_alias,
-                        child_sku,
-                        upc,
-                        "delete",
-                    )
-                    if not delete_result.get("Success"):
+                    # Best-effort source removal — alias may already be gone
+                    try:
+                        await sellercloud_internal_service.sync_delete_alias(
+                            child_sku, upc
+                        )
+                    except Exception as src_del_err:
                         logger.warning(
-                            f"Delete alias {upc} from {child_sku} returned: {delete_result}"
+                            f"Source alias delete for {upc} from {child_sku} non-fatal: {src_del_err}"
                         )
 
-                    await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [upc])
+                    await conn.execute_query(
+                        "DELETE FROM child_upcs WHERE upc = $1", [upc]
+                    )
 
                     if not is_placeholder:
-                        validation = await retry_operation(
-                            f"Validate {upc} for {target_child_sku}",
-                            sellercloud_internal_service.validate_alias,
-                            target_child_sku,
-                            upc,
+                        await sellercloud_internal_service.sync_add_alias(
+                            target_child_sku, upc, is_primary=False
                         )
-                        if not validation.get("IsValid"):
-                            already_used = validation.get("AlreadyUsedForProduct")
-                            error_msg = (
-                                f"UPC {upc} already used by {already_used}"
-                                if already_used
-                                else f"UPC {upc} cannot be added to {target_child_sku}"
-                            )
-                            raise Exception(error_msg)
-
-                        alias_result = await retry_operation(
-                            f"Add {upc} as alias to {target_child_sku}",
-                            sellercloud_internal_service.save_alias,
-                            target_child_sku,
-                            upc,
-                            "add",
-                        )
-                        if not alias_result.get("Success"):
-                            raise Exception(
-                                f"Failed to add alias: {alias_result.get('Notification', {}).get('Message', 'Unknown error')}"
-                            )
 
                     await conn.execute_query(
                         "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)",
@@ -265,28 +210,17 @@ class ProductService:
                     logger.info(f"Transferred secondary UPC {upc} to {target_child_sku}")
 
                 except Exception as e:
-                    errors.append(f"Secondary UPC {upc}: {str(e)}")
-                    logger.error(f"Failed to transfer secondary UPC {upc}: {e}")
-                    return {
-                        "success": False,
-                        "error": f"Failed to transfer secondary UPC {upc}: {str(e)}",
-                        "user_message": f"Failed to transfer UPC {upc}",
-                        "transferred_upcs": transferred_upcs,
-                        "transferred_keywords": transferred_keywords,
-                    }
+                    return _failure("secondary UPC", upc, e)
 
             for keyword in keywords:
                 try:
-                    delete_result = await retry_operation(
-                        f"Delete keyword {keyword} from {child_sku}",
-                        sellercloud_internal_service.save_alias,
-                        child_sku,
-                        keyword,
-                        "delete",
-                    )
-                    if not delete_result.get("Success"):
+                    try:
+                        await sellercloud_internal_service.sync_delete_alias(
+                            child_sku, keyword
+                        )
+                    except Exception as src_del_err:
                         logger.warning(
-                            f"Delete alias {keyword} from {child_sku} returned: {delete_result}"
+                            f"Source keyword delete for {keyword} from {child_sku} non-fatal: {src_del_err}"
                         )
 
                     await conn.execute_query(
@@ -294,32 +228,9 @@ class ProductService:
                         [keyword, child_sku],
                     )
 
-                    validation = await retry_operation(
-                        f"Validate keyword {keyword} for {target_child_sku}",
-                        sellercloud_internal_service.validate_alias,
-                        target_child_sku,
-                        keyword,
+                    await sellercloud_internal_service.sync_add_alias(
+                        target_child_sku, keyword, is_primary=False
                     )
-                    if not validation.get("IsValid"):
-                        already_used = validation.get("AlreadyUsedForProduct")
-                        error_msg = (
-                            f"Keyword {keyword} already used by {already_used}"
-                            if already_used
-                            else f"Keyword {keyword} cannot be added to {target_child_sku}"
-                        )
-                        raise Exception(error_msg)
-
-                    alias_result = await retry_operation(
-                        f"Add keyword {keyword} as alias to {target_child_sku}",
-                        sellercloud_internal_service.save_alias,
-                        target_child_sku,
-                        keyword,
-                        "add",
-                    )
-                    if not alias_result.get("Success"):
-                        raise Exception(
-                            f"Failed to add alias: {alias_result.get('Notification', {}).get('Message', 'Unknown error')}"
-                        )
 
                     await conn.execute_query(
                         "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
@@ -330,15 +241,7 @@ class ProductService:
                     logger.info(f"Transferred keyword {keyword} to {target_child_sku}")
 
                 except Exception as e:
-                    errors.append(f"Keyword {keyword}: {str(e)}")
-                    logger.error(f"Failed to transfer keyword {keyword}: {e}")
-                    return {
-                        "success": False,
-                        "error": f"Failed to transfer keyword {keyword}: {str(e)}",
-                        "user_message": f"Failed to transfer keyword {keyword}",
-                        "transferred_upcs": transferred_upcs,
-                        "transferred_keywords": transferred_keywords,
-                    }
+                    return _failure("keyword", keyword, e)
 
             total_transferred = len(transferred_upcs) + len(transferred_keywords)
             return {
@@ -2140,6 +2043,30 @@ class ProductService:
                     return {"success": False, "error": "UPC already exists for this SKU"}
                 return {"success": False, "error": f"UPC already exists for SKU: {existing_sku}"}
 
+            # Determine whether this UPC will become primary (first UPC for this child)
+            existing_count = await conn.execute_query_dict(
+                "SELECT COUNT(*) AS cnt FROM child_upcs WHERE child_sku = $1", [sku]
+            )
+            will_be_primary = existing_count[0]["cnt"] == 0
+
+            # Sync to SellerCloud first — leave DB untouched on failure so the UI can retry
+            try:
+                await sellercloud_internal_service.sync_add_alias(
+                    sku, upc, is_primary=will_be_primary
+                )
+            except SellercloudPermanentError as e:
+                logger.info(f"Permanent SellerCloud failure adding {upc} to {sku}: {e}")
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                logger.error(
+                    f"Transient SellerCloud failure adding {upc} to {sku}: {e}",
+                    exc_info=True,
+                )
+                return {
+                    "success": False,
+                    "error": "SellerCloud is temporarily unavailable. Please try again.",
+                }
+
             # Insert UPC (DB trigger sets is_primary_upc if first UPC)
             await conn.execute_query(
                 "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)", [upc, sku]
@@ -2171,6 +2098,35 @@ class ProductService:
 
         try:
             conn = await ProductService._get_connection()
+
+            # Fetch the current primary so we know what to demote in SellerCloud
+            current_primary_rows = await conn.execute_query_dict(
+                "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE",
+                [sku],
+            )
+            old_primary = current_primary_rows[0]["upc"] if current_primary_rows else None
+
+            # Sync to SellerCloud first — leave DB untouched on failure
+            try:
+                await sellercloud_internal_service.sync_change_primary(
+                    sku, new_primary=upc, old_primary=old_primary
+                )
+            except SellercloudPermanentError as e:
+                logger.info(
+                    f"Permanent SellerCloud failure setting primary for {sku} "
+                    f"({old_primary} -> {upc}): {e}"
+                )
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                logger.error(
+                    f"Transient SellerCloud failure setting primary for {sku} "
+                    f"({old_primary} -> {upc}): {e}",
+                    exc_info=True,
+                )
+                return {
+                    "success": False,
+                    "error": "SellerCloud is temporarily unavailable. Please try again.",
+                }
 
             result = await conn.execute_query_dict(
                 "SELECT update_primary_upc_for_child($1, $2) as result", [sku, upc]
@@ -2214,7 +2170,23 @@ class ProductService:
 
             await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [upc])
 
-            return {"success": True, "sku": sku, "upc": upc}
+            response: Dict[str, Any] = {"success": True, "sku": sku, "upc": upc}
+            try:
+                await sellercloud_internal_service.sync_delete_alias(sku, upc)
+            except SellercloudPermanentError as e:
+                logger.warning(
+                    f"Permanent SellerCloud failure deleting {upc} from {sku}: {e}"
+                )
+                response["sellercloud_warning"] = str(e)
+            except Exception as e:
+                logger.error(
+                    f"Transient SellerCloud failure deleting {upc} from {sku}: {e}",
+                    exc_info=True,
+                )
+                response["sellercloud_warning"] = (
+                    "Removed locally but SellerCloud sync failed — will need manual cleanup."
+                )
+            return response
 
         except Exception as e:
             logger.error(f"Error deleting UPC {upc} from {sku}: {e}")

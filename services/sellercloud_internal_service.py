@@ -12,6 +12,38 @@ logger = logging.getLogger(__name__)
 
 SELLERCLOUD_INTERNAL_CONFIG = config.get("sellercloud_internal", {})
 
+SC_SYNC_MAX_RETRIES = 3
+SC_SYNC_RETRY_DELAY = 1  # seconds
+
+_TRANSIENT_MESSAGE_MARKERS = (
+    "toolbox operation failed",
+    "internal server error",
+    "timeout",
+    "temporarily unavailable",
+)
+
+
+class SellercloudPermanentError(Exception):
+    """Raised when a SellerCloud operation fails in a way that retries cannot fix.
+    str(e) is the user-facing message the UI should display."""
+
+
+def _is_transient_message(msg: Optional[str]) -> bool:
+    if not msg:
+        return True
+    msg_lower = msg.lower()
+    return any(marker in msg_lower for marker in _TRANSIENT_MESSAGE_MARKERS)
+
+
+def _classify_sc_failure(op_name: str, result: Dict[str, Any]) -> None:
+    """Inspect a Success=false response and raise either SellercloudPermanentError
+    (don't retry, message shown to user) or a plain Exception (retry)."""
+    notification = result.get("Notification") or {}
+    msg = notification.get("Message") or ""
+    if _is_transient_message(msg):
+        raise Exception(f"{op_name}: transient SellerCloud failure: {msg or '<empty>'}")
+    raise SellercloudPermanentError(msg)
+
 
 class SellercloudInternalService:
     def __init__(self):
@@ -605,6 +637,139 @@ class SellercloudInternalService:
         return await self.post(
             "/Toolbox/Product/AliasesTool/Load",
             data={"Id": product_id},
+        )
+
+    async def _retry_sc(self, op_name: str, coro_factory):
+        last_error: Optional[Exception] = None
+        for attempt in range(1, SC_SYNC_MAX_RETRIES + 1):
+            try:
+                return await coro_factory()
+            except SellercloudPermanentError:
+                raise
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"{op_name} attempt {attempt}/{SC_SYNC_MAX_RETRIES} failed: {e}"
+                )
+                if attempt < SC_SYNC_MAX_RETRIES:
+                    await asyncio.sleep(SC_SYNC_RETRY_DELAY)
+        assert last_error is not None
+        raise last_error
+
+    def _check_sc_success(self, op_name: str, result: Dict[str, Any]) -> None:
+        if not result.get("Success"):
+            _classify_sc_failure(op_name, result)
+
+    async def sync_add_alias(self, sku: str, value: str, is_primary: bool) -> None:
+        """Validate + add alias; if primary, also update BasicInfo UPC. Retries toolbox failures."""
+
+        async def _do_validate():
+            validation = await self.validate_alias(sku, value)
+            if not validation.get("IsValid"):
+                already = validation.get("AlreadyUsedForProduct")
+                if already:
+                    raise SellercloudPermanentError(
+                        f"UPC {value} is already used by another product (ID: {already})"
+                    )
+                error_msg = validation.get("ErrorMessage") or (
+                    validation.get("Notification") or {}
+                ).get("Message", "")
+                if _is_transient_message(error_msg):
+                    raise Exception(f"validate_alias transient failure: {error_msg}")
+                raise SellercloudPermanentError(
+                    error_msg or f"UPC {value} failed validation in SellerCloud"
+                )
+            return validation
+
+        async def _do_save():
+            result = await self.save_alias(sku, value, action="add")
+            self._check_sc_success(f"save_alias(add {value} to {sku})", result)
+            return result
+
+        async def _do_basicinfo():
+            from services.sellercloud_service import sellercloud_service
+
+            result = await sellercloud_service.update_product_upc(sku, value)
+            if not result.get("success"):
+                raise Exception(f"update_product_upc failed: {result}")
+            return result
+
+        await self._retry_sc(f"validate_alias({sku},{value})", _do_validate)
+        await self._retry_sc(f"save_alias(add {sku},{value})", _do_save)
+        if is_primary:
+            await self._retry_sc(f"update_product_upc({sku},{value})", _do_basicinfo)
+
+    async def sync_delete_alias(self, sku: str, value: str) -> None:
+        """Delete alias from SellerCloud. Retries toolbox failures; tolerates 'not found'."""
+
+        async def _do_delete():
+            result = await self.save_alias(sku, value, action="delete")
+            if not result.get("Success"):
+                msg = (result.get("Notification") or {}).get("Message", "") or ""
+                if "not found" in msg.lower() or "does not exist" in msg.lower():
+                    logger.info(f"Alias {value} already absent from {sku} in SellerCloud")
+                    return result
+                self._check_sc_success(f"save_alias(delete {value} from {sku})", result)
+            return result
+
+        await self._retry_sc(f"save_alias(delete {sku},{value})", _do_delete)
+
+    async def sync_change_primary(
+        self, sku: str, new_primary: str, old_primary: Optional[str]
+    ) -> None:
+        """Demote old primary to alias, remove new primary from aliases, update BasicInfo UPC."""
+
+        async def _do_load():
+            aliases_response = await self.load_aliases(sku)
+            if aliases_response.get("Success") is False:
+                self._check_sc_success(f"load_aliases({sku})", aliases_response)
+            dto = (aliases_response.get("Data") or {}).get("DTO") or {}
+            return {
+                a.get("Name")
+                for a in (dto.get("Aliases") or [])
+                if a.get("Name")
+            }
+
+        async def _do_add_old(alias: str):
+            async def _inner():
+                result = await self.save_alias(sku, alias, action="add")
+                self._check_sc_success(f"save_alias(add old primary {alias})", result)
+                return result
+
+            return await self._retry_sc(
+                f"save_alias(add old primary {alias} to {sku})", _inner
+            )
+
+        async def _do_remove_new(alias: str):
+            async def _inner():
+                result = await self.save_alias(sku, alias, action="delete")
+                self._check_sc_success(
+                    f"save_alias(remove new primary {alias})", result
+                )
+                return result
+
+            return await self._retry_sc(
+                f"save_alias(remove new primary {alias} from {sku})", _inner
+            )
+
+        async def _do_basicinfo():
+            from services.sellercloud_service import sellercloud_service
+
+            result = await sellercloud_service.update_product_upc(sku, new_primary)
+            if not result.get("success"):
+                raise Exception(f"update_product_upc failed: {result}")
+            return result
+
+        existing = await self._retry_sc(f"load_aliases({sku})", _do_load)
+
+        if old_primary and old_primary not in existing:
+            await _do_add_old(old_primary)
+
+        if new_primary in existing:
+            await _do_remove_new(new_primary)
+
+        await self._retry_sc(
+            f"update_product_upc({sku},{new_primary})", _do_basicinfo
         )
 
     async def initialize(self):
