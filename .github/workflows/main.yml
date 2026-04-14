@@ -63,12 +63,13 @@ jobs:
           SELLERCLOUD_API_ENDPOINT: ${{ vars.SELLERCLOUD_API_ENDPOINT }}
           SELLERCLOUD_INTERNAL_API_ENDPOINT: ${{ vars.SELLERCLOUD_INTERNAL_API_ENDPOINT }}
           SERVICE_ACCOUNT: ${{ secrets.SERVICE_ACCOUNT }}
+          SERVICE_ACCOUNT_2: ${{ secrets.SERVICE_ACCOUNT_2 }}
         with:
           host: ${{ vars.PROD_SERVER_IP }}
           username: ${{ secrets.PROD_SERVER_USER }}
           password: ${{ secrets.PROD_SERVER_PASS }}
           port: 22
-          envs: CONFIG,SELLERCLOUD_USER,SELLERCLOUD_PASS,SELLERCLOUD_API_ENDPOINT,SELLERCLOUD_INTERNAL_API_ENDPOINT,SERVICE_ACCOUNT
+          envs: CONFIG,SELLERCLOUD_USER,SELLERCLOUD_PASS,SELLERCLOUD_API_ENDPOINT,SELLERCLOUD_INTERNAL_API_ENDPOINT,SERVICE_ACCOUNT,SERVICE_ACCOUNT_2
           script: |
             mkdir -p ${{ vars.APP_DIR }}
             cd ${{ vars.APP_DIR }}
@@ -95,6 +96,10 @@ jobs:
 
             if [ -n "$SERVICE_ACCOUNT" ]; then
               echo "$SERVICE_ACCOUNT" | base64 --decode > service-account.json
+            fi
+
+            if [ -n "$SERVICE_ACCOUNT_2" ]; then
+              echo "$SERVICE_ACCOUNT_2" | base64 --decode > service-account-2.json
             fi
 
       - name: Copy files to server
