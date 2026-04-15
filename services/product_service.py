@@ -7,6 +7,7 @@ import traceback
 from typing import Dict, List, Any, Optional
 from tortoise import connections
 
+from services import sellercloud_sync_queue
 from services.sellercloud_internal_service import (
     SellercloudPermanentError,
     sellercloud_internal_service,
@@ -2581,6 +2582,13 @@ class ProductService:
         try:
             sku, upc = item["sku"], item["value"]
 
+            # Capture current primary so we can decide between add_primary_upc and change_primary_upc
+            current_primary_rows = await conn.execute_query_dict(
+                "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE",
+                [sku],
+            )
+            current_primary = current_primary_rows[0]["upc"] if current_primary_rows else None
+
             # Check if UPC already exists for this SKU
             existing = await conn.execute_query_dict(
                 "SELECT upc, is_primary_upc FROM child_upcs WHERE upc = $1 AND child_sku = $2", [upc, sku]
@@ -2596,16 +2604,26 @@ class ProductService:
                     return {"row": item["row"], "sku": sku, "value": upc, "action": "Primary", "success": False, "error": f"UPC already exists for {upc_exists_other[0]['child_sku']}"}
                 await conn.execute_query("INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)", [upc, sku])
 
-                # Check if it auto-became primary
+                # Check if it auto-became primary (no prior primary on this SKU)
                 check = await conn.execute_query_dict("SELECT is_primary_upc FROM child_upcs WHERE upc = $1", [upc])
                 if check and check[0]["is_primary_upc"]:
+                    await sellercloud_sync_queue.enqueue(sku, upc, "add_primary_upc")
                     return {"row": item["row"], "sku": sku, "value": upc, "action": "Primary", "success": True}
 
             # Set as primary using DB function
             result = await conn.execute_query_dict("SELECT update_primary_upc_for_child($1, $2) as result", [sku, upc])
             db_result = json.loads(result[0]["result"]) if isinstance(result[0]["result"], str) else result[0]["result"]
 
-            return {"row": item["row"], "sku": sku, "value": upc, "action": "Primary", "success": db_result.get("success", False), "error": db_result.get("error")}
+            success = db_result.get("success", False)
+            if success:
+                if current_primary and current_primary != upc:
+                    await sellercloud_sync_queue.enqueue(
+                        sku, upc, "change_primary_upc", old_primary_upc=current_primary
+                    )
+                else:
+                    await sellercloud_sync_queue.enqueue(sku, upc, "add_primary_upc")
+
+            return {"row": item["row"], "sku": sku, "value": upc, "action": "Primary", "success": success, "error": db_result.get("error")}
         except Exception as e:
             return {"row": item["row"], "sku": item["sku"], "value": item["value"], "action": "Primary", "success": False, "error": str(e)}
 
@@ -2624,6 +2642,15 @@ class ProductService:
                 return {"row": item["row"], "sku": sku, "value": upc, "action": "Secondary", "success": False, "error": f"UPC already exists for {upc_exists_other[0]['child_sku']}"}
 
             await conn.execute_query("INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)", [upc, sku])
+
+            # If no prior primary existed, the new UPC may have auto-become primary
+            check = await conn.execute_query_dict(
+                "SELECT is_primary_upc FROM child_upcs WHERE upc = $1", [upc]
+            )
+            became_primary = bool(check and check[0]["is_primary_upc"])
+            sync_type = "add_primary_upc" if became_primary else "add_secondary_upc"
+            await sellercloud_sync_queue.enqueue(sku, upc, sync_type)
+
             return {"row": item["row"], "sku": sku, "value": upc, "action": "Secondary", "success": True}
         except Exception as e:
             return {"row": item["row"], "sku": item["sku"], "value": item["value"], "action": "Secondary", "success": False, "error": str(e)}
@@ -2651,6 +2678,7 @@ class ProductService:
                 "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
                 [clean_keyword, sku],
             )
+            await sellercloud_sync_queue.enqueue(sku, clean_keyword, "add_keyword")
             return {"row": item["row"], "sku": sku, "value": clean_keyword, "action": "Keyword", "success": True}
         except Exception as e:
             return {"row": item["row"], "sku": item["sku"], "value": item["value"], "action": "Keyword", "success": False, "error": str(e)}
@@ -2668,6 +2696,7 @@ class ProductService:
                 if upc_check[0]["is_primary_upc"]:
                     return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": False, "error": "Cannot delete primary UPC"}
                 await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [value])
+                await sellercloud_sync_queue.enqueue(sku, value, "delete_upc")
                 return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": True}
 
             # Check if it's a keyword
@@ -2678,6 +2707,7 @@ class ProductService:
                 await conn.execute_query(
                     "UPDATE child_products SET keywords = array_remove(keywords, $1) WHERE sku = $2", [value, sku]
                 )
+                await sellercloud_sync_queue.enqueue(sku, value, "delete_keyword")
                 return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": True}
 
             return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": False, "error": f"UPC/Keyword '{value}' not found for SKU '{sku}'"}

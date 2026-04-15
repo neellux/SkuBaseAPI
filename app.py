@@ -23,6 +23,7 @@ from listingoptions.routes.api_routes import router as lo_api_router
 from services.image_service import image_service
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
+from services.sellercloud_sync_poller import sellercloud_sync_poller
 from services.spo_poller import spo_poller
 from services.submission_poller import submission_poller
 from tortoise.contrib.fastapi import register_tortoise
@@ -115,12 +116,14 @@ async def startup_event():
 
     await submission_poller.start()
     await spo_poller.start()
+    await sellercloud_sync_poller.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("Listing API shutdown...")
 
+    await sellercloud_sync_poller.stop()
     await spo_poller.stop()
     await submission_poller.stop()
 
