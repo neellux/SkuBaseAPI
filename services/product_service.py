@@ -1526,6 +1526,27 @@ class ProductService:
 
                 children = list(children_map.values())
 
+                parent_sizing_scheme = parent.get("sizing_scheme")
+                if parent_sizing_scheme:
+                    default_conn = connections.get("default")
+                    scheme_rows = await default_conn.execute_query_dict(
+                        """
+                        SELECT size, "order"
+                        FROM listingoptions_sizing_schemes
+                        WHERE sizing_scheme = $1
+                        ORDER BY "order"
+                        """,
+                        [parent_sizing_scheme],
+                    )
+                    if scheme_rows:
+                        size_order = {row["size"]: row["order"] for row in scheme_rows}
+                        children.sort(
+                            key=lambda c: (
+                                size_order.get(c["size"], float("inf")),
+                                not c["is_primary"],
+                            )
+                        )
+
                 return {
                     "success": True,
                     "sku": sku,
@@ -2019,7 +2040,7 @@ class ProductService:
             return {"success": False, "error": "Failed to process assignment"}
 
     # ========================================================================
-    # UPC Management (DB only, no SellerCloud sync)
+    # UPC Management
     # ========================================================================
 
     @staticmethod
@@ -2202,7 +2223,7 @@ class ProductService:
             return {"success": False, "error": str(e)}
 
     # ========================================================================
-    # Keyword Management (DB only, no SellerCloud sync)
+    # Keyword Management (synced to SellerCloud as non-primary aliases)
     # ========================================================================
 
     @staticmethod
@@ -2232,6 +2253,34 @@ class ProductService:
 
             clean_keyword = validation.get("keyword", clean_keyword)
 
+            # Guard against duplicates before pushing to SellerCloud
+            existing = await conn.execute_query_dict(
+                "SELECT 1 FROM child_products WHERE sku = $1 AND $2 = ANY(keywords)",
+                [sku, clean_keyword],
+            )
+            if existing:
+                return {"success": False, "error": "Keyword already exists for this SKU"}
+
+            # Sync to SellerCloud first — leave DB untouched on failure so the UI can retry
+            try:
+                await sellercloud_internal_service.sync_add_alias(
+                    sku, clean_keyword, is_primary=False
+                )
+            except SellercloudPermanentError as e:
+                logger.info(
+                    f"Permanent SellerCloud failure adding keyword {clean_keyword} to {sku}: {e}"
+                )
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                logger.error(
+                    f"Transient SellerCloud failure adding keyword {clean_keyword} to {sku}: {e}",
+                    exc_info=True,
+                )
+                return {
+                    "success": False,
+                    "error": "SellerCloud is temporarily unavailable. Please try again.",
+                }
+
             # Add to keywords array
             await conn.execute_query(
                 """UPDATE child_products
@@ -2260,6 +2309,24 @@ class ProductService:
             )
             if not check:
                 return {"success": False, "error": f"Keyword '{clean_keyword}' not found for SKU '{sku}'"}
+
+            # Sync to SellerCloud first — leave DB untouched on failure so the UI can retry
+            try:
+                await sellercloud_internal_service.sync_delete_alias(sku, clean_keyword)
+            except SellercloudPermanentError as e:
+                logger.info(
+                    f"Permanent SellerCloud failure deleting keyword {clean_keyword} from {sku}: {e}"
+                )
+                return {"success": False, "error": str(e)}
+            except Exception as e:
+                logger.error(
+                    f"Transient SellerCloud failure deleting keyword {clean_keyword} from {sku}: {e}",
+                    exc_info=True,
+                )
+                return {
+                    "success": False,
+                    "error": "SellerCloud is temporarily unavailable. Please try again.",
+                }
 
             await conn.execute_query(
                 """UPDATE child_products
