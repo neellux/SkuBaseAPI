@@ -33,7 +33,7 @@ logging.basicConfig(level=LOGGING_LEVEL)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Listing API",
+    title="SkuBase API",
     description="API for managing dynamic database tables and mapping lists.",
     version="1.0.0",
     docs_url=None,
@@ -42,7 +42,7 @@ app = FastAPI(
 )
 
 api_app = FastAPI(
-    title="Listing Public API",
+    title="SkuBase Public API",
     description="Publicly accessible endpoints.",
     version="1.0.0",
     redoc_url=None,
@@ -98,7 +98,7 @@ async def periodic_tasks_1min():
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Listing API startup...")
+    logger.info("SkuBase API startup...")
 
     logger.info("Initializing SellerCloud service...")
     await sellercloud_service.initialize()
@@ -121,7 +121,7 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    logger.info("Listing API shutdown...")
+    logger.info("SkuBase API shutdown...")
 
     await sellercloud_sync_poller.stop()
     await spo_poller.stop()
@@ -143,7 +143,7 @@ async def shutdown_event():
 @app.get("/")
 async def root():
     return {
-        "message": "Listing API",
+        "message": "SkuBase API",
         "version": "1.0.0",
     }
 
