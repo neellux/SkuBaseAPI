@@ -923,6 +923,15 @@ class BulkImportItem(BaseModel):
     sku: str
     value: str
     action: str = Field(..., description="Primary, Secondary, Keyword, or Delete")
+    classification: Optional[str] = Field(
+        None,
+        description="Resolved action: add_primary, add_secondary, add_keyword, "
+                     "noop, promote_primary, swap_primary, swap_secondary, "
+                     "swap_keyword, delete_upc, delete_keyword",
+    )
+    source_sku: Optional[str] = Field(
+        None, description="SKU that currently owns the value (for swaps)",
+    )
 
 
 class BulkImportValidationError(BaseModel):
@@ -953,8 +962,10 @@ class BulkImportResultItem(BaseModel):
     sku: str
     value: str
     action: str
+    classification: Optional[str] = None
     success: bool
     error: Optional[str] = None
+    operation_id: Optional[int] = None
 
 
 class BulkImportResponse(BaseModel):
