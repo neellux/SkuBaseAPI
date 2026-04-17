@@ -2564,17 +2564,248 @@ class ProductService:
                     item["source_sku"] = source_sku
                 items.append(item)
 
+            # ============================================================
+            # Simulate final UPC state per SKU and validate primary invariants.
+            #
+            # Rules:
+            # 1. Every SKU must have at least one UPC after the import.
+            # 2. Every SKU must have at least one primary-capable UPC (not EAN-8).
+            #    EAN-8 cannot be primary, so if only EAN-8 UPCs remain, there's no
+            #    way to have a valid primary.
+            # 3. If the current primary is moved away and no explicit new primary is
+            #    assigned, a secondary will be auto-promoted by the DB trigger.
+            #    Surface this to the UI as an `auto_promotions` warning.
+            # Keywords are NOT UPCs — they never count toward these checks.
+            # ============================================================
+
+            # Identify all SKUs affected by the import (either as source or target of UPC ops)
+            upc_affected_skus: set = set()
+            rows_affecting_sku: Dict[str, List[int]] = {}  # sku -> list of dataframe idx
+
+            for it in items:
+                cls = it.get("classification") or ""
+                idx = it["row"] - 2
+                if cls in ("swap_primary", "swap_secondary"):
+                    upc_affected_skus.add(it["sku"])
+                    upc_affected_skus.add(it["source_sku"])
+                    rows_affecting_sku.setdefault(it["source_sku"], []).append(idx)
+                    rows_affecting_sku.setdefault(it["sku"], []).append(idx)
+                elif cls in ("add_primary", "add_secondary", "promote_primary"):
+                    upc_affected_skus.add(it["sku"])
+                elif cls == "delete_upc":
+                    upc_affected_skus.add(it["sku"])
+                    rows_affecting_sku.setdefault(it["sku"], []).append(idx)
+
+            # Build simulated UPC state per affected SKU
+            simulated_upcs: Dict[str, Dict[str, Dict[str, Any]]] = {}
+            original_primary_by_sku: Dict[str, str] = {}
+            explicit_new_primary_by_sku: Dict[str, str] = {}
+
+            if upc_affected_skus:
+                current_rows = await conn.execute_query_dict(
+                    "SELECT child_sku, upc, is_primary_upc FROM child_upcs WHERE child_sku = ANY($1)",
+                    [list(upc_affected_skus)],
+                )
+                for r in current_rows:
+                    sku = r["child_sku"]
+                    upc = r["upc"]
+                    simulated_upcs.setdefault(sku, {})[upc] = {
+                        "is_ean8": len(upc) == 8,
+                        "is_primary": r["is_primary_upc"],
+                    }
+                    if r["is_primary_upc"]:
+                        original_primary_by_sku[sku] = upc
+
+                # Apply CSV changes to the simulation
+                for it in items:
+                    cls = it.get("classification") or ""
+                    sku = it["sku"]
+                    val = it["value"]
+                    src = it.get("source_sku")
+
+                    if cls == "swap_primary":
+                        if src and val in simulated_upcs.get(src, {}):
+                            simulated_upcs[src].pop(val, None)
+                        # Demote any existing primary on target
+                        for other in simulated_upcs.get(sku, {}).values():
+                            other["is_primary"] = False
+                        simulated_upcs.setdefault(sku, {})[val] = {
+                            "is_ean8": len(val) == 8,
+                            "is_primary": True,
+                        }
+                        explicit_new_primary_by_sku[sku] = val
+                    elif cls == "swap_secondary":
+                        if src and val in simulated_upcs.get(src, {}):
+                            simulated_upcs[src].pop(val, None)
+                        simulated_upcs.setdefault(sku, {})[val] = {
+                            "is_ean8": len(val) == 8,
+                            "is_primary": False,
+                        }
+                    elif cls == "add_primary":
+                        for other in simulated_upcs.get(sku, {}).values():
+                            other["is_primary"] = False
+                        simulated_upcs.setdefault(sku, {})[val] = {
+                            "is_ean8": len(val) == 8,
+                            "is_primary": True,
+                        }
+                        explicit_new_primary_by_sku[sku] = val
+                    elif cls == "add_secondary":
+                        simulated_upcs.setdefault(sku, {})[val] = {
+                            "is_ean8": len(val) == 8,
+                            "is_primary": False,
+                        }
+                    elif cls == "promote_primary":
+                        for upc, meta in simulated_upcs.get(sku, {}).items():
+                            meta["is_primary"] = (upc == val)
+                        explicit_new_primary_by_sku[sku] = val
+                    elif cls == "delete_upc":
+                        simulated_upcs.get(sku, {}).pop(val, None)
+
+            # Validate each affected SKU's final state
+            stranded_no_upcs: List[str] = []
+            stranded_only_ean8: List[str] = []
+            auto_promotions: List[Dict[str, Any]] = []
+
+            for sku in upc_affected_skus:
+                upcs = simulated_upcs.get(sku, {})
+                if not upcs:
+                    stranded_no_upcs.append(sku)
+                    continue
+
+                primary_capable = [u for u, m in upcs.items() if not m["is_ean8"]]
+                if not primary_capable:
+                    stranded_only_ean8.append(sku)
+                    continue
+
+                # Detect auto-promotion: current primary moved away, no explicit new primary
+                original_primary = original_primary_by_sku.get(sku)
+                explicit_new = explicit_new_primary_by_sku.get(sku)
+                original_still_here = original_primary and original_primary in upcs
+                has_any_primary = any(m["is_primary"] for m in upcs.values())
+
+                if original_primary and not original_still_here and not explicit_new and not has_any_primary:
+                    # Trigger will auto-promote the oldest primary-capable UPC
+                    auto_promotions.append({
+                        "sku": sku,
+                        "previous_primary": original_primary,
+                        "candidates": primary_capable,  # one of these will become the new primary
+                    })
+
+            # Report errors for stranded SKUs
+            for sku in stranded_no_upcs:
+                msg = (
+                    f"Import would leave SKU '{sku}' with no UPCs. "
+                    f"A SKU must always have at least one primary UPC."
+                )
+                for idx in rows_affecting_sku.get(sku, []):
+                    error_by_index[idx] = msg
+                    row_num = idx + 2
+                    offending = next(
+                        (it for it in items
+                         if it["row"] == row_num
+                         and (it.get("source_sku") == sku or (it.get("classification") == "delete_upc" and it["sku"] == sku))),
+                        None,
+                    )
+                    errors.append({
+                        "row": row_num,
+                        "sku": offending["sku"] if offending else None,
+                        "value": offending["value"] if offending else None,
+                        "field": "SKU",
+                        "message": msg,
+                    })
+
+            for sku in stranded_only_ean8:
+                msg = (
+                    f"Import would leave SKU '{sku}' with only EAN-8 UPCs, which cannot be primary. "
+                    f"A SKU must always have at least one primary-capable UPC (UPC-A or EAN-13)."
+                )
+                for idx in rows_affecting_sku.get(sku, []):
+                    error_by_index[idx] = msg
+                    row_num = idx + 2
+                    offending = next(
+                        (it for it in items
+                         if it["row"] == row_num
+                         and (it.get("source_sku") == sku or (it.get("classification") == "delete_upc" and it["sku"] == sku))),
+                        None,
+                    )
+                    errors.append({
+                        "row": row_num,
+                        "sku": offending["sku"] if offending else None,
+                        "value": offending["value"] if offending else None,
+                        "field": "SKU",
+                        "message": msg,
+                    })
+
+            # Drop invalid items so they don't propagate to processing
+            stranded_set = set(stranded_no_upcs) | set(stranded_only_ean8)
+            if stranded_set:
+                items = [
+                    it for it in items
+                    if not (
+                        (it.get("classification") in ("swap_primary", "swap_secondary")
+                         and it.get("source_sku") in stranded_set)
+                        or (it.get("classification") == "delete_upc"
+                            and it["sku"] in stranded_set)
+                    )
+                ]
+
+            # Detect donor SKUs: those losing UPCs/keywords without receiving any in return
+            # (one-way transfers, not bidirectional swaps). Break losses down by
+            # primary/secondary so the UI can surface "losing 1 Primary UPC" etc.
+            sku_gains: Dict[str, int] = {}
+            sku_loss_primary: Dict[str, int] = {}
+            sku_loss_secondary: Dict[str, int] = {}
+            for it in items:
+                if (it.get("classification") or "").startswith("swap_") and it.get("source_sku"):
+                    target = it["sku"]
+                    src = it["source_sku"]
+                    val = it["value"]
+                    sku_gains[target] = sku_gains.get(target, 0) + 1
+                    was_primary_on_source = original_primary_by_sku.get(src) == val
+                    if was_primary_on_source:
+                        sku_loss_primary[src] = sku_loss_primary.get(src, 0) + 1
+                    else:
+                        sku_loss_secondary[src] = sku_loss_secondary.get(src, 0) + 1
+
+            donors = {}
+            for sku in set(list(sku_loss_primary.keys()) + list(sku_loss_secondary.keys())):
+                lost_primary = sku_loss_primary.get(sku, 0)
+                lost_secondary = sku_loss_secondary.get(sku, 0)
+                total_losses = lost_primary + lost_secondary
+                gains = sku_gains.get(sku, 0)
+                if total_losses > gains:
+                    donors[sku] = {
+                        "losses": total_losses,
+                        "gains": gains,
+                        "lost_primary": lost_primary,
+                        "lost_secondary": lost_secondary,
+                    }
+
             file_data = None
             if errors:
                 df["Error"] = df.index.map(lambda i: error_by_index.get(i, ""))
                 csv_with_errors = df.to_csv(index=False)
                 file_data = base64.b64encode(csv_with_errors.encode()).decode()
 
-            return {"valid": len(errors) == 0, "errors": errors, "items": items if not errors else [], "file_data": file_data}
+            # Collect noop items so the UI can surface them as a warning + downloadable list
+            noops = [
+                {"row": it["row"], "sku": it["sku"], "value": it["value"], "action": it["action"]}
+                for it in items if it.get("classification") == "noop"
+            ]
+
+            return {
+                "valid": len(errors) == 0,
+                "errors": errors,
+                "items": items if not errors else [],
+                "file_data": file_data,
+                "donors": donors,
+                "auto_promotions": auto_promotions,
+                "noops": noops,
+            }
 
         except Exception as e:
             logger.error(f"Error validating bulk import: {e}", exc_info=True)
-            return {"valid": False, "errors": [{"row": 0, "field": "file", "message": f"Unexpected error: {str(e)}"}], "items": []}
+            return {"valid": False, "errors": [{"row": 0, "field": "file", "message": f"Unexpected error: {str(e)}"}], "items": [], "donors": {}, "auto_promotions": [], "noops": []}
 
     @staticmethod
     async def process_bulk_import(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2782,8 +3013,9 @@ class ProductService:
     @staticmethod
     async def _bulk_process_swap(conn, item: Dict) -> Dict:
         """
-        Synchronous swap: SC operations first (tracked), then DB changes in a transaction.
-        Re-derives all swap metadata from the database at process time (never trusts client).
+        DB-first swap: DB transaction commits first (source of truth). Then mirror to
+        SellerCloud with tracked but non-raising failures. Result is success=True if
+        DB succeeds, even if SC steps fail — operation_id lets devs trace SC divergence.
         """
         from services import sellercloud_sync_logger
         from tortoise.transactions import in_transaction
@@ -2800,225 +3032,345 @@ class ProductService:
                 "success": success, "error": error, "operation_id": operation_id,
             }
 
-        try:
-            # ================================================================
-            # Re-derive swap state from DB (TOCTOU protection)
-            # ================================================================
-            if classification == "swap_keyword":
-                # Keyword swap
-                kw_check = await conn.execute_query_dict(
-                    "SELECT sku FROM (SELECT unnest(keywords) AS kw, sku FROM child_products) sub WHERE kw = $1",
-                    [value],
-                )
-                if not kw_check:
-                    return _result(False, f"Keyword '{value}' not found on any SKU")
-                source_sku = kw_check[0]["sku"]
-                if source_sku == target_sku:
-                    return _result(True)  # already on target — noop
-
-                async with sellercloud_sync_logger.tracked_operation(
-                    "swap_keyword", target_sku, value,
-                    source="bulk_import", source_sku=source_sku,
-                ) as tracker:
-                    # Check if keyword is in source's alias list
-                    source_aliases_resp = await sellercloud_internal_service.load_aliases(source_sku)
-                    source_dto = (source_aliases_resp.get("Data") or {}).get("DTO") or {}
-                    source_alias_set = {
-                        a.get("Name") for a in (source_dto.get("Aliases") or []) if a.get("Name")
-                    }
-
-                    # Step 1: Remove keyword alias from source SC — check first
-                    if value in source_alias_set:
-                        del_result = await sellercloud_internal_service.save_alias(source_sku, value, action="delete")
-                        if not del_result.get("Success"):
-                            msg = (del_result.get("Notification") or {}).get("Message", "") or ""
-                            if "not found" not in msg.lower() and "does not exist" not in msg.lower():
-                                error_msg = f"Failed to delete keyword alias {value} from {source_sku}: {msg}"
-                                await tracker.record_failure(source_sku, value, "delete_alias", error_msg, "Delete keyword alias from source")
-                                raise Exception(error_msg)
-                        await tracker.record_step(source_sku, value, "delete_alias", "Deleted keyword alias from source")
-                    else:
-                        await tracker.record_skip(source_sku, value, "delete_alias", "Keyword not in source alias list")
-
-                    # Step 2: Validate alias on target
-                    validation = await sellercloud_internal_service.validate_alias(target_sku, value)
-                    if not validation.get("IsValid"):
-                        already = validation.get("AlreadyUsedForProduct")
-                        error_msg = f"Keyword {value} already used by product (ID: {already})" if already else (
-                            validation.get("ErrorMessage") or (validation.get("Notification") or {}).get("Message", "") or f"Keyword {value} failed validation"
-                        )
-                        await tracker.record_failure(target_sku, value, "validate_alias", error_msg, "Validate keyword alias on target")
-                        raise SellercloudPermanentError(error_msg)
-                    await tracker.record_step(target_sku, value, "validate_alias", "Validated keyword alias on target")
-
-                    # Step 3: Save alias (add) on target
-                    save_result = await sellercloud_internal_service.save_alias(target_sku, value, action="add")
-                    if not save_result.get("Success"):
-                        msg = (save_result.get("Notification") or {}).get("Message", "") or ""
-                        await tracker.record_failure(target_sku, value, "add_alias", msg or "Save alias failed", "Add keyword alias to target")
-                        raise Exception(f"save_alias(add {value} to {target_sku}) failed: {msg}")
-                    await tracker.record_step(target_sku, value, "add_alias", "Added keyword alias to target")
-
-                    # DB: remove from source, add to target (in transaction, source first)
-                    async with in_transaction("product_db") as txn:
-                        await txn.execute_query(
-                            "UPDATE child_products SET keywords = array_remove(keywords, $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
-                            [value, source_sku],
-                        )
-                        await txn.execute_query(
-                            "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
-                            [value, target_sku],
-                        )
-
-                return _result(True, operation_id=tracker.operation_id)
-
-            # ================================================================
-            # UPC swap (swap_primary or swap_secondary)
-            # ================================================================
-            upc_check = await conn.execute_query_dict(
-                "SELECT child_sku, is_primary_upc FROM child_upcs WHERE upc = $1", [value]
+        # ====================================================================
+        # KEYWORD SWAP
+        # ====================================================================
+        if classification == "swap_keyword":
+            # Find source from DB
+            kw_check = await conn.execute_query_dict(
+                "SELECT sku FROM (SELECT unnest(keywords) AS kw, sku FROM child_products) sub WHERE kw = $1",
+                [value],
             )
-            if not upc_check:
-                return _result(False, f"UPC '{value}' not found on any SKU")
-            source_sku = upc_check[0]["child_sku"]
-            was_primary_on_source = upc_check[0]["is_primary_upc"]
+            if not kw_check:
+                return _result(False, f"Keyword '{value}' not found on any SKU")
+            source_sku = kw_check[0]["sku"]
             if source_sku == target_sku:
                 return _result(True)  # already on target — noop
 
-            make_primary = classification == "swap_primary"
-
-            # Get target's current primary (for demotion if needed)
-            target_primary_rows = await conn.execute_query_dict(
-                "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE", [target_sku]
-            )
-            target_current_primary = target_primary_rows[0]["upc"] if target_primary_rows else None
-
-            async with sellercloud_sync_logger.tracked_operation(
-                classification, target_sku, value,
-                source="bulk_import", source_sku=source_sku,
-                metadata={
-                    "was_primary_on_source": was_primary_on_source,
-                    "target_current_primary": target_current_primary,
-                    "make_primary": make_primary,
-                },
-            ) as tracker:
-                # Load source aliases once — used to decide which deletes are needed
-                source_aliases_resp = await sellercloud_internal_service.load_aliases(source_sku)
-                source_dto = (source_aliases_resp.get("Data") or {}).get("DTO") or {}
-                source_alias_set = {
-                    a.get("Name") for a in (source_dto.get("Aliases") or []) if a.get("Name")
-                }
-
-                # ==============================================================
-                # SOURCE-SIDE SC OPERATIONS
-                # ==============================================================
-                if was_primary_on_source:
-                    # Find fallback Y = oldest remaining UPC on source
-                    remaining = await conn.execute_query_dict(
-                        "SELECT upc FROM child_upcs WHERE child_sku = $1 AND upc != $2 ORDER BY created_at ASC LIMIT 1",
-                        [source_sku, value],
-                    )
-                    fallback_upc = remaining[0]["upc"] if remaining else None
-
-                    if fallback_upc:
-                        # Promote fallback: remove from aliases if present, then set as primary UPC
-                        if fallback_upc in source_alias_set:
-                            del_result = await sellercloud_internal_service.save_alias(source_sku, fallback_upc, action="delete")
-                            if not del_result.get("Success"):
-                                msg = (del_result.get("Notification") or {}).get("Message", "") or ""
-                                error_msg = f"Failed to remove fallback {fallback_upc} from source aliases: {msg}"
-                                await tracker.record_failure(source_sku, fallback_upc, "delete_alias", error_msg, "Remove fallback from source aliases (promoting to primary)")
-                                raise Exception(error_msg)
-                            await tracker.record_step(source_sku, fallback_upc, "delete_alias", "Removed fallback from source aliases (promoting to primary)")
-                        else:
-                            await tracker.record_skip(source_sku, fallback_upc, "delete_alias", "Fallback not in source alias list, skip delete")
-
-                        result = await sellercloud_service.update_product_upc(source_sku, fallback_upc)
-                        if not result.get("success"):
-                            error_msg = f"Failed to set primary UPC on {source_sku} to {fallback_upc}: {result}"
-                            await tracker.record_failure(source_sku, fallback_upc, "set_primary_upc", error_msg, "Promote fallback to primary UPC on source")
-                            raise Exception(error_msg)
-                        await tracker.record_step(source_sku, fallback_upc, "set_primary_upc", "Promoted fallback to primary UPC on source")
-                    else:
-                        # No fallback — clear primary UPC on source
-                        result = await sellercloud_service.update_product_upc(source_sku, "")
-                        if not result.get("success"):
-                            error_msg = f"Failed to clear primary UPC on {source_sku}: {result}"
-                            await tracker.record_failure(source_sku, value, "clear_primary_upc", error_msg, "Clear primary UPC on source (no fallback)")
-                            raise Exception(error_msg)
-                        await tracker.record_step(source_sku, value, "clear_primary_upc", "Cleared primary UPC on source (no fallback UPC)")
-
-                # Delete X alias from source — check first, skip if not present
-                if value in source_alias_set:
-                    del_result = await sellercloud_internal_service.save_alias(source_sku, value, action="delete")
-                    if not del_result.get("Success"):
-                        msg = (del_result.get("Notification") or {}).get("Message", "") or ""
-                        # Tolerate "not found" — may have been removed by the BasicInfo clear above
-                        if "not found" not in msg.lower() and "does not exist" not in msg.lower():
-                            error_msg = f"Failed to delete alias {value} from {source_sku}: {msg}"
-                            await tracker.record_failure(source_sku, value, "delete_alias", error_msg, "Delete UPC alias from source")
-                            raise Exception(error_msg)
-                    await tracker.record_step(source_sku, value, "delete_alias", "Deleted UPC alias from source")
-                else:
-                    await tracker.record_skip(source_sku, value, "delete_alias", "UPC not in source alias list (only in BasicInfo)")
-
-                # ==============================================================
-                # TARGET-SIDE SC OPERATIONS
-                # Primary UPCs go in BasicInfo only (not aliases).
-                # Secondary UPCs go in aliases only (not BasicInfo).
-                # ==============================================================
-
-                # Validate alias on target (checks UPC isn't used by another product)
-                validation = await sellercloud_internal_service.validate_alias(target_sku, value)
-                if not validation.get("IsValid"):
-                    already = validation.get("AlreadyUsedForProduct")
-                    if already:
-                        error_msg = f"UPC {value} is already used by another product (ID: {already})"
-                        await tracker.record_failure(target_sku, value, "validate_alias", error_msg, "Validate UPC on target")
-                        raise SellercloudPermanentError(error_msg)
-                    error_msg = validation.get("ErrorMessage") or (validation.get("Notification") or {}).get("Message", "")
-                    await tracker.record_failure(target_sku, value, "validate_alias", error_msg or "Validation failed", "Validate UPC on target")
-                    raise SellercloudPermanentError(error_msg or f"UPC {value} failed validation in SellerCloud")
-                await tracker.record_step(target_sku, value, "validate_alias", "Validated UPC on target")
-
-                if make_primary:
-                    # Primary: set BasicInfo UPC directly — no alias add needed
-                    primary_result = await sellercloud_service.update_product_upc(target_sku, value)
-                    if not primary_result.get("success"):
-                        error_msg = f"Failed to set primary UPC on {target_sku} to {value}: {primary_result}"
-                        await tracker.record_failure(target_sku, value, "set_primary_upc", error_msg, "Set primary UPC on target")
-                        raise Exception(error_msg)
-                    await tracker.record_step(target_sku, value, "set_primary_upc", "Set primary UPC on target")
-                else:
-                    # Secondary: add to aliases only — no BasicInfo change
-                    save_result = await sellercloud_internal_service.save_alias(target_sku, value, action="add")
-                    if not save_result.get("Success"):
-                        msg = (save_result.get("Notification") or {}).get("Message", "") or ""
-                        await tracker.record_failure(target_sku, value, "add_alias", msg or "Save alias failed", "Add secondary UPC alias to target")
-                        raise Exception(f"save_alias(add {value} to {target_sku}) failed: {msg}")
-                    await tracker.record_step(target_sku, value, "add_alias", "Added secondary UPC alias to target")
-
-                # ==============================================================
-                # DB SWAP (in explicit transaction — prevents data loss on crash)
-                # ==============================================================
+            # === DB FIRST (source of truth) ===
+            try:
                 async with in_transaction("product_db") as txn:
-                    await txn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [value])
-                    if make_primary:
-                        await txn.execute_query(
-                            "INSERT INTO child_upcs (upc, child_sku, is_primary_upc) VALUES ($1, $2, TRUE)",
-                            [value, target_sku],
-                        )
-                    else:
-                        await txn.execute_query(
-                            "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)",
-                            [value, target_sku],
-                        )
+                    await txn.execute_query(
+                        "UPDATE child_products SET keywords = array_remove(keywords, $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
+                        [value, source_sku],
+                    )
+                    await txn.execute_query(
+                        "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
+                        [value, target_sku],
+                    )
+            except Exception as e:
+                logger.error(f"DB swap failed for keyword {value} {source_sku}->{target_sku}: {e}", exc_info=True)
+                return _result(False, f"DB swap failed: {e}")
 
-            return _result(True, operation_id=tracker.operation_id)
+            # === SC MIRROR (tracked, non-blocking) ===
+            op_id = None
+            async with sellercloud_sync_logger.tracked_operation(
+                "swap_keyword", target_sku, value,
+                source="bulk_import", source_sku=source_sku,
+            ) as tracker:
+                op_id = tracker.operation_id
+                await ProductService._sync_keyword_swap_to_sc(tracker, source_sku, target_sku, value)
 
-        except SellercloudPermanentError as e:
-            logger.info(f"Permanent SC failure during swap {value} to {target_sku}: {e}")
-            return _result(False, str(e))
+            return _result(True, operation_id=op_id)
+
+        # ====================================================================
+        # UPC SWAP (swap_primary or swap_secondary)
+        # ====================================================================
+        upc_check = await conn.execute_query_dict(
+            "SELECT child_sku, is_primary_upc FROM child_upcs WHERE upc = $1", [value]
+        )
+        if not upc_check:
+            return _result(False, f"UPC '{value}' not found on any SKU")
+        source_sku = upc_check[0]["child_sku"]
+        was_primary_on_source = upc_check[0]["is_primary_upc"]
+        if source_sku == target_sku:
+            return _result(True)  # already on target — noop
+
+        make_primary = classification == "swap_primary"
+
+        # Capture target's current primary BEFORE swap (for SC demotion mirroring)
+        target_primary_rows = await conn.execute_query_dict(
+            "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE", [target_sku]
+        )
+        target_current_primary = target_primary_rows[0]["upc"] if target_primary_rows else None
+
+        # === DB FIRST (source of truth) ===
+        # DB triggers handle invariants:
+        #   trg_child_upcs_after_delete  → auto-promotes oldest remaining UPC on source if primary was deleted
+        #   trg_child_upcs_before_insert → auto-demotes existing primary on target when new primary inserted
+        try:
+            async with in_transaction("product_db") as txn:
+                await txn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [value])
+                if make_primary:
+                    await txn.execute_query(
+                        "INSERT INTO child_upcs (upc, child_sku, is_primary_upc) VALUES ($1, $2, TRUE)",
+                        [value, target_sku],
+                    )
+                else:
+                    await txn.execute_query(
+                        "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)",
+                        [value, target_sku],
+                    )
         except Exception as e:
-            logger.error(f"Swap failed for {value} to {target_sku}: {e}", exc_info=True)
-            return _result(False, f"Swap failed: {e}")
+            logger.error(f"DB swap failed for UPC {value} {source_sku}->{target_sku}: {e}", exc_info=True)
+            return _result(False, f"DB swap failed: {e}")
+
+        # Query post-DB state to find the new primary on source (promoted by trigger)
+        new_source_primary = None
+        if was_primary_on_source:
+            remaining = await conn.execute_query_dict(
+                "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE", [source_sku]
+            )
+            new_source_primary = remaining[0]["upc"] if remaining else None
+
+        # === SC MIRROR (tracked, non-blocking) ===
+        op_id = None
+        async with sellercloud_sync_logger.tracked_operation(
+            classification, target_sku, value,
+            source="bulk_import", source_sku=source_sku,
+            metadata={
+                "was_primary_on_source": was_primary_on_source,
+                "target_current_primary": target_current_primary,
+                "make_primary": make_primary,
+                "new_source_primary": new_source_primary,
+            },
+        ) as tracker:
+            op_id = tracker.operation_id
+            await ProductService._sync_upc_swap_to_sc(
+                tracker,
+                source_sku=source_sku,
+                target_sku=target_sku,
+                value=value,
+                was_primary_on_source=was_primary_on_source,
+                make_primary=make_primary,
+                target_current_primary=target_current_primary,
+                new_source_primary=new_source_primary,
+            )
+
+        return _result(True, operation_id=op_id)
+
+    @staticmethod
+    async def _sync_keyword_swap_to_sc(tracker, source_sku, target_sku, value):
+        """Mirror a completed DB keyword swap to SellerCloud. Never raises."""
+        # Load source aliases
+        try:
+            source_aliases_resp = await sellercloud_internal_service.load_aliases(source_sku)
+            source_dto = (source_aliases_resp.get("Data") or {}).get("DTO") or {}
+            source_alias_set = {a.get("Name") for a in (source_dto.get("Aliases") or []) if a.get("Name")}
+        except Exception as e:
+            await tracker.record_failure(source_sku, value, "load_aliases", str(e), "Load source aliases")
+            source_alias_set = set()
+
+        # Delete keyword from source SC aliases (check first)
+        if value in source_alias_set:
+            try:
+                del_result = await sellercloud_internal_service.save_alias(source_sku, value, action="delete")
+                if not del_result.get("Success"):
+                    msg = (del_result.get("Notification") or {}).get("Message", "") or ""
+                    if "not found" in msg.lower() or "does not exist" in msg.lower():
+                        await tracker.record_step(source_sku, value, "delete_alias", "Keyword already absent from source aliases")
+                    else:
+                        await tracker.record_failure(source_sku, value, "delete_alias", msg, "Delete keyword alias from source")
+                        logger.error(f"SC delete keyword {value} from {source_sku}: {msg}")
+                else:
+                    await tracker.record_step(source_sku, value, "delete_alias", "Deleted keyword alias from source")
+            except Exception as e:
+                await tracker.record_failure(source_sku, value, "delete_alias", str(e), "Delete keyword alias from source")
+                logger.error(f"SC delete keyword {value} from {source_sku}: {e}")
+        else:
+            await tracker.record_skip(source_sku, value, "delete_alias", "Keyword not in source alias list")
+
+        # Validate alias on target
+        try:
+            validation = await sellercloud_internal_service.validate_alias(target_sku, value)
+            if not validation.get("IsValid"):
+                already = validation.get("AlreadyUsedForProduct")
+                error_msg = f"Keyword {value} already used by product (ID: {already})" if already else (
+                    validation.get("ErrorMessage") or (validation.get("Notification") or {}).get("Message", "") or f"Keyword {value} failed validation"
+                )
+                await tracker.record_failure(target_sku, value, "validate_alias", error_msg, "Validate keyword alias on target")
+                logger.error(f"SC validate keyword {value} on {target_sku}: {error_msg}")
+                return  # can't add alias if validation failed
+            await tracker.record_step(target_sku, value, "validate_alias", "Validated keyword alias on target")
+        except Exception as e:
+            await tracker.record_failure(target_sku, value, "validate_alias", str(e), "Validate keyword alias on target")
+            logger.error(f"SC validate keyword {value} on {target_sku}: {e}")
+            return
+
+        # Add keyword alias to target
+        try:
+            save_result = await sellercloud_internal_service.save_alias(target_sku, value, action="add")
+            if not save_result.get("Success"):
+                msg = (save_result.get("Notification") or {}).get("Message", "") or ""
+                await tracker.record_failure(target_sku, value, "add_alias", msg or "Save alias failed", "Add keyword alias to target")
+                logger.error(f"SC add keyword {value} to {target_sku}: {msg}")
+            else:
+                await tracker.record_step(target_sku, value, "add_alias", "Added keyword alias to target")
+        except Exception as e:
+            await tracker.record_failure(target_sku, value, "add_alias", str(e), "Add keyword alias to target")
+            logger.error(f"SC add keyword {value} to {target_sku}: {e}")
+
+    @staticmethod
+    async def _sync_upc_swap_to_sc(
+        tracker,
+        source_sku: str,
+        target_sku: str,
+        value: str,
+        was_primary_on_source: bool,
+        make_primary: bool,
+        target_current_primary: Optional[str],
+        new_source_primary: Optional[str],
+    ):
+        """Mirror a completed DB UPC swap to SellerCloud. Never raises — logs SC failures."""
+        # Load source aliases
+        try:
+            source_aliases_resp = await sellercloud_internal_service.load_aliases(source_sku)
+            source_dto = (source_aliases_resp.get("Data") or {}).get("DTO") or {}
+            source_alias_set = {a.get("Name") for a in (source_dto.get("Aliases") or []) if a.get("Name")}
+        except Exception as e:
+            await tracker.record_failure(source_sku, value, "load_aliases", str(e), "Load source aliases")
+            source_alias_set = set()
+
+        # ==============================================================
+        # SOURCE-SIDE SC MIRRORING (only if source primary changed)
+        # ==============================================================
+        if was_primary_on_source:
+            if new_source_primary:
+                # Remove new primary from source aliases (was secondary, now primary)
+                if new_source_primary in source_alias_set:
+                    try:
+                        del_result = await sellercloud_internal_service.save_alias(source_sku, new_source_primary, action="delete")
+                        if not del_result.get("Success"):
+                            msg = (del_result.get("Notification") or {}).get("Message", "") or ""
+                            if "not found" in msg.lower() or "does not exist" in msg.lower():
+                                await tracker.record_step(source_sku, new_source_primary, "delete_alias", "New source primary already absent from aliases")
+                            else:
+                                await tracker.record_failure(source_sku, new_source_primary, "delete_alias", msg, "Remove new source primary from aliases")
+                                logger.error(f"SC remove new primary {new_source_primary} from {source_sku} aliases: {msg}")
+                        else:
+                            await tracker.record_step(source_sku, new_source_primary, "delete_alias", "Removed new source primary from aliases (promoting to primary)")
+                    except Exception as e:
+                        await tracker.record_failure(source_sku, new_source_primary, "delete_alias", str(e), "Remove new source primary from aliases")
+                        logger.error(f"SC remove new primary {new_source_primary} from {source_sku} aliases: {e}")
+                else:
+                    await tracker.record_skip(source_sku, new_source_primary, "delete_alias", "New source primary not in aliases, skip delete")
+
+                # Set new primary in BasicInfo on source
+                try:
+                    result = await sellercloud_service.update_product_upc(source_sku, new_source_primary)
+                    if not result.get("success"):
+                        error_msg = f"Failed to set primary UPC on {source_sku} to {new_source_primary}: {result}"
+                        await tracker.record_failure(source_sku, new_source_primary, "set_primary_upc", error_msg, "Set new primary on source")
+                        logger.error(error_msg)
+                    else:
+                        await tracker.record_step(source_sku, new_source_primary, "set_primary_upc", "Set new primary UPC on source")
+                except Exception as e:
+                    await tracker.record_failure(source_sku, new_source_primary, "set_primary_upc", str(e), "Set new primary on source")
+                    logger.error(f"SC set primary {new_source_primary} on {source_sku}: {e}")
+            else:
+                # No UPCs remaining on source — clear BasicInfo
+                try:
+                    result = await sellercloud_service.update_product_upc(source_sku, "")
+                    if not result.get("success"):
+                        error_msg = f"Failed to clear primary UPC on {source_sku}: {result}"
+                        await tracker.record_failure(source_sku, value, "clear_primary_upc", error_msg, "Clear primary UPC on source (no UPCs remaining)")
+                        logger.error(error_msg)
+                    else:
+                        await tracker.record_step(source_sku, value, "clear_primary_upc", "Cleared primary UPC on source (no UPCs remaining)")
+                except Exception as e:
+                    await tracker.record_failure(source_sku, value, "clear_primary_upc", str(e), "Clear primary UPC on source")
+                    logger.error(f"SC clear primary on {source_sku}: {e}")
+
+        # Delete X alias from source (if present)
+        if value in source_alias_set:
+            try:
+                del_result = await sellercloud_internal_service.save_alias(source_sku, value, action="delete")
+                if not del_result.get("Success"):
+                    msg = (del_result.get("Notification") or {}).get("Message", "") or ""
+                    if "not found" in msg.lower() or "does not exist" in msg.lower():
+                        await tracker.record_step(source_sku, value, "delete_alias", "UPC already absent from source aliases")
+                    else:
+                        await tracker.record_failure(source_sku, value, "delete_alias", msg, "Delete UPC alias from source")
+                        logger.error(f"SC delete {value} from {source_sku} aliases: {msg}")
+                else:
+                    await tracker.record_step(source_sku, value, "delete_alias", "Deleted UPC alias from source")
+            except Exception as e:
+                await tracker.record_failure(source_sku, value, "delete_alias", str(e), "Delete UPC alias from source")
+                logger.error(f"SC delete {value} from {source_sku} aliases: {e}")
+        else:
+            await tracker.record_skip(source_sku, value, "delete_alias", "UPC not in source alias list (only in BasicInfo)")
+
+        # ==============================================================
+        # TARGET-SIDE SC MIRRORING
+        # When make_primary: demote Z to alias (secondary UPCs go in aliases), set X as BasicInfo
+        # When secondary: just add X as alias
+        # ==============================================================
+        if make_primary and target_current_primary:
+            # Demote Z: add to target aliases (Z is now secondary in DB, needs to be alias in SC)
+            try:
+                target_aliases_resp = await sellercloud_internal_service.load_aliases(target_sku)
+                target_dto = (target_aliases_resp.get("Data") or {}).get("DTO") or {}
+                target_alias_set = {a.get("Name") for a in (target_dto.get("Aliases") or []) if a.get("Name")}
+            except Exception as e:
+                await tracker.record_failure(target_sku, target_current_primary, "load_aliases", str(e), "Load target aliases for demotion")
+                target_alias_set = set()
+
+            if target_current_primary in target_alias_set:
+                await tracker.record_skip(target_sku, target_current_primary, "demote_primary_upc", "Previous primary already in target aliases")
+            else:
+                try:
+                    demote_result = await sellercloud_internal_service.save_alias(target_sku, target_current_primary, action="add")
+                    if not demote_result.get("Success"):
+                        msg = (demote_result.get("Notification") or {}).get("Message", "") or ""
+                        await tracker.record_failure(target_sku, target_current_primary, "demote_primary_upc", msg, "Demote previous primary on target (add to aliases)")
+                        logger.error(f"SC demote {target_current_primary} on {target_sku}: {msg}")
+                    else:
+                        await tracker.record_step(target_sku, target_current_primary, "demote_primary_upc", "Demoted previous primary on target (added to aliases)")
+                except Exception as e:
+                    await tracker.record_failure(target_sku, target_current_primary, "demote_primary_upc", str(e), "Demote previous primary on target")
+                    logger.error(f"SC demote {target_current_primary} on {target_sku}: {e}")
+
+        # Validate X on target
+        try:
+            validation = await sellercloud_internal_service.validate_alias(target_sku, value)
+            if not validation.get("IsValid"):
+                already = validation.get("AlreadyUsedForProduct")
+                if already:
+                    error_msg = f"UPC {value} is already used by another product (ID: {already})"
+                else:
+                    error_msg = validation.get("ErrorMessage") or (validation.get("Notification") or {}).get("Message", "") or f"UPC {value} failed validation"
+                await tracker.record_failure(target_sku, value, "validate_alias", error_msg, "Validate UPC on target")
+                logger.error(f"SC validate {value} on {target_sku}: {error_msg}")
+                return  # can't proceed if validation failed
+            await tracker.record_step(target_sku, value, "validate_alias", "Validated UPC on target")
+        except Exception as e:
+            await tracker.record_failure(target_sku, value, "validate_alias", str(e), "Validate UPC on target")
+            logger.error(f"SC validate {value} on {target_sku}: {e}")
+            return
+
+        if make_primary:
+            # Set X as BasicInfo on target (primary UPCs not in aliases)
+            try:
+                primary_result = await sellercloud_service.update_product_upc(target_sku, value)
+                if not primary_result.get("success"):
+                    error_msg = f"Failed to set primary UPC on {target_sku} to {value}: {primary_result}"
+                    await tracker.record_failure(target_sku, value, "set_primary_upc", error_msg, "Set primary UPC on target")
+                    logger.error(error_msg)
+                else:
+                    await tracker.record_step(target_sku, value, "set_primary_upc", "Set primary UPC on target")
+            except Exception as e:
+                await tracker.record_failure(target_sku, value, "set_primary_upc", str(e), "Set primary UPC on target")
+                logger.error(f"SC set primary {value} on {target_sku}: {e}")
+        else:
+            # Secondary: add to target aliases
+            try:
+                save_result = await sellercloud_internal_service.save_alias(target_sku, value, action="add")
+                if not save_result.get("Success"):
+                    msg = (save_result.get("Notification") or {}).get("Message", "") or ""
+                    await tracker.record_failure(target_sku, value, "add_alias", msg or "Save alias failed", "Add secondary UPC alias to target")
+                    logger.error(f"SC add {value} to {target_sku} aliases: {msg}")
+                else:
+                    await tracker.record_step(target_sku, value, "add_alias", "Added secondary UPC alias to target")
+            except Exception as e:
+                await tracker.record_failure(target_sku, value, "add_alias", str(e), "Add secondary UPC alias to target")
+                logger.error(f"SC add {value} to {target_sku} aliases: {e}")

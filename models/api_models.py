@@ -949,6 +949,23 @@ class BulkImportValidateResponse(BaseModel):
     errors: List[BulkImportValidationError] = []
     items: List[BulkImportItem] = []
     file_data: Optional[str] = None
+    donors: Dict[str, Dict[str, int]] = Field(
+        default_factory=dict,
+        description="SKUs that lose UPCs without receiving any in return (one-way transfers). "
+                     "Keys are SKUs, values are {losses: int, gains: int}.",
+    )
+    auto_promotions: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="SKUs where a secondary UPC will be auto-promoted to primary because the "
+                     "current primary is being moved away and no explicit replacement was provided. "
+                     "Each entry: {sku, previous_primary, candidates: [upcs]}.",
+    )
+    noops: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Rows that will be skipped because the UPC/keyword is already on the target SKU "
+                     "in the desired state. Each entry: {row, sku, value, action}. Safe to re-import; "
+                     "the UI should warn the user and offer a download.",
+    )
 
 
 class BulkImportRequest(BaseModel):
@@ -975,3 +992,24 @@ class BulkImportResponse(BaseModel):
     successful_count: int
     failed_count: int
     results: List[BulkImportResultItem] = []
+    async_job: bool = Field(
+        False,
+        description="True when the import was enqueued as a background job because "
+                     "items exceeded the synchronous threshold. Poll /bulk_import/jobs/{job_id}.",
+    )
+    job_id: Optional[int] = None
+
+
+class BulkImportJobStatusResponse(BaseModel):
+
+    job_id: int
+    status: str  # pending, processing, completed, failed
+    total_items: int
+    processed_items: int
+    successful_count: int
+    failed_count: int
+    results: List[BulkImportResultItem] = []
+    error_message: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None

@@ -33,9 +33,12 @@ from models.api_models import (
     BulkImportValidateResponse,
     BulkImportRequest,
     BulkImportResponse,
+    BulkImportJobStatusResponse,
 )
 from services.product_service import ProductService
 from services.sellercloud_service import sellercloud_service
+from services import alias_bulk_import_job_service
+from config import config
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["products"])
@@ -537,10 +540,86 @@ async def validate_bulk_import(file: UploadFile = File(...)):
 @router.post("/bulk_import", response_model=BulkImportResponse)
 async def bulk_import(request: BulkImportRequest):
     try:
+        import asyncio
+        from services.alias_bulk_import_poller import alias_bulk_import_poller
+
         items = [item.model_dump() for item in request.items]
-        result = await ProductService.process_bulk_import(items)
-        return BulkImportResponse(**result)
+        max_tracked = config.get("bulk_import", {}).get("max_tracked_items", 50)
+
+        # Always enqueue as a job so progress is trackable via /bulk_import/jobs/{id}.
+        job_id = await alias_bulk_import_job_service.create_job(items)
+
+        # Kick off processing in the background so there's no poller delay.
+        # claim_next_job enforces single-job-at-a-time serialization (via an
+        # advisory lock + processing-status check). If another job is already
+        # processing, we return None and the poller will pick ours up later.
+        # Always process whatever we claim (may be an older pending job ahead
+        # of ours in FIFO order); the poller is a backstop.
+        async def _run_job():
+            claimed = None
+            try:
+                claimed = await alias_bulk_import_job_service.claim_next_job()
+                if claimed:
+                    await alias_bulk_import_poller._process_job(
+                        claimed["id"], claimed["items"] or []
+                    )
+                    await alias_bulk_import_job_service.mark_completed(claimed["id"])
+            except Exception as e:
+                logger.exception(f"bulk_import background task failed (job_id={job_id})")
+                if claimed:
+                    try:
+                        await alias_bulk_import_job_service.mark_failed(
+                            claimed["id"], f"{type(e).__name__}: {e}"
+                        )
+                    except Exception:
+                        pass
+
+        asyncio.create_task(_run_job())
+
+        logger.info(
+            f"Bulk import with {len(items)} items enqueued as job {job_id} "
+            f"(threshold max_tracked={max_tracked} — UI decides poll vs fire-and-forget)"
+        )
+        return BulkImportResponse(
+            success=True,
+            total_items=len(items),
+            successful_count=0,
+            failed_count=0,
+            results=[],
+            async_job=True,
+            job_id=job_id,
+        )
     except Exception as e:
         logger.error(f"Error processing bulk import: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/bulk_import/jobs", response_model=BulkImportJobStatusResponse)
+async def get_bulk_import_job(id: int = Query(..., description="Bulk import job id")):
+    try:
+        job = await alias_bulk_import_job_service.get_job(id)
+        if not job:
+            raise HTTPException(status_code=404, detail=f"Job {id} not found")
+
+        def _iso(ts):
+            return ts.isoformat() if ts else None
+
+        return BulkImportJobStatusResponse(
+            job_id=job["id"],
+            status=job["status"],
+            total_items=job["total_items"],
+            processed_items=job["processed_items"],
+            successful_count=job["successful_count"],
+            failed_count=job["failed_count"],
+            results=job.get("results") or [],
+            error_message=job.get("error_message"),
+            created_at=_iso(job.get("created_at")),
+            started_at=_iso(job.get("started_at")),
+            completed_at=_iso(job.get("completed_at")),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching bulk import job {id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
