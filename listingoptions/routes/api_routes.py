@@ -191,6 +191,46 @@ async def bulk_get_types_by_name(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.put("/add_aliases_to_color", response_model=AddAliasResponse)
+async def add_aliases_to_color(
+    name: str = Query(..., description="Name of the color to add aliases to"),
+    aliases: List[str] = Query(..., description="List of aliases to add"),
+):
+    """Append new aliases to a specific color's alias list by color name."""
+    try:
+        response = await DatabaseService.add_aliases_to_record(
+            table_name="colors",
+            new_aliases=aliases,
+            primary_column_value=name,
+        )
+        return response
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error adding aliases to color '{name}': {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/bulk_add_aliases_to_color", response_model=Dict[str, AddAliasResponse])
+async def bulk_add_aliases_to_color(
+    aliases_map: Dict[str, List[str]] = Body(...),
+):
+    """Append new aliases to multiple colors' alias lists."""
+    try:
+        results = await DatabaseService.bulk_add_aliases_to_records(
+            table_name="colors",
+            aliases_map=aliases_map,
+        )
+        return results
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error bulk adding aliases to colors: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/get_table", include_in_schema=False)
 async def export_table(
     table_name: str = Query(..., description="Name of the table to export"),

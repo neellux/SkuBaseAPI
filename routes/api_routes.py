@@ -5,10 +5,12 @@ from models.api_models import BatchResponse, CreateBatchRequest
 from services.batch_service import BatchService
 from utils.load_app_data import add_user_data
 from exceptions.batch_exceptions import BatchCreationError
+from listingoptions.routes.api_routes import router as listingoptions_api_router
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+router.include_router(listingoptions_api_router)
 
 
 @router.post("/create_batch", response_model=BatchResponse, include_in_schema=False)
