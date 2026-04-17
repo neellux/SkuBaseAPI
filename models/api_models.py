@@ -776,11 +776,6 @@ class ProductDetailsResponse(BaseModel):
     color: Optional[str] = None
     child_count: Optional[int] = None
     children: Optional[List[Dict[str, Any]]] = None
-    error: Optional[str] = None
-    redirect_to: Optional[str] = Field(
-        None,
-        description="When the requested SKU was reassigned, the SKU the UI should redirect to.",
-    )
 
 
 class BulkMappingItem(BaseModel):
@@ -970,6 +965,12 @@ class BulkImportValidateResponse(BaseModel):
         description="Rows that will be skipped because the UPC/keyword is already on the target SKU "
                      "in the desired state. Each entry: {row, sku, value, action}. Safe to re-import; "
                      "the UI should warn the user and offer a download.",
+    )
+    transfers: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Per-row transfer list — one entry per swap (Primary UPC, Secondary UPC, or "
+                     "Keyword moving between SKUs). Each entry: {row, value_type, value, from_sku, "
+                     "to_sku}. Surfaced to the user so they see every move explicitly.",
     )
 
 

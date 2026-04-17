@@ -67,7 +67,7 @@ class AliasBulkImportPoller(BasePoller):
                 break
 
             try:
-                result = await self._dispatch_item(conn, item, job_id)
+                result = await self._dispatch_item(conn, item)
             except Exception as e:
                 logger.exception(f"{self.name}: unexpected error on item {item.get('row')}")
                 result = {
@@ -84,19 +84,11 @@ class AliasBulkImportPoller(BasePoller):
                 job_id, result, success=bool(result.get("success"))
             )
 
-    async def _dispatch_item(self, conn, item: dict, job_id: int) -> dict:
-        """Dispatch a single item to the appropriate ProductService bulk processor.
-
-        For non-swap, non-noop items, wrap the processor call in a tracked_operation
-        scope so the enqueued queue rows carry an operation_id linked to this
-        alias_bulk_import_jobs.id — same audit pattern as warehouse transfers.
-        Swap already manages its own tracked_operation internally.
-        """
+    async def _dispatch_item(self, conn, item: dict) -> dict:
+        """Dispatch a single item to the appropriate ProductService bulk processor."""
         from services.product_service import ProductService
-        from services.sellercloud_sync_logger import tracked_operation
 
         classification = item.get("classification") or ""
-        action = item.get("action") or ""
 
         if classification == "noop":
             return {
@@ -107,37 +99,22 @@ class AliasBulkImportPoller(BasePoller):
         if classification.startswith("swap_"):
             return await ProductService._bulk_process_swap(conn, item)
 
-        processor = None
         if classification.startswith("delete_"):
-            processor = ProductService._bulk_process_delete
-        elif action == "Primary":
-            processor = ProductService._bulk_process_primary
-        elif action == "Secondary":
-            processor = ProductService._bulk_process_secondary
-        elif action == "Keyword":
-            processor = ProductService._bulk_process_keyword
+            return await ProductService._bulk_process_delete(conn, item)
 
-        if processor is None:
-            return {
-                "row": item.get("row"), "sku": item.get("sku"), "value": item.get("value"),
-                "action": item.get("action"), "classification": classification,
-                "success": False, "error": f"Unknown action: {item.get('action')}",
-            }
+        # Add/promote flows dispatch on action
+        if item["action"] == "Primary":
+            return await ProductService._bulk_process_primary(conn, item)
+        if item["action"] == "Secondary":
+            return await ProductService._bulk_process_secondary(conn, item)
+        if item["action"] == "Keyword":
+            return await ProductService._bulk_process_keyword(conn, item)
 
-        async with tracked_operation(
-            operation=f"bulk_import_{(action or classification).lower()}",
-            target_sku=item["sku"],
-            value=item.get("value", ""),
-            source="bulk_import",
-            source_sku=item["sku"],
-            metadata={
-                "alias_bulk_import_job_id": job_id,
-                "row": item.get("row"),
-                "classification": classification,
-                "action": action,
-            },
-        ) as tracker:
-            return await processor(conn, item, _tracker=tracker)
+        return {
+            "row": item.get("row"), "sku": item.get("sku"), "value": item.get("value"),
+            "action": item.get("action"), "classification": classification,
+            "success": False, "error": f"Unknown action: {item.get('action')}",
+        }
 
 
 alias_bulk_import_poller = AliasBulkImportPoller()
