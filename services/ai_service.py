@@ -2,6 +2,7 @@ import asyncio
 import base64
 import logging
 import os
+import random
 from io import BytesIO
 from typing import Any, Dict, List
 
@@ -50,6 +51,9 @@ CAPTION_USER_PROMPT_TEMPLATE = _load_prompt("./utils/prompts/caption_prompt.txt"
 MAX_IMAGE_SIDE = 1024
 MAX_IMAGE_SIZE_MB = 5
 MAX_IMAGES_TO_SEND = 8
+
+GENAI_MAX_ATTEMPTS = 3
+GENAI_RETRY_BACKOFFS = (2.0, 5.0)
 
 
 def _convert_hyphens_to_html_list(text: str) -> str:
@@ -126,69 +130,88 @@ async def _call_google_genai(
     temperature: float = 1,
     max_output_tokens: int = 8192,
 ) -> str:
-    try:
-        num_images = len(image_data or []) + len(image_urls or [])
-        logger.debug(f"Making API call to Google GenAI with {num_images} images")
+    num_images = len(image_data or []) + len(image_urls or [])
+    logger.debug(f"Making API call to Google GenAI with {num_images} images")
 
-        parts = [types.Part.from_text(text=user_prompt)]
+    parts = [types.Part.from_text(text=user_prompt)]
 
-        if image_data:
-            for base64_image in image_data:
-                parts.append(
-                    types.Part.from_bytes(
-                        data=base64.b64decode(base64_image), mime_type="image/jpeg"
-                    )
+    if image_data:
+        for base64_image in image_data:
+            parts.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(base64_image), mime_type="image/jpeg"
                 )
-
-        if image_urls:
-            for url in image_urls:
-                try:
-                    parts.append(types.Part.from_uri(file_uri=url, mime_type="image/jpeg"))
-                except Exception as e:
-                    logger.warning(f"Failed to process image {url}: {e}")
-
-        contents = [
-            types.Content(role="user", parts=parts),
-        ]
-
-        generate_content_config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            temperature=temperature,
-            top_p=0.95,
-            max_output_tokens=max_output_tokens,
-            safety_settings=[
-                types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
-                types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
-                types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
-                types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
-            ],
-            thinking_config=types.ThinkingConfig(
-                thinking_budget=0,
-            ),
-        )
-
-        async with genai.Client(
-            vertexai=True,
-            project="433271307736",
-            location="us-central1",
-        ).aio as aclient:
-            response = await aclient.models.generate_content(
-                model=model_name.split("vertex_ai/")[-1],
-                contents=contents,
-                config=generate_content_config,
             )
 
-            response_text = response.text
+    if image_urls:
+        for url in image_urls:
+            try:
+                parts.append(types.Part.from_uri(file_uri=url, mime_type="image/jpeg"))
+            except Exception as e:
+                logger.warning(f"Failed to process image {url}: {e}")
 
-            if response_text:
-                logger.debug(f"Successfully generated response, length: {len(response_text)}")
-                return response_text
-            else:
+    contents = [
+        types.Content(role="user", parts=parts),
+    ]
+
+    generate_content_config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        temperature=temperature,
+        top_p=0.95,
+        max_output_tokens=max_output_tokens,
+        safety_settings=[
+            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
+            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
+        ],
+        thinking_config=types.ThinkingConfig(
+            thinking_budget=0,
+        ),
+    )
+
+    resolved_model = model_name.split("vertex_ai/")[-1]
+    last_exc: Exception | None = None
+
+    for attempt in range(1, GENAI_MAX_ATTEMPTS + 1):
+        try:
+            async with genai.Client(
+                vertexai=True,
+                project="433271307736",
+                location="us-central1",
+            ).aio as aclient:
+                response = await aclient.models.generate_content(
+                    model=resolved_model,
+                    contents=contents,
+                    config=generate_content_config,
+                )
+
+                response_text = response.text
+
+                if response_text:
+                    logger.debug(
+                        f"Successfully generated response on attempt {attempt}, length: {len(response_text)}"
+                    )
+                    return response_text
                 raise Exception("No response generated from Google GenAI.")
 
-    except Exception as e:
-        logger.error(f"Error in Google GenAI API call: {e}")
-        raise
+        except Exception as e:
+            last_exc = e
+            if attempt < GENAI_MAX_ATTEMPTS:
+                backoff = GENAI_RETRY_BACKOFFS[attempt - 1] + random.uniform(0, 0.5)
+                logger.warning(
+                    f"Google GenAI call failed (attempt {attempt}/{GENAI_MAX_ATTEMPTS}) "
+                    f"model={resolved_model} images={num_images} err={type(e).__name__}: {e}. "
+                    f"Retrying in {backoff:.1f}s"
+                )
+                await asyncio.sleep(backoff)
+            else:
+                logger.error(
+                    f"Google GenAI call failed after {GENAI_MAX_ATTEMPTS} attempts "
+                    f"model={resolved_model} images={num_images} err={type(e).__name__}: {e}"
+                )
+
+    raise last_exc if last_exc else Exception("Google GenAI call failed with no exception captured")
 
 
 class AIService:
@@ -293,7 +316,14 @@ class AIService:
             return description
 
         except Exception as e:
-            logger.error(f"Error calling Caption AI model: {e}")
+            url_sample = (image_urls or [])[:10]
+            logger.error(
+                f"Error calling Caption AI model after retries: "
+                f"product={product_name!r} model={CAPTION_MODEL} "
+                f"image_count={len(image_urls or [])} use_raw_image_urls={use_raw_image_urls} "
+                f"image_urls={url_sample} err={type(e).__name__}: {e}",
+                exc_info=True,
+            )
             return None
 
     @staticmethod
@@ -426,7 +456,14 @@ class AIService:
             logger.info(f"Successfully received and parsed AI aspects for product {product_name}")
             return ai_data
         except Exception as e:
-            logger.error(f"Error in AI aspects generation: {e}")
+            url_sample = (image_urls or [])[:10]
+            logger.error(
+                f"Error in AI aspects generation after retries: "
+                f"product={product_name!r} model={ASPECTS_MODEL} "
+                f"image_count={len(image_urls or [])} use_raw_image_urls={use_raw_image_urls} "
+                f"image_urls={url_sample} err={type(e).__name__}: {e}",
+                exc_info=True,
+            )
             return {}
 
     @staticmethod

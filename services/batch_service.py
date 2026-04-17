@@ -66,7 +66,7 @@ class BatchService:
                 )
                 logger.debug(f"Created batch {batch.id} (not yet committed)")
 
-                semaphore = asyncio.Semaphore(10)
+                semaphore = asyncio.Semaphore(3)
                 product_failures = []
 
                 async def process_product(full_product_id: str):
