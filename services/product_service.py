@@ -2523,6 +2523,16 @@ class ProductService:
                 elif action_normalized == "Delete":
                     is_valid_upc = len(clean_value) in (8, 12, 13) and ProductService._validate_upc_checksum(clean_value)
                     if is_valid_upc:
+                        # Must actually belong to the target SKU
+                        owner = upc_to_sku.get(clean_value)
+                        if owner is None:
+                            error_by_index[idx] = f"UPC '{clean_value}' not found on any SKU"
+                            errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                            continue
+                        if owner != sku:
+                            error_by_index[idx] = f"Cannot delete, UPC belongs to a different SKU ({owner})"
+                            errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                            continue
                         if sku_primary_upc.get(sku) == clean_value:
                             error_by_index[idx] = "Cannot delete primary UPC"
                             errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
@@ -2533,6 +2543,16 @@ class ProductService:
                         errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
                     else:
+                        # Keyword delete — must actually exist on the target SKU
+                        kw_owner = keyword_to_sku.get(clean_value)
+                        if kw_owner is None:
+                            error_by_index[idx] = f"Keyword '{clean_value}' not found on any SKU"
+                            errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                            continue
+                        if kw_owner != sku:
+                            error_by_index[idx] = f"Cannot delete, keyword belongs to a different SKU ({kw_owner})"
+                            errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                            continue
                         classification = "delete_keyword"
 
                 elif action_normalized == "Keyword":
@@ -2693,10 +2713,7 @@ class ProductService:
 
             # Report errors for stranded SKUs
             for sku in stranded_no_upcs:
-                msg = (
-                    f"Import would leave SKU '{sku}' with no UPCs. "
-                    f"A SKU must always have at least one primary UPC."
-                )
+                msg = f"Import would remove the only UPC from {sku}"
                 for idx in rows_affecting_sku.get(sku, []):
                     error_by_index[idx] = msg
                     row_num = idx + 2
@@ -2715,10 +2732,7 @@ class ProductService:
                     })
 
             for sku in stranded_only_ean8:
-                msg = (
-                    f"Import would leave SKU '{sku}' with only EAN-8 UPCs, which cannot be primary. "
-                    f"A SKU must always have at least one primary-capable UPC (UPC-A or EAN-13)."
-                )
+                msg = f"Import would leave {sku} with only EAN-8 UPCs, which cannot be primary"
                 for idx in rows_affecting_sku.get(sku, []):
                     error_by_index[idx] = msg
                     row_num = idx + 2
