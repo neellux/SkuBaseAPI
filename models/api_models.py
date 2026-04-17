@@ -776,6 +776,11 @@ class ProductDetailsResponse(BaseModel):
     color: Optional[str] = None
     child_count: Optional[int] = None
     children: Optional[List[Dict[str, Any]]] = None
+    error: Optional[str] = None
+    redirect_to: Optional[str] = Field(
+        None,
+        description="When the requested SKU was reassigned, the SKU the UI should redirect to.",
+    )
 
 
 class BulkMappingItem(BaseModel):

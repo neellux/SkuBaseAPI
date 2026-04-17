@@ -87,43 +87,45 @@ class ProductService:
 
     @staticmethod
     async def _execute_transfer_upcs_keywords_job(
-        child_sku: str, target_child_sku: str, is_placeholder: bool = False, **kwargs
+        child_sku: str,
+        target_child_sku: str,
+        is_placeholder: bool = False,
+        caller_job_id: Optional[int] = None,
+        **kwargs,
     ) -> Dict[str, Any]:
+        """
+        DB-first UPC/keyword transfer. Mutates child_upcs and child_products.keywords
+        inside a single transaction, then enqueues matching SC sync ops to
+        sellercloud_alias_sync_history for asynchronous processing by
+        SellercloudSyncPoller.
+
+        Wrapped in tracked_operation so every enqueued row carries an operation_id
+        pointing at the parent sellercloud_sync_operations row, which has
+        metadata={'assignment_job_id': caller_job_id}.
+        """
+        from functools import partial
+        from tortoise.transactions import in_transaction
+        from services.sellercloud_sync_logger import tracked_operation
+
         transferred_upcs: List[str] = []
         transferred_keywords: List[str] = []
 
-        def _failure(label: str, value: str, exc: Exception) -> Dict[str, Any]:
-            if isinstance(exc, SellercloudPermanentError):
-                user_message = str(exc)
-            else:
-                user_message = (
-                    "SellerCloud temporarily unavailable — please retry the reassignment"
-                )
-            logger.error(f"Failed to transfer {label} {value}: {exc}")
-            return {
-                "success": False,
-                "error": f"Failed to transfer {label} {value}: {exc}",
-                "user_message": user_message,
-                "transferred_upcs": transferred_upcs,
-                "transferred_keywords": transferred_keywords,
-            }
-
         try:
-            conn = await ProductService._get_connection()
+            pre_conn = await ProductService._get_connection()
 
-            upcs_result = await conn.execute_query_dict(
-                "SELECT upc, is_primary_upc FROM child_upcs WHERE child_sku = $1", [child_sku]
+            upcs_result = await pre_conn.execute_query_dict(
+                "SELECT upc, is_primary_upc FROM child_upcs WHERE child_sku = $1",
+                [child_sku],
             )
-
             primary_upc = None
-            secondary_upcs = []
+            secondary_upcs: List[str] = []
             for row in upcs_result:
                 if row["is_primary_upc"]:
                     primary_upc = row["upc"]
                 else:
                     secondary_upcs.append(row["upc"])
 
-            keywords_result = await conn.execute_query_dict(
+            keywords_result = await pre_conn.execute_query_dict(
                 "SELECT keywords FROM child_products WHERE sku = $1", [child_sku]
             )
             keywords = (
@@ -137,113 +139,100 @@ class ProductService:
                 f"primary_upc={primary_upc}, secondary_upcs={secondary_upcs}, keywords={keywords}"
             )
 
-            if primary_upc:
-                try:
-                    # Clear BasicInfo UPC on source — direct call, not alias management
-                    clear_result = await sellercloud_service.update_product_upc(
-                        child_sku, ""
-                    )
-                    if not clear_result.get("success"):
-                        raise Exception(
-                            f"Failed to clear BasicInfo UPC on {child_sku}: {clear_result}"
-                        )
-                    logger.info(f"Cleared primary UPC from {child_sku} in SellerCloud")
-
-                    # Best-effort: remove the alias from source. The primary may not
-                    # exist as an alias on source (it lives in BasicInfo), so tolerate
-                    # both permanent and transient failures here.
-                    try:
-                        await sellercloud_internal_service.sync_delete_alias(
-                            child_sku, primary_upc
-                        )
-                    except Exception as src_del_err:
-                        logger.debug(
-                            f"Alias delete for {primary_upc} from source (non-fatal): {src_del_err}"
+            async with tracked_operation(
+                operation="warehouse_transfer_aliases",
+                target_sku=target_child_sku,
+                value="",
+                source="transfer",
+                source_sku=child_sku,
+                metadata={
+                    "assignment_job_id": caller_job_id,
+                    "is_placeholder": is_placeholder,
+                },
+            ) as tracker:
+                async with in_transaction("product_db") as conn:
+                    for s in sorted({child_sku, target_child_sku}):
+                        await conn.execute_query(
+                            "SELECT pg_advisory_xact_lock(hashtext($1))", [s]
                         )
 
-                    if not is_placeholder:
-                        # Add to target as a non-primary alias (matches DB shape below)
-                        await sellercloud_internal_service.sync_add_alias(
-                            target_child_sku, primary_upc, is_primary=False
-                        )
-
-                    await conn.execute_query(
-                        "DELETE FROM child_upcs WHERE upc = $1", [primary_upc]
-                    )
-                    await conn.execute_query(
-                        "INSERT INTO child_upcs (upc, child_sku, is_primary_upc) VALUES ($1, $2, FALSE)",
-                        [primary_upc, target_child_sku],
+                    _enqueue = partial(
+                        sellercloud_sync_queue.enqueue,
+                        conn=conn,
+                        source="transfer",
+                        operation_id=tracker.operation_id,
                     )
 
-                    transferred_upcs.append(primary_upc)
-                    logger.info(f"Transferred primary UPC {primary_upc} to {target_child_sku}")
-
-                except Exception as e:
-                    return _failure("primary UPC", primary_upc, e)
-
-            for upc in secondary_upcs:
-                try:
-                    # Best-effort source removal — alias may already be gone
-                    try:
-                        await sellercloud_internal_service.sync_delete_alias(
-                            child_sku, upc
+                    if primary_upc:
+                        await conn.execute_query(
+                            "DELETE FROM child_upcs WHERE upc = $1", [primary_upc]
                         )
-                    except Exception as src_del_err:
-                        logger.warning(
-                            f"Source alias delete for {upc} from {child_sku} non-fatal: {src_del_err}"
+                        await conn.execute_query(
+                            "INSERT INTO child_upcs (upc, child_sku, is_primary_upc) VALUES ($1, $2, FALSE)",
+                            [primary_upc, target_child_sku],
                         )
-
-                    if not is_placeholder:
-                        await sellercloud_internal_service.sync_add_alias(
-                            target_child_sku, upc, is_primary=False
+                        new_src_primary = await conn.execute_query_dict(
+                            "SELECT upc FROM child_upcs WHERE child_sku = $1 AND is_primary_upc = TRUE LIMIT 1",
+                            [child_sku],
                         )
+                        if new_src_primary:
+                            await _enqueue(
+                                sku=child_sku,
+                                value=new_src_primary[0]["upc"],
+                                sync_type="change_primary_upc",
+                                old_primary_upc=primary_upc,
+                            )
+                        else:
+                            await _enqueue(
+                                sku=child_sku,
+                                value="",
+                                sync_type="clear_primary_upc",
+                            )
+                        if not is_placeholder:
+                            await _enqueue(
+                                sku=target_child_sku,
+                                value=primary_upc,
+                                sync_type="add_secondary_upc",
+                            )
+                        transferred_upcs.append(primary_upc)
 
-                    # DB swap only after SC ops succeed — prevents losing the row
-                    # if the target add fails after the source delete
-                    await conn.execute_query(
-                        "DELETE FROM child_upcs WHERE upc = $1", [upc]
-                    )
-                    await conn.execute_query(
-                        "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)",
-                        [upc, target_child_sku],
-                    )
-
-                    transferred_upcs.append(upc)
-                    logger.info(f"Transferred secondary UPC {upc} to {target_child_sku}")
-
-                except Exception as e:
-                    return _failure("secondary UPC", upc, e)
-
-            for keyword in keywords:
-                try:
-                    try:
-                        await sellercloud_internal_service.sync_delete_alias(
-                            child_sku, keyword
+                    for upc in secondary_upcs:
+                        await conn.execute_query(
+                            "DELETE FROM child_upcs WHERE upc = $1", [upc]
                         )
-                    except Exception as src_del_err:
-                        logger.warning(
-                            f"Source keyword delete for {keyword} from {child_sku} non-fatal: {src_del_err}"
+                        await conn.execute_query(
+                            "INSERT INTO child_upcs (upc, child_sku) VALUES ($1, $2)",
+                            [upc, target_child_sku],
                         )
+                        await _enqueue(
+                            sku=child_sku, value=upc, sync_type="delete_upc"
+                        )
+                        if not is_placeholder:
+                            await _enqueue(
+                                sku=target_child_sku,
+                                value=upc,
+                                sync_type="add_secondary_upc",
+                            )
+                        transferred_upcs.append(upc)
 
-                    await sellercloud_internal_service.sync_add_alias(
-                        target_child_sku, keyword, is_primary=False
-                    )
-
-                    # DB swap only after SC ops succeed
-                    await conn.execute_query(
-                        "UPDATE child_products SET keywords = array_remove(keywords, $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
-                        [keyword, child_sku],
-                    )
-                    await conn.execute_query(
-                        "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
-                        [keyword, target_child_sku],
-                    )
-
-                    transferred_keywords.append(keyword)
-                    logger.info(f"Transferred keyword {keyword} to {target_child_sku}")
-
-                except Exception as e:
-                    return _failure("keyword", keyword, e)
+                    for keyword in keywords:
+                        await conn.execute_query(
+                            "UPDATE child_products SET keywords = array_remove(keywords, $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
+                            [keyword, child_sku],
+                        )
+                        await conn.execute_query(
+                            "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
+                            [keyword, target_child_sku],
+                        )
+                        await _enqueue(
+                            sku=child_sku, value=keyword, sync_type="delete_keyword"
+                        )
+                        await _enqueue(
+                            sku=target_child_sku,
+                            value=keyword,
+                            sync_type="add_keyword",
+                        )
+                        transferred_keywords.append(keyword)
 
             total_transferred = len(transferred_upcs) + len(transferred_keywords)
             return {
@@ -255,7 +244,7 @@ class ProductService:
                 "user_message": f"Transferred {total_transferred} items ({len(transferred_upcs)} UPCs, {len(transferred_keywords)} keywords)",
             }
 
-        except Exception as e:
+        except Exception:
             logger.error(f"Error in transfer UPCs/keywords job: {traceback.format_exc()}")
             return {
                 "success": False,
@@ -1106,7 +1095,7 @@ class ProductService:
                 )
 
                 handler = getattr(ProductService, handler_name)
-                result = await handler(**job_context)
+                result = await handler(**job_context, caller_job_id=job_id)
                 last_result = result
                 executed_jobs.append({"code": job_code, "job_id": job_id, "result": result})
 
@@ -1343,6 +1332,18 @@ class ProductService:
             return {"results": [], "total": 0, "exact_match": False}
 
     @staticmethod
+    async def _resolve_reassigned_sku(conn, sku: str) -> Optional[str]:
+        """Return the SKU a reassigned secondary now points to, or None."""
+        rows = await conn.execute_query_dict(
+            "SELECT current_primary_sku FROM secondary_skus WHERE secondary_sku = $1 LIMIT 1",
+            [sku],
+        )
+        if not rows:
+            return None
+        target = rows[0].get("current_primary_sku")
+        return target if target and target != sku else None
+
+    @staticmethod
     async def get_product_details(sku: str) -> Dict[str, Any]:
         try:
             conn = await ProductService._get_connection()
@@ -1356,6 +1357,15 @@ class ProductService:
             )
 
             if not type_result:
+                redirect_to = await ProductService._resolve_reassigned_sku(conn, sku)
+                if redirect_to:
+                    return {
+                        "success": False,
+                        "sku": sku,
+                        "is_parent": False,
+                        "error": "reassigned",
+                        "redirect_to": redirect_to,
+                    }
                 return {
                     "success": False,
                     "sku": sku,
@@ -1992,7 +2002,7 @@ class ProductService:
                 )
 
                 handler = getattr(ProductService, handler_name)
-                result = await handler(**job_context)
+                result = await handler(**job_context, caller_job_id=job_id)
 
                 if result.get("success"):
                     await conn.execute_query_dict(
@@ -2809,11 +2819,27 @@ class ProductService:
 
     @staticmethod
     async def process_bulk_import(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-        from config import config
+        from services.sellercloud_sync_logger import tracked_operation
 
         results = []
-        max_tracked = config.get("bulk_import", {}).get("max_tracked_items", 50)
-        use_tracking = len(items) <= max_tracked
+
+        async def _run_with_tracker(item: Dict, processor) -> Dict:
+            action = item.get("action") or ""
+            classification = item.get("classification") or ""
+            async with tracked_operation(
+                operation=f"bulk_import_{(action or classification).lower()}",
+                target_sku=item["sku"],
+                value=item.get("value", ""),
+                source="bulk_import",
+                source_sku=item["sku"],
+                metadata={
+                    "sync_inline": True,
+                    "row": item.get("row"),
+                    "classification": classification,
+                    "action": action,
+                },
+            ) as tracker:
+                return await processor(conn, item, _tracker=tracker)
 
         try:
             conn = await ProductService._get_connection()
@@ -2834,7 +2860,7 @@ class ProductService:
                     "action": item["action"], "classification": "noop", "success": True,
                 })
 
-            # 2. Swaps → synchronous SC+DB (always tracked regardless of size)
+            # 2. Swaps → synchronous SC+DB (already wrapped in tracked_operation internally)
             for item in swap_items:
                 result = await ProductService._bulk_process_swap(conn, item)
                 results.append(result)
@@ -2842,11 +2868,11 @@ class ProductService:
             # 3. Adds (including promote_primary) → existing handlers (DB first, enqueue)
             for item in other_items:
                 if item["action"] == "Primary":
-                    result = await ProductService._bulk_process_primary(conn, item)
+                    result = await _run_with_tracker(item, ProductService._bulk_process_primary)
                 elif item["action"] == "Secondary":
-                    result = await ProductService._bulk_process_secondary(conn, item)
+                    result = await _run_with_tracker(item, ProductService._bulk_process_secondary)
                 elif item["action"] == "Keyword":
-                    result = await ProductService._bulk_process_keyword(conn, item)
+                    result = await _run_with_tracker(item, ProductService._bulk_process_keyword)
                 else:
                     result = {
                         "row": item["row"], "sku": item["sku"], "value": item["value"],
@@ -2857,7 +2883,7 @@ class ProductService:
 
             # 4. Deletes → existing handler (DB first, enqueue)
             for item in delete_items:
-                result = await ProductService._bulk_process_delete(conn, item)
+                result = await _run_with_tracker(item, ProductService._bulk_process_delete)
                 results.append(result)
 
             successful = sum(1 for r in results if r["success"])
@@ -2874,7 +2900,8 @@ class ProductService:
             raise
 
     @staticmethod
-    async def _bulk_process_primary(conn, item: Dict) -> Dict:
+    async def _bulk_process_primary(conn, item: Dict, _tracker=None) -> Dict:
+        op_id = _tracker.operation_id if _tracker else None
         try:
             sku, upc = item["sku"], item["value"]
 
@@ -2903,7 +2930,7 @@ class ProductService:
                 # Check if it auto-became primary (no prior primary on this SKU)
                 check = await conn.execute_query_dict("SELECT is_primary_upc FROM child_upcs WHERE upc = $1", [upc])
                 if check and check[0]["is_primary_upc"]:
-                    await sellercloud_sync_queue.enqueue(sku, upc, "add_primary_upc")
+                    await sellercloud_sync_queue.enqueue(sku, upc, "add_primary_upc", operation_id=op_id)
                     return {"row": item["row"], "sku": sku, "value": upc, "action": "Primary", "success": True}
 
             # Set as primary using DB function
@@ -2914,17 +2941,18 @@ class ProductService:
             if success:
                 if current_primary and current_primary != upc:
                     await sellercloud_sync_queue.enqueue(
-                        sku, upc, "change_primary_upc", old_primary_upc=current_primary
+                        sku, upc, "change_primary_upc", old_primary_upc=current_primary, operation_id=op_id
                     )
                 else:
-                    await sellercloud_sync_queue.enqueue(sku, upc, "add_primary_upc")
+                    await sellercloud_sync_queue.enqueue(sku, upc, "add_primary_upc", operation_id=op_id)
 
             return {"row": item["row"], "sku": sku, "value": upc, "action": "Primary", "success": success, "error": db_result.get("error")}
         except Exception as e:
             return {"row": item["row"], "sku": item["sku"], "value": item["value"], "action": "Primary", "success": False, "error": str(e)}
 
     @staticmethod
-    async def _bulk_process_secondary(conn, item: Dict) -> Dict:
+    async def _bulk_process_secondary(conn, item: Dict, _tracker=None) -> Dict:
+        op_id = _tracker.operation_id if _tracker else None
         try:
             sku, upc = item["sku"], item["value"]
             existing = await conn.execute_query_dict(
@@ -2945,14 +2973,15 @@ class ProductService:
             )
             became_primary = bool(check and check[0]["is_primary_upc"])
             sync_type = "add_primary_upc" if became_primary else "add_secondary_upc"
-            await sellercloud_sync_queue.enqueue(sku, upc, sync_type)
+            await sellercloud_sync_queue.enqueue(sku, upc, sync_type, operation_id=op_id)
 
             return {"row": item["row"], "sku": sku, "value": upc, "action": "Secondary", "success": True}
         except Exception as e:
             return {"row": item["row"], "sku": item["sku"], "value": item["value"], "action": "Secondary", "success": False, "error": str(e)}
 
     @staticmethod
-    async def _bulk_process_keyword(conn, item: Dict) -> Dict:
+    async def _bulk_process_keyword(conn, item: Dict, _tracker=None) -> Dict:
+        op_id = _tracker.operation_id if _tracker else None
         try:
             sku, keyword = item["sku"], item["value"]
             clean_keyword = re.sub(r"[^0-9]", "", keyword)
@@ -2974,13 +3003,14 @@ class ProductService:
                 "UPDATE child_products SET keywords = array_append(COALESCE(keywords, '{}'), $1), updated_at = CURRENT_TIMESTAMP WHERE sku = $2",
                 [clean_keyword, sku],
             )
-            await sellercloud_sync_queue.enqueue(sku, clean_keyword, "add_keyword")
+            await sellercloud_sync_queue.enqueue(sku, clean_keyword, "add_keyword", operation_id=op_id)
             return {"row": item["row"], "sku": sku, "value": clean_keyword, "action": "Keyword", "success": True}
         except Exception as e:
             return {"row": item["row"], "sku": item["sku"], "value": item["value"], "action": "Keyword", "success": False, "error": str(e)}
 
     @staticmethod
-    async def _bulk_process_delete(conn, item: Dict) -> Dict:
+    async def _bulk_process_delete(conn, item: Dict, _tracker=None) -> Dict:
+        op_id = _tracker.operation_id if _tracker else None
         try:
             sku, value = item["sku"], item["value"]
 
@@ -2992,7 +3022,7 @@ class ProductService:
                 if upc_check[0]["is_primary_upc"]:
                     return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": False, "error": "Cannot delete primary UPC"}
                 await conn.execute_query("DELETE FROM child_upcs WHERE upc = $1", [value])
-                await sellercloud_sync_queue.enqueue(sku, value, "delete_upc")
+                await sellercloud_sync_queue.enqueue(sku, value, "delete_upc", operation_id=op_id)
                 return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": True}
 
             # Check if it's a keyword
@@ -3003,7 +3033,7 @@ class ProductService:
                 await conn.execute_query(
                     "UPDATE child_products SET keywords = array_remove(keywords, $1) WHERE sku = $2", [value, sku]
                 )
-                await sellercloud_sync_queue.enqueue(sku, value, "delete_keyword")
+                await sellercloud_sync_queue.enqueue(sku, value, "delete_keyword", operation_id=op_id)
                 return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": True}
 
             return {"row": item["row"], "sku": sku, "value": value, "action": "Delete", "success": False, "error": f"UPC/Keyword '{value}' not found for SKU '{sku}'"}

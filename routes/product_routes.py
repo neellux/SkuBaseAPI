@@ -254,6 +254,8 @@ async def get_product_details(sku: str = Query(..., description="Product SKU (pa
         result = await ProductService.get_product_details(sku)
 
         if not result.get("success"):
+            if result.get("redirect_to"):
+                return ProductDetailsResponse(**result)
             raise HTTPException(status_code=404, detail=result.get("error", "Product not found"))
 
         return ProductDetailsResponse(**result)

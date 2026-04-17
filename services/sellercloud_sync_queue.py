@@ -16,14 +16,18 @@ async def enqueue(
     sync_type: str,
     old_primary_upc: Optional[str] = None,
     source: str = "bulk_import",
+    operation_id: Optional[int] = None,
+    conn=None,
 ) -> int:
-    result = await _conn().execute_query_dict(
+    db = conn or _conn()
+    result = await db.execute_query_dict(
         """
-        INSERT INTO sellercloud_alias_sync_history (sku, value, type, old_primary_upc, source)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO sellercloud_alias_sync_history
+            (sku, value, type, old_primary_upc, source, operation_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
         """,
-        [sku, value, sync_type, old_primary_upc, source],
+        [sku, value, sync_type, old_primary_upc, source, operation_id],
     )
     return result[0]["id"]
 

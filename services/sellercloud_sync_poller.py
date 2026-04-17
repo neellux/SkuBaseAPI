@@ -5,6 +5,7 @@ from config import config
 from services import sellercloud_sync_queue
 from services.base_poller import BasePoller
 from services.sellercloud_internal_service import sellercloud_internal_service
+from services.sellercloud_service import sellercloud_service
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class SellercloudSyncPoller(BasePoller):
                 await sellercloud_internal_service.sync_change_primary(
                     sku, value, rec.get("old_primary_upc")
                 )
+            elif sync_type == "clear_primary_upc":
+                await sellercloud_service.update_product_upc(sku, "")
             elif sync_type in ("delete_upc", "delete_keyword"):
                 await sellercloud_internal_service.sync_delete_alias(sku, value)
             else:
