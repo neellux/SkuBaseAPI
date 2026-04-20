@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 import openpyxl
+from tortoise import connections
 
 from config import config
 from services.listing_options_service import listing_options_service
@@ -163,7 +164,7 @@ class SpoService:
         sizing_type = None
         product_type = form_data.get("product_type")
         if product_type:
-            conn = Tortoise.get_connection("default")
+            conn = connections.get("default")
             type_result = await conn.execute_query_dict(
                 "SELECT sizing_types FROM listingoptions_types WHERE type = $1 LIMIT 1",
                 [product_type],
@@ -176,6 +177,15 @@ class SpoService:
             )
             logger.info(f"SPO size_map: {size_map}")
 
+        pending_pairs: set[tuple[str, str]] = set()
+        for mapped_size in size_map.values():
+            if mapped_size and " " in mapped_size:
+                column, label = mapped_size.split(" ", 1)
+                pending_pairs.add((f"{column}-values", label))
+        value_code_map = await listing_options_service.get_spo_value_codes(
+            list(pending_pairs)
+        )
+
         products = []
         for child_sku, size_str in child_size_overrides.items():
             product = {**row_data}
@@ -185,12 +195,26 @@ class SpoService:
             product["image-link-2"] = f"{IMAGE_BASE_URL}/{listing.product_id}/2_fullsize.jpg"
 
             if size_str:
-                mapped_size = size_map.get(str(size_str), str(size_str))
-                if " " in mapped_size:
-                    size_column, size_value = mapped_size.split(" ", 1)
-                    product[size_column] = size_value
-                else:
-                    product["unisex-size"] = mapped_size
+                mapped_size = size_map.get(str(size_str))
+                if mapped_size is None:
+                    raise ValueError(
+                        f"SPO: no platform size mapping for {size_str!r} "
+                        f"(child {child_sku}, scheme {sizing_scheme!r}, type {sizing_type!r})"
+                    )
+                if " " not in mapped_size:
+                    raise ValueError(
+                        f"SPO: platform_value {mapped_size!r} missing column prefix "
+                        f"(child {child_sku}); expected '<column> <label>' format"
+                    )
+                size_column, size_label = mapped_size.split(" ", 1)
+                list_code = f"{size_column}-values"
+                value_code = value_code_map.get((list_code, size_label))
+                if value_code is None:
+                    raise ValueError(
+                        f"SPO: no value_code for {list_code}/{size_label!r} "
+                        f"(child {child_sku}); config_spo_value_lists is missing this entry"
+                    )
+                product[size_column] = value_code
 
             products.append(product)
 

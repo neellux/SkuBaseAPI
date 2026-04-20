@@ -165,6 +165,37 @@ class SizingList(Model):
         return f"SizingList Entry ID: {self.id} - SchemeEntry: {self.sizing_scheme_entry_id} - Platform: {self.platform_id} -> {self.platform_value}"
 
 
+class ConfigSpoValueList(Model):
+
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    value_list = fields.CharField(
+        max_length=100,
+        description="Human-readable name of the ShopSimon value list (e.g. 'Mens Clothing Bottoms Size').",
+    )
+    list_code = fields.CharField(
+        max_length=100,
+        index=True,
+        description="ShopSimon list slug (e.g. 'mens-clothing-bottoms-size-values').",
+    )
+    label = fields.CharField(
+        max_length=255,
+        description="Display label as it appears in SPO data (e.g. '30\"\" Waist').",
+    )
+    value_code = fields.CharField(
+        max_length=100,
+        description="Value code SPO's import file expects (e.g. '30-inch').",
+    )
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "config_spo_value_lists"
+
+    def __str__(self) -> str:
+        return f"{self.list_code}: {self.label} -> {self.value_code}"
+
+
 class ParentType(Model):
 
     id = fields.UUIDField(pk=True, default=uuid.uuid4)

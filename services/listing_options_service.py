@@ -343,6 +343,27 @@ class ListingOptionsService:
         )
         return {row["size"]: row["platform_value"] for row in rows}
 
+    async def get_spo_value_codes(
+        self, pairs: List[tuple[str, str]]
+    ) -> Dict[tuple[str, str], str]:
+        """Resolve (list_code, label) pairs to ShopSimon value codes in one query."""
+        if not pairs:
+            return {}
+        conn = connections.get("default")
+        list_codes = [lc for lc, _ in pairs]
+        labels = [lb for _, lb in pairs]
+        rows = await conn.execute_query_dict(
+            """
+            SELECT DISTINCT list_code, label, value_code
+            FROM config_spo_value_lists
+            WHERE (list_code, label) IN (
+                SELECT * FROM unnest($1::text[], $2::text[])
+            )
+            """,
+            [list_codes, labels],
+        )
+        return {(r["list_code"], r["label"]): r["value_code"] for r in rows}
+
     async def get_color_info(self, color: str) -> Dict[str, Any]:
         try:
             conn = connections.get("default")
