@@ -1193,34 +1193,59 @@ class ProductService:
             search_lower = search_term.lower()
             search_prefix = f"{search_term}%"
             search_lower_prefix = f"{search_lower}%"
-            search_lower_contains = f"%{search_lower}%"
+            # Skip contains search for very short queries — trigram indexes have poor
+            # selectivity below 3 chars and would fall back to seq scan anyway.
+            search_lower_contains = f"%{search_lower}%" if len(search_lower) >= 3 else None
 
             if is_parent is None or is_parent is True:
                 parents = await conn.execute_query_dict(
                     """
+                    WITH candidates AS (
+                        (SELECT sku, 0 AS rank
+                         FROM parent_products
+                         WHERE is_active = TRUE AND LOWER(sku) = $1
+                         LIMIT $4)
+                        UNION ALL
+                        (SELECT sku, 1 AS rank
+                         FROM parent_products
+                         WHERE is_active = TRUE AND LOWER(mpn) = $1
+                         LIMIT $4)
+                        UNION ALL
+                        (SELECT sku, 2 AS rank
+                         FROM parent_products
+                         WHERE is_active = TRUE AND LOWER(sku) LIKE $2
+                         LIMIT $4)
+                        UNION ALL
+                        (SELECT sku, 3 AS rank
+                         FROM parent_products
+                         WHERE is_active = TRUE AND LOWER(mpn) LIKE $2
+                         LIMIT $4)
+                        UNION ALL
+                        (SELECT sku, 3 AS rank
+                         FROM parent_products
+                         WHERE is_active = TRUE AND LOWER(title) LIKE $2
+                         LIMIT $4)
+                        UNION ALL
+                        (SELECT sku, 3 AS rank
+                         FROM parent_products
+                         WHERE is_active = TRUE AND title ILIKE $3
+                         LIMIT $4)
+                    ),
+                    deduped AS (
+                        SELECT sku, MIN(rank) AS rank
+                        FROM candidates
+                        GROUP BY sku
+                    )
                     SELECT
                         pp.sku,
                         pp.title,
                         pp.mpn,
                         pp.brand,
-                        (SELECT COUNT(*) FROM child_products cp WHERE cp.parent_sku = pp.sku AND cp.is_active = TRUE) as child_count
-                    FROM parent_products pp
-                    WHERE pp.is_active = TRUE AND (
-                        LOWER(pp.sku) = $1
-                        OR LOWER(pp.mpn) = $1
-                        OR LOWER(pp.sku) LIKE $2
-                        OR LOWER(pp.mpn) LIKE $2
-                        OR LOWER(pp.title) LIKE $2
-                        OR LOWER(pp.title) LIKE $3
-                    )
-                    ORDER BY
-                        CASE
-                            WHEN LOWER(pp.sku) = $1 THEN 0
-                            WHEN LOWER(pp.mpn) = $1 THEN 1
-                            WHEN LOWER(pp.sku) LIKE $2 THEN 2
-                            ELSE 3
-                        END,
-                        pp.sku
+                        (SELECT COUNT(*) FROM child_products cp
+                         WHERE cp.parent_sku = pp.sku AND cp.is_active = TRUE) AS child_count
+                    FROM deduped d
+                    JOIN parent_products pp ON pp.sku = d.sku
+                    ORDER BY d.rank, pp.sku
                     LIMIT $4
                     """,
                     [search_lower, search_lower_prefix, search_lower_contains, limit],
@@ -1242,8 +1267,44 @@ class ProductService:
                     )
 
             if is_parent is None or is_parent is False:
+                is_numeric = search_term.isdigit()
+
+                # Build UNION ALL branches dynamically. UPC and keyword branches
+                # are only included for numeric queries — both fields are always numeric.
+                child_branches = []
+                if is_numeric:
+                    child_branches += [
+                        "(SELECT cu.child_sku AS sku, 0 AS rank FROM child_upcs cu WHERE cu.upc = $1 LIMIT $6)",
+                        "(SELECT cp.sku, 0 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND $1 = ANY(cp.keywords) LIMIT $6)",
+                    ]
+                child_branches += [
+                    "(SELECT cp.sku, 1 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) = $2 LIMIT $6)",
+                    "(SELECT cp.sku, 2 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) = $2 LIMIT $6)",
+                    "(SELECT cp.sku, 3 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) LIKE $3 LIMIT $6)",
+                    "(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) LIKE $3 LIMIT $6)",
+                    "(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.title) LIKE $3 LIMIT $6)",
+                ]
+                if is_numeric:
+                    child_branches += [
+                        "(SELECT cu.child_sku AS sku, 3 AS rank FROM child_upcs cu WHERE cu.upc LIKE $4 LIMIT $6)",
+                        "(SELECT cp.sku, 3 AS rank FROM child_products cp, unnest(cp.keywords) AS k WHERE cp.is_active = TRUE AND k LIKE $4 LIMIT $6)",
+                    ]
+                if search_lower_contains is not None:
+                    child_branches.append(
+                        "(SELECT cp.sku, 4 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND pp.title ILIKE $5 LIMIT $6)"
+                    )
+
+                union_sep = "\n                        UNION ALL\n                        "
                 children = await conn.execute_query_dict(
-                    """
+                    f"""
+                    WITH candidates AS (
+                        {union_sep.join(child_branches)}
+                    ),
+                    deduped AS (
+                        SELECT sku, MIN(rank) AS rank
+                        FROM candidates
+                        GROUP BY sku
+                    )
                     SELECT
                         cp.sku,
                         cp.size,
@@ -1252,39 +1313,11 @@ class ProductService:
                         cp.keywords,
                         pp.title,
                         pp.mpn,
-                        pp.brand,
-                        (SELECT upc FROM child_upcs WHERE child_sku = cp.sku AND is_primary_upc = TRUE LIMIT 1) as upc
-                    FROM child_products cp
+                        pp.brand
+                    FROM deduped d
+                    JOIN child_products cp ON cp.sku = d.sku AND cp.is_active = TRUE
                     LEFT JOIN parent_products pp ON cp.parent_sku = pp.sku
-                    WHERE cp.is_active = TRUE AND (
-                        -- Exact UPC match (any UPC, primary or secondary)
-                        EXISTS (SELECT 1 FROM child_upcs WHERE child_sku = cp.sku AND upc = $1)
-                        -- Exact keyword match
-                        OR $1 = ANY(cp.keywords)
-                        -- SKU/MPN exact matches
-                        OR LOWER(cp.sku) = $2
-                        OR LOWER(pp.mpn) = $2
-                        -- SKU/MPN prefix matches
-                        OR LOWER(cp.sku) LIKE $3
-                        OR LOWER(pp.mpn) LIKE $3
-                        -- UPC prefix match (any UPC)
-                        OR EXISTS (SELECT 1 FROM child_upcs WHERE child_sku = cp.sku AND upc LIKE $4)
-                        -- Title matches
-                        OR LOWER(pp.title) LIKE $3
-                        OR LOWER(pp.title) LIKE $5
-                        -- Keyword prefix match
-                        OR EXISTS (SELECT 1 FROM unnest(cp.keywords) k WHERE k LIKE $4)
-                    )
-                    ORDER BY
-                        CASE
-                            WHEN EXISTS (SELECT 1 FROM child_upcs WHERE child_sku = cp.sku AND upc = $1) THEN 0
-                            WHEN $1 = ANY(cp.keywords) THEN 0
-                            WHEN LOWER(cp.sku) = $2 THEN 1
-                            WHEN LOWER(pp.mpn) = $2 THEN 2
-                            WHEN LOWER(cp.sku) LIKE $3 THEN 3
-                            ELSE 4
-                        END,
-                        cp.sku
+                    ORDER BY d.rank, cp.sku
                     LIMIT $6
                     """,
                     [
