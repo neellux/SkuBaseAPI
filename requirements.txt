@@ -18,3 +18,4 @@ litellm==1.42.1
 Pillow
 google-genai
 gcloud-aio-storage
+apscheduler==3.11.0
