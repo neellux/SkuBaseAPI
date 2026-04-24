@@ -346,30 +346,39 @@ async def process_bulk_assignment(bulk_id: int = Query(..., description="Bulk re
 
 @router.get("/export")
 async def export_products(
-    type: str = Query("primary", description="Export type: 'primary' or 'secondary_skus'"),
+    type: str = Query("primary", description="Export type: 'primary', 'secondary_skus', or 'parent_skus'"),
 ):
-    """Export products as CSV. Type 'primary' exports UPCs/keywords, 'secondary_skus' exports secondary-to-primary mappings."""
+    """Export products as CSV."""
     import io
     import pandas as pd
 
     try:
         conn = Tortoise.get_connection("product_db")
 
-        if type == "secondary_skus":
+        if type == "parent_skus":
             query = """
                 SELECT
-                    sec.sku as old_sku,
-                    pri.sku as new_sku
-                FROM child_products sec
-                JOIN child_products pri
-                    ON pri.parent_sku = sec.parent_sku
-                    AND pri.size = sec.size
-                    AND pri.is_primary = TRUE
-                WHERE sec.is_primary = FALSE
-                ORDER BY sec.sku
+                    cp.parent_sku,
+                    cp.sku,
+                    cu.upc AS primary_upc
+                FROM child_products cp
+                LEFT JOIN child_upcs cu
+                    ON cu.child_sku = cp.sku AND cu.is_primary_upc = TRUE
+                WHERE cp.is_primary = TRUE AND cp.is_active = TRUE
+                ORDER BY cp.parent_sku, cp.sku
             """
             results = await conn.execute_query_dict(query)
-            df = pd.DataFrame(results, columns=["old_sku", "new_sku"])
+            df = pd.DataFrame(results, columns=["parent_sku", "sku", "primary_upc"])
+            df.columns = ["Parent SKU", "SKU", "Primary UPC"]
+            filename = "parent_skus_export.csv"
+        elif type == "secondary_skus":
+            query = """
+                SELECT secondary_sku, current_primary_sku
+                FROM secondary_skus
+                ORDER BY secondary_sku
+            """
+            results = await conn.execute_query_dict(query)
+            df = pd.DataFrame(results, columns=["secondary_sku", "current_primary_sku"])
             filename = "secondary_skus_export.csv"
         else:
             query = """

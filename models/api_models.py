@@ -539,6 +539,10 @@ class PlatformMeta(BaseModel):
     icon_mime_type: Optional[str] = Field(
         None, description="MIME type of the icon (e.g., 'image/svg+xml')"
     )
+    settings: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Platform settings from app_settings.platform_settings (auto_submit, batch_submit, allow_resubmit, requires_images, etc.)",
+    )
 
 
 class PlatformMetaResponse(BaseModel):

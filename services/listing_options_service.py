@@ -186,6 +186,123 @@ class ListingOptionsService:
             logger.error(f"Error fetching {platform} type for {product_type}: {e}")
             raise
 
+    async def get_platform_color(self, color: str, platform: str) -> str | None:
+        try:
+            conn = connections.get("default")
+
+            query = """
+                SELECT cdl.platform_value
+                FROM listingoptions_colors_default_list cdl
+                JOIN listingoptions_colors c ON cdl.primary_id = c.id
+                WHERE cdl.platform_id = $2
+                  AND (
+                      LOWER(c.color) = LOWER($1)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(c.aliases) AS alias
+                          WHERE LOWER(alias) = LOWER($1)
+                      )
+                  )
+                LIMIT 1
+            """
+
+            result = await conn.execute_query_dict(query, [color, platform])
+
+            if not result:
+                logger.warning(f"No {platform} color mapping found for: {color}")
+                return None
+
+            platform_value = result[0].get("platform_value")
+            logger.info(f"{platform} color for '{color}': {platform_value}")
+            return platform_value
+
+        except Exception as e:
+            logger.error(f"Error fetching {platform} color for {color}: {e}")
+            raise
+
+    async def check_unmapped_type_or_color(
+        self,
+        product_type: str | None,
+        color: str | None,
+        platforms: list,
+        platform_settings: dict,
+    ) -> list:
+        result = []
+        for platform_id in platforms:
+            if platform_id == "sellercloud":
+                continue
+            settings = platform_settings.get(platform_id, {}) or {}
+            require_type = bool(settings.get("require_type_mapping"))
+            require_color = bool(settings.get("require_color_mapping"))
+            if not require_type and not require_color:
+                continue
+
+            missing = []
+            if require_type:
+                if not product_type:
+                    missing.append("type")
+                else:
+                    mapped = await self.get_platform_type(product_type, platform_id)
+                    if not mapped:
+                        missing.append("type")
+            if require_color:
+                if not color:
+                    missing.append("color")
+                else:
+                    mapped = await self.get_platform_color(color, platform_id)
+                    if not mapped:
+                        missing.append("color")
+
+            if missing:
+                conn = connections.get("default")
+                platform_info = await conn.execute_query_dict(
+                    "SELECT name FROM listingoptions_platforms WHERE id = $1", [platform_id]
+                )
+                result.append(
+                    {
+                        "platform_id": platform_id,
+                        "platform_name": (
+                            platform_info[0]["name"] if platform_info else platform_id
+                        ),
+                        "missing": missing,
+                        "product_type": product_type,
+                        "color": color,
+                    }
+                )
+        return result
+
+    async def get_mapping_status(
+        self,
+        product_type: str | None,
+        color: str | None,
+        platforms: list,
+        platform_settings: dict | None = None,
+    ) -> dict:
+        type_status: dict = {}
+        color_status: dict = {}
+        type_required: dict = {}
+        color_required: dict = {}
+        platform_settings = platform_settings or {}
+        for platform_id in platforms:
+            if platform_id == "sellercloud":
+                continue
+            settings = platform_settings.get(platform_id, {}) or {}
+            type_required[platform_id] = bool(settings.get("require_type_mapping"))
+            color_required[platform_id] = bool(settings.get("require_color_mapping"))
+            type_status[platform_id] = bool(
+                product_type
+                and await self.get_platform_type(product_type, platform_id)
+            )
+            color_status[platform_id] = bool(
+                color and await self.get_platform_color(color, platform_id)
+            )
+        return {
+            "type": type_status,
+            "color": color_status,
+            "type_required": type_required,
+            "color_required": color_required,
+        }
+
     async def check_unmapped_sizes(
         self, sizing_scheme: str, sizes: list, platforms: list, sizing_type: str = None
     ) -> list:

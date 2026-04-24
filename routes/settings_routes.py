@@ -195,10 +195,15 @@ async def get_platform_meta():
         enabled_platform_ids = (
             settings.platforms if settings and settings.platforms else ["sellercloud", "grailed"]
         )
+        platform_settings = (settings.platform_settings or {}) if settings else {}
 
         all_platforms = await listing_options_service.get_platforms()
 
-        platforms = [p for p in all_platforms if p.get("id") in enabled_platform_ids]
+        platforms = [
+            {**p, "settings": platform_settings.get(p["id"], {})}
+            for p in all_platforms
+            if p.get("id") in enabled_platform_ids
+        ]
 
         return PlatformMetaResponse(platforms=platforms)
     except Exception as e:

@@ -279,7 +279,7 @@ async def get_submission_status(
     }
 
     all_complete = (
-        all(s["status"] in ("success", "failed", "queued") for s in platform_statuses.values())
+        all(s["status"] in ("success", "failed") for s in platform_statuses.values())
         if platform_statuses
         else True
     )
@@ -287,6 +287,35 @@ async def get_submission_status(
     return {
         "platforms": platform_statuses,
         "all_complete": all_complete,
+    }
+
+
+@router.get("/mapping_status")
+async def get_mapping_status(
+    listing_id: str = Query(..., description="Listing ID"),
+):
+    listing = await ListingService.get_listing_by_id(listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    settings = await AppSettings.first()
+    enabled_platforms = settings.platforms if settings and settings.platforms else []
+    non_sc_platforms = [p for p in enabled_platforms if p != "sellercloud"]
+    platform_settings = (
+        settings.platform_settings if settings and settings.platform_settings else {}
+    )
+
+    form_data = listing.data or {}
+    product_type = form_data.get("product_type")
+    color = form_data.get("standard_color")
+
+    status = await listing_options_service.get_mapping_status(
+        product_type, color, non_sc_platforms, platform_settings
+    )
+    return {
+        "product_type": product_type,
+        "standard_color": color,
+        **status,
     }
 
 
@@ -421,6 +450,24 @@ async def submit_listing(
                         "platforms_with_missing": unmapped,
                     },
                 )
+
+    if non_sc_platforms:
+        form_data = listing.data or {}
+        product_type = form_data.get("product_type")
+        color = form_data.get("standard_color")
+        missing_type_or_color = await listing_options_service.check_unmapped_type_or_color(
+            product_type, color, non_sc_platforms, platform_settings
+        )
+        if missing_type_or_color:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "type": "unmapped_types_or_colors",
+                    "product_type": product_type,
+                    "color": color,
+                    "platforms_with_missing": missing_type_or_color,
+                },
+            )
 
     submission_records = {}
     try:

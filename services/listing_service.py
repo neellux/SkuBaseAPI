@@ -122,6 +122,27 @@ class ListingService:
         return product_name
 
     @staticmethod
+    async def _check_photos_uploaded(product_id: str) -> bool:
+        try:
+            photo_conn = connections.get("photography_db")
+            rows = await photo_conn.execute_query_dict(
+                """
+                SELECT image_source
+                FROM productimages
+                WHERE product_id = $1
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                [product_id],
+            )
+            if not rows:
+                return False
+            return rows[0].get("image_source") in ("upload", "manual")
+        except Exception as e:
+            logger.warning(f"Failed to check photo upload status for {product_id}: {e}")
+            return False
+
+    @staticmethod
     async def _load_mapped_options(
         field_definitions: List[Dict[str, Any]],
     ) -> Dict[str, List[Any]]:
@@ -365,6 +386,10 @@ class ListingService:
                         maxsplit=1,
                     )[0].strip()
 
+            upload_status = "pending"
+            if await ListingService._check_photos_uploaded(request.product_id):
+                upload_status = "uploaded"
+
             listing = await Listing.create(
                 product_id=request.product_id,
                 info_product_id=request.info_product_id,
@@ -373,6 +398,7 @@ class ListingService:
                 ai_response=ai_response_data,
                 ai_description=ai_description,
                 original_description=original_description,
+                upload_status=upload_status,
                 created_by=created_by,
             )
 
@@ -448,7 +474,13 @@ class ListingService:
     @staticmethod
     async def get_draft_listing_by_product_id(product_id: str) -> Optional[Listing]:
         try:
-            listing = await Listing.get_or_none(product_id=product_id, submitted=False)
+            listing = (
+                await Listing.filter(
+                    product_id=product_id, submitted=False, batch_id=None
+                )
+                .order_by("-created_at")
+                .first()
+            )
             return listing
         except Exception as e:
             logger.error(f"Error fetching draft listing for product {product_id}: {e}")

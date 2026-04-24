@@ -405,6 +405,9 @@ class GrailedService:
         stripped_description = row_data.pop("description", "")
         country_full = row_data.get("country_of_origin", "")
 
+        require_type_mapping = bool(settings.get("require_type_mapping"))
+        require_color_mapping = bool(settings.get("require_color_mapping"))
+
         category = row_data.get("category")
         if category:
             grailed_type = await listing_options_service.get_platform_type(
@@ -412,6 +415,24 @@ class GrailedService:
             )
             if grailed_type:
                 row_data["category"] = grailed_type
+            elif require_type_mapping:
+                raise ValueError(
+                    f"Grailed: require_type_mapping is on and no platform type mapping exists "
+                    f"for product_type {category!r}"
+                )
+
+        standard_color = form_data.get("standard_color")
+        if standard_color:
+            grailed_color = await listing_options_service.get_platform_color(
+                standard_color, self.PLATFORM_ID
+            )
+            if grailed_color:
+                row_data["color"] = grailed_color
+            elif require_color_mapping:
+                raise ValueError(
+                    f"Grailed: require_color_mapping is on and no platform color mapping exists "
+                    f"for color {standard_color!r}"
+                )
 
         country_of_origin = row_data.get("country_of_origin")
         if country_of_origin:

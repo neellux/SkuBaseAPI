@@ -40,6 +40,19 @@ class BatchService:
                 detail=f"Batch size ({len(request.product_ids)}) exceeds maximum allowed ({max_batches})",
             )
 
+        if request.photography_batch_id is not None:
+            existing = (
+                await Batch.filter(photography_batch_id=request.photography_batch_id)
+                .order_by("created_at")
+                .first()
+            )
+            if existing:
+                logger.info(
+                    f"Idempotent create_batch: photography_batch_id={request.photography_batch_id} "
+                    f"already mapped to batch_id={existing.id}; returning existing batch"
+                )
+                return await BatchService._to_response(existing, include_listings=True)
+
         logger.info("Pre-fetching default template for batch processing")
         sellercloud_template = await TemplateService.get_template_by_id("default")
 
@@ -142,12 +155,16 @@ class BatchService:
                     else:
                         successful_listings.append(result)
 
-                if not successful_listings:
-                    error_msg = f"Failed to create batch: all {len(request.product_ids)} products failed processing"
+                if product_failures:
+                    error_msg = (
+                        f"Failed to create batch: {len(product_failures)} of "
+                        f"{len(request.product_ids)} products failed processing"
+                    )
                     logger.error(
-                        f"Batch creation failed - no successful listings",
+                        "Batch creation failed - rolling back",
                         extra={
                             "total_products": len(request.product_ids),
+                            "succeeded_count": len(successful_listings),
                             "failed_count": len(product_failures),
                             "failure_details": product_failures,
                         },

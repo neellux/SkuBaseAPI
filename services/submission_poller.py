@@ -57,17 +57,12 @@ class SubmissionPoller(BasePoller):
             await sub.save()
 
     async def _process_queued_submissions(self) -> None:
-        uploaded_ids = await Listing.filter(upload_status="uploaded").values_list("id", flat=True)
-
-        if not uploaded_ids:
-            return
-
         claimed_subs: list[ListingSubmission] = []
         async with in_transaction("default") as conn:
             queued = await (
                 ListingSubmission.filter(
                     status=SubmissionStatus.QUEUED,
-                    listing_id__in=uploaded_ids,
+                    listing__upload_status="uploaded",
                 )
                 .select_for_update(skip_locked=True)
                 .using_db(conn)

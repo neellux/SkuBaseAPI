@@ -15,6 +15,7 @@ import openpyxl
 from tortoise import connections
 
 from config import config
+from models.db_models import AppSettings
 from services.listing_options_service import listing_options_service
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,15 @@ class SpoService:
         spo_config = config.get("spo", {})
         self.api_endpoint: str = spo_config.get("api_endpoint", "").rstrip("/")
         self.api_key: str = spo_config.get("api_key", "")
+        self.appscript_endpoint: str = spo_config.get("appscript_endpoint", "")
+        self.appscript_key: str = spo_config.get("appscript_key", "")
         self._client: httpx.AsyncClient | None = None
+
+    async def get_platform_settings(self) -> dict:
+        settings = await AppSettings.first()
+        if not settings or not settings.platform_settings:
+            return {}
+        return settings.platform_settings.get(self.PLATFORM_ID, {}) or {}
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -141,11 +150,33 @@ class SpoService:
         logger.info(f"SPO normalized-color: {row_data.get('normalized-color')}")
         logger.info(f"SPO form standard_color: {form_data.get('standard_color')}")
 
+        platform_settings = await self.get_platform_settings()
+        require_type_mapping = bool(platform_settings.get("require_type_mapping"))
+        require_color_mapping = bool(platform_settings.get("require_color_mapping"))
+
         category = row_data.get("category")
         if category:
             spo_type = await listing_options_service.get_platform_type(category, self.PLATFORM_ID)
             if spo_type:
                 row_data["category"] = spo_type
+            elif require_type_mapping:
+                raise ValueError(
+                    f"SPO: require_type_mapping is on and no platform type mapping exists "
+                    f"for product_type {category!r}"
+                )
+
+        standard_color = form_data.get("standard_color")
+        if standard_color:
+            spo_color = await listing_options_service.get_platform_color(
+                standard_color, self.PLATFORM_ID
+            )
+            if spo_color:
+                row_data["normalized-color"] = spo_color
+            elif require_color_mapping:
+                raise ValueError(
+                    f"SPO: require_color_mapping is on and no platform color mapping exists "
+                    f"for color {standard_color!r}"
+                )
 
         weight = row_data.get("weight")
         if weight:
@@ -259,6 +290,37 @@ class SpoService:
                 }
             )
         return offers
+
+    async def submit_offers(self, offers: list[dict[str, Any]]) -> dict[str, Any]:
+        if not offers:
+            raise ValueError("No offers to submit to SPO AppScript")
+        if not self.appscript_endpoint:
+            raise ValueError(
+                "SPO AppScript endpoint not configured in config.toml [spo] section"
+            )
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                self.appscript_endpoint,
+                follow_redirects=True,
+                json={
+                    "key": self.appscript_key,
+                    "action": "addOffers",
+                    "data": offers,
+                },
+            )
+        response_data = response.json()
+
+        if not response_data.get("success"):
+            error_msg = response_data.get("error", "Unknown error from SPO AppScript")
+            raise ValueError(f"SPO AppScript submission failed: {error_msg}")
+
+        logger.info(
+            f"SPO AppScript submission succeeded: "
+            f"added={response_data.get('addedCount', 0)}, "
+            f"skipped={response_data.get('skippedCount', 0)}"
+        )
+        return response_data
 
     async def upload_products(self, xlsx_path: str) -> int:
         client = await self._get_client()

@@ -1269,29 +1269,43 @@ class ProductService:
             if is_parent is None or is_parent is False:
                 is_numeric = search_term.isdigit()
 
-                # Build UNION ALL branches dynamically. UPC and keyword branches
-                # are only included for numeric queries — both fields are always numeric.
-                child_branches = []
+                # Build params and branches together. Only reference parameters
+                # that are actually used — PostgreSQL can't infer types for
+                # unreferenced placeholders.
+                child_params: List[Any] = []
+
+                def _p(value: Any) -> str:
+                    child_params.append(value)
+                    return f"${len(child_params)}"
+
+                p_lower = _p(search_lower)
+                p_lower_prefix = _p(search_lower_prefix)
+                p_term = _p(search_term) if is_numeric else None
+                p_prefix = _p(search_prefix) if is_numeric else None
+                p_contains = _p(search_lower_contains) if search_lower_contains is not None else None
+                p_limit = _p(limit)
+
+                child_branches: List[str] = []
                 if is_numeric:
                     child_branches += [
-                        "(SELECT cu.child_sku AS sku, 0 AS rank FROM child_upcs cu WHERE cu.upc = $1 LIMIT $6)",
-                        "(SELECT cp.sku, 0 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND $1 = ANY(cp.keywords) LIMIT $6)",
+                        f"(SELECT cu.child_sku AS sku, 0 AS rank FROM child_upcs cu WHERE cu.upc = {p_term} LIMIT {p_limit})",
+                        f"(SELECT cp.sku, 0 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND {p_term} = ANY(cp.keywords) LIMIT {p_limit})",
                     ]
                 child_branches += [
-                    "(SELECT cp.sku, 1 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) = $2 LIMIT $6)",
-                    "(SELECT cp.sku, 2 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) = $2 LIMIT $6)",
-                    "(SELECT cp.sku, 3 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) LIKE $3 LIMIT $6)",
-                    "(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) LIKE $3 LIMIT $6)",
-                    "(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.title) LIKE $3 LIMIT $6)",
+                    f"(SELECT cp.sku, 1 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) = {p_lower} LIMIT {p_limit})",
+                    f"(SELECT cp.sku, 2 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) = {p_lower} LIMIT {p_limit})",
+                    f"(SELECT cp.sku, 3 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) LIKE {p_lower_prefix} LIMIT {p_limit})",
+                    f"(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) LIKE {p_lower_prefix} LIMIT {p_limit})",
+                    f"(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.title) LIKE {p_lower_prefix} LIMIT {p_limit})",
                 ]
                 if is_numeric:
                     child_branches += [
-                        "(SELECT cu.child_sku AS sku, 3 AS rank FROM child_upcs cu WHERE cu.upc LIKE $4 LIMIT $6)",
-                        "(SELECT cp.sku, 3 AS rank FROM child_products cp, unnest(cp.keywords) AS k WHERE cp.is_active = TRUE AND k LIKE $4 LIMIT $6)",
+                        f"(SELECT cu.child_sku AS sku, 3 AS rank FROM child_upcs cu WHERE cu.upc LIKE {p_prefix} LIMIT {p_limit})",
+                        f"(SELECT cp.sku, 3 AS rank FROM child_products cp, unnest(cp.keywords) AS k WHERE cp.is_active = TRUE AND k LIKE {p_prefix} LIMIT {p_limit})",
                     ]
-                if search_lower_contains is not None:
+                if p_contains is not None:
                     child_branches.append(
-                        "(SELECT cp.sku, 4 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND pp.title ILIKE $5 LIMIT $6)"
+                        f"(SELECT cp.sku, 4 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND pp.title ILIKE {p_contains} LIMIT {p_limit})"
                     )
 
                 union_sep = "\n                        UNION ALL\n                        "
@@ -1318,16 +1332,9 @@ class ProductService:
                     JOIN child_products cp ON cp.sku = d.sku AND cp.is_active = TRUE
                     LEFT JOIN parent_products pp ON cp.parent_sku = pp.sku
                     ORDER BY d.rank, cp.sku
-                    LIMIT $6
+                    LIMIT {p_limit}
                     """,
-                    [
-                        search_term,
-                        search_lower,
-                        search_lower_prefix,
-                        search_prefix,
-                        search_lower_contains,
-                        limit,
-                    ],
+                    child_params,
                 )
 
                 for c in children:

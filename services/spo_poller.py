@@ -308,26 +308,22 @@ class SpoPoller(BasePoller):
             await sub.save()
             return
 
-        tmp_dir = tempfile.mkdtemp(prefix="spo_offers_")
-        csv_path = os.path.join(
-            tmp_dir, f"spo_offers_{sub.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        )
+        result = await spo_service.submit_offers(offers)
 
-        try:
-            spo_service.generate_offer_csv(offers, csv_path)
-            offer_import_id = await spo_service.upload_offers(csv_path)
+        skipped = result.get("skipped") or []
+        if skipped:
+            child_skus = set((listing.data or {}).get("child_size_overrides", {}).keys())
+            sub_skipped = [s for s in skipped if s.get("sku") in child_skus]
+            if sub_skipped:
+                logger.info(
+                    f"{self.name}: submission {sub.id} had {len(sub_skipped)} "
+                    f"already-on-sheet SKUs: {sub_skipped}"
+                )
 
-            meta = sub.platform_meta or {}
-            meta["offer_import_id"] = offer_import_id
-            sub.platform_meta = meta
-            sub.platform_status = "offers_processing"
-            await sub.save()
-        finally:
-            try:
-                os.remove(csv_path)
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+        sub.status = SubmissionStatus.SUCCESS
+        sub.platform_status = "listed"
+        await sub.save()
+        logger.info(f"{self.name}: submission {sub.id} successfully listed on SPO")
 
     async def _handle_offers_complete(
         self, import_id: int, submissions: list[ListingSubmission]
