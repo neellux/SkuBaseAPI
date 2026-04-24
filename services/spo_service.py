@@ -7,7 +7,7 @@ import re
 import tempfile
 import traceback
 from datetime import datetime
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Any
 
 import httpx
@@ -361,17 +361,27 @@ class SpoService:
         response.raise_for_status()
 
         errors = []
-        content = response.text
-        for line in csv.DictReader(content.splitlines(), delimiter=";"):
-            sku = line.get("sku", line.get("SKU", ""))
-            error_msg = line.get("error-message", line.get("Error Message", ""))
-            if sku and SKU_PATTERN.match(sku):
-                errors.append(
-                    {
-                        "sku": sku,
-                        "error": _sanitize_error_text(error_msg),
-                    }
-                )
+        # StringIO so csv reader handles newlines embedded in quoted fields
+        # (description/designer); splitlines() would fragment those rows.
+        reader = csv.DictReader(StringIO(response.text), delimiter=";")
+        for line in reader:
+            sku = (line.get("sku") or line.get("SKU") or "").strip()
+            raw_errors = (line.get("errors") or line.get("Errors") or "").strip()
+            if not sku or not SKU_PATTERN.match(sku) or not raw_errors:
+                continue
+            messages: list[str] = []
+            for part in raw_errors.split(","):
+                part = part.strip()
+                if "|" in part:
+                    messages.append(part.split("|", 1)[1].strip())
+                elif part:
+                    messages.append(part)
+            errors.append(
+                {
+                    "sku": sku,
+                    "error": _sanitize_error_text("; ".join(messages)),
+                }
+            )
         return errors
 
     async def get_transformation_error_report(self, import_id: int) -> list[dict[str, str]]:
