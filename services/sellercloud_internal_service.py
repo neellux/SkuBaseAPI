@@ -448,6 +448,8 @@ class SellercloudInternalService:
         }
         try:
             result = await self.post("/Transfer/SkuToSkuTransfer/CreateNewTransfer", data=payload)
+            data = result.get("Data") or {}
+            transfer_id = data.get("TransferID") or data.get("Id") or data.get("ID")
             if result.get("Success"):
                 return {
                     "success": True,
@@ -455,12 +457,16 @@ class SellercloudInternalService:
                     "qty": qty,
                     "from_bin": from_bin,
                     "to_bin": to_bin,
+                    "transfer_id": transfer_id,
+                    "raw": data,
                 }
             return {
                 "success": False,
                 "warehouse_id": warehouse_id,
                 "qty": qty,
                 "error": result.get("Notification", {}).get("Message", "Transfer failed"),
+                "transfer_id": transfer_id,
+                "raw": data,
             }
         except Exception as e:
             logger.error(f"Transfer failed {from_sku} -> {to_sku}: {e}")
@@ -541,6 +547,8 @@ class SellercloudInternalService:
                     to_bin=-1,
                 )
 
+                if transfer_resp.get("transfer_id") is not None:
+                    wh_result["transfer_id"] = transfer_resp.get("transfer_id")
                 if transfer_resp.get("success"):
                     wh_result["status"] = "completed"
                     result["summary"]["transferred_qty"] += physical_qty
@@ -581,6 +589,8 @@ class SellercloudInternalService:
                         "name": bin_info.get("BinName", "Unknown"),
                         "qty": bin_qty,
                     }
+                    if transfer_resp.get("transfer_id") is not None:
+                        bin_transfer["transfer_id"] = transfer_resp.get("transfer_id")
 
                     if transfer_resp.get("success"):
                         bin_transfer["status"] = "completed"
