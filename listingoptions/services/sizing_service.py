@@ -188,7 +188,7 @@ class SizingService:
     async def create_full_sizing_scheme(
         scheme_create: FullSizingSchemeCreate,
     ) -> SizingSchemeDetailResponse:
-        async with in_transaction():
+        async with in_transaction("default"):
             if await SizingScheme.filter(sizing_scheme=scheme_create.sizing_scheme).exists():
                 raise ValueError(
                     f"Sizing scheme '{scheme_create.sizing_scheme}' already exists or has entries. Cannot create as new."
@@ -230,7 +230,7 @@ class SizingService:
     async def update_scheme_size_orders(
         scheme_name: str, update_request: UpdateSizeOrderRequest
     ) -> SizingSchemeDetailResponse:
-        async with in_transaction():
+        async with in_transaction("default"):
             new_scheme_name = (
                 update_request.new_sizing_scheme.strip()
                 if update_request.new_sizing_scheme
@@ -340,7 +340,7 @@ class SizingService:
     async def update_single_size_entry(
         scheme_name: str, current_size_value: str, entry_update: SizingSchemeEntryCreate
     ) -> SizingSchemeEntryDB:
-        async with in_transaction():
+        async with in_transaction("default"):
             entry = await SizingScheme.get_or_none(
                 sizing_scheme=scheme_name, size=current_size_value
             )
