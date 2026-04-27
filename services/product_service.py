@@ -1391,11 +1391,19 @@ class ProductService:
             secondary_task = _run_secondary() if want_children else None
 
             tasks = [t for t in (parent_task, child_task, secondary_task) if t is not None]
-            gathered = await asyncio.gather(*tasks)
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
             gathered_iter = iter(gathered)
-            parent_results = next(gathered_iter) if parent_task else []
-            child_results = next(gathered_iter) if child_task else []
-            secondary_result = next(gathered_iter) if secondary_task else None
+
+            def _take(default):
+                val = next(gathered_iter)
+                if isinstance(val, Exception):
+                    logger.error(f"search_products subquery failed: {val}")
+                    return default
+                return val
+
+            parent_results = _take([]) if parent_task else []
+            child_results = _take([]) if child_task else []
+            secondary_result = _take(None) if secondary_task else None
 
             results = [*parent_results, *child_results]
 
