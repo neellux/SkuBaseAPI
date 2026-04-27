@@ -1187,7 +1187,6 @@ class ProductService:
     ) -> Dict[str, Any]:
         try:
             conn = await ProductService._get_connection()
-            results = []
 
             search_term = query.strip()
             search_lower = search_term.lower()
@@ -1197,8 +1196,11 @@ class ProductService:
             # selectivity below 3 chars and would fall back to seq scan anyway.
             search_lower_contains = f"%{search_lower}%" if len(search_lower) >= 3 else None
 
-            if is_parent is None or is_parent is True:
-                parents = await conn.execute_query_dict(
+            want_parents = is_parent is None or is_parent is True
+            want_children = is_parent is None or is_parent is False
+
+            async def _run_parents() -> List[Dict[str, Any]]:
+                rows = await conn.execute_query_dict(
                     """
                     WITH candidates AS (
                         (SELECT sku, 0 AS rank
@@ -1250,23 +1252,22 @@ class ProductService:
                     """,
                     [search_lower, search_lower_prefix, search_lower_contains, limit],
                 )
+                return [
+                    {
+                        "sku": p["sku"],
+                        "title": p.get("title"),
+                        "mpn": p.get("mpn"),
+                        "brand": p.get("brand"),
+                        "size": None,
+                        "is_primary": None,
+                        "parent_sku": None,
+                        "child_count": p.get("child_count", 0),
+                        "is_parent": True,
+                    }
+                    for p in rows
+                ]
 
-                for p in parents:
-                    results.append(
-                        {
-                            "sku": p["sku"],
-                            "title": p.get("title"),
-                            "mpn": p.get("mpn"),
-                            "brand": p.get("brand"),
-                            "size": None,
-                            "is_primary": None,
-                            "parent_sku": None,
-                            "child_count": p.get("child_count", 0),
-                            "is_parent": True,
-                        }
-                    )
-
-            if is_parent is None or is_parent is False:
+            async def _run_children() -> List[Dict[str, Any]]:
                 is_numeric = search_term.isdigit()
 
                 # Build params and branches together. Only reference parameters
@@ -1309,7 +1310,7 @@ class ProductService:
                     )
 
                 union_sep = "\n                        UNION ALL\n                        "
-                children = await conn.execute_query_dict(
+                rows = await conn.execute_query_dict(
                     f"""
                     WITH candidates AS (
                         {union_sep.join(child_branches)}
@@ -1336,22 +1337,67 @@ class ProductService:
                     """,
                     child_params,
                 )
+                return [
+                    {
+                        "sku": c["sku"],
+                        "title": c.get("title"),
+                        "mpn": c.get("mpn"),
+                        "brand": c.get("brand"),
+                        "size": c.get("size"),
+                        "is_primary": c.get("is_primary"),
+                        "parent_sku": c.get("parent_sku"),
+                        "child_count": None,
+                        "is_parent": False,
+                        "_keywords": c.get("keywords") or [],
+                    }
+                    for c in rows
+                ]
 
-                for c in children:
-                    results.append(
-                        {
-                            "sku": c["sku"],
-                            "title": c.get("title"),
-                            "mpn": c.get("mpn"),
-                            "brand": c.get("brand"),
-                            "size": c.get("size"),
-                            "is_primary": c.get("is_primary"),
-                            "parent_sku": c.get("parent_sku"),
-                            "child_count": None,
-                            "is_parent": False,
-                            "_keywords": c.get("keywords") or [],
-                        }
-                    )
+            # Resolve a reassigned secondary SKU to its live primary's child row in
+            # one JOIN. Runs in parallel with the main search; only used as a
+            # fallback when no exact match was found.
+            async def _run_secondary() -> Optional[Dict[str, Any]]:
+                rows = await conn.execute_query_dict(
+                    """
+                    SELECT cp.sku, cp.size, cp.is_primary, cp.parent_sku,
+                           pp.title, pp.mpn, pp.brand
+                    FROM secondary_skus s
+                    JOIN child_products cp
+                      ON cp.sku = s.current_primary_sku AND cp.is_active = TRUE
+                    LEFT JOIN parent_products pp ON cp.parent_sku = pp.sku
+                    WHERE s.secondary_sku = $1
+                    LIMIT 1
+                    """,
+                    [search_term],
+                )
+                if not rows:
+                    return None
+                c = rows[0]
+                return {
+                    "sku": c["sku"],
+                    "title": c.get("title"),
+                    "mpn": c.get("mpn"),
+                    "brand": c.get("brand"),
+                    "size": c.get("size"),
+                    "is_primary": c.get("is_primary"),
+                    "parent_sku": c.get("parent_sku"),
+                    "child_count": None,
+                    "is_parent": False,
+                }
+
+            parent_task = _run_parents() if want_parents else None
+            child_task = _run_children() if want_children else None
+            # Secondary lookup is child-context only.
+            secondary_task = _run_secondary() if want_children else None
+
+            tasks = [t for t in (parent_task, child_task, secondary_task) if t is not None]
+            gathered = await asyncio.gather(*tasks)
+            gathered_iter = iter(gathered)
+            parent_results = next(gathered_iter) if parent_task else []
+            child_results = next(gathered_iter) if child_task else []
+            secondary_result = next(gathered_iter) if secondary_task else None
+
+            results = [*parent_results, *child_results]
 
             exact_match = False
             if results:
@@ -1372,6 +1418,13 @@ class ProductService:
                         [first["sku"], search_term],
                     )
                     exact_match = len(upc_check) > 0
+
+            # If the term is an exact secondary SKU and the main search didn't
+            # already nail an exact match, swap in the live primary as the sole
+            # exact match so the UI's auto-select redirects to the active SKU.
+            if not exact_match and secondary_result is not None:
+                results = [secondary_result]
+                exact_match = True
 
             for r in results:
                 r.pop("_keywords", None)
