@@ -780,6 +780,10 @@ class ProductDetailsResponse(BaseModel):
     color: Optional[str] = None
     child_count: Optional[int] = None
     children: Optional[List[Dict[str, Any]]] = None
+    redirect_to: Optional[str] = Field(
+        None,
+        description="If the requested SKU is a reassigned secondary SKU, the live primary SKU it now maps to.",
+    )
 
 
 class BulkMappingItem(BaseModel):

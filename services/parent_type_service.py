@@ -69,7 +69,7 @@ class ParentTypeService:
         gender: Gender,
         reporting_category: ReportingCategory,
     ) -> ParentType:
-        async with in_transaction() as conn:
+        async with in_transaction("default") as conn:
             try:
                 parent_type_to_update = (
                     await ParentType.filter(id=parent_type_id).using_db(conn).get()
@@ -286,7 +286,7 @@ class ParentTypeService:
 
     @staticmethod
     async def delete_parent_type(parent_type_id: str):
-        async with in_transaction() as conn:
+        async with in_transaction("default") as conn:
             try:
                 existing_types_query = 'select * from "listingoptions_types" where parent_id = $1'
                 existing_types = await conn.execute_query_dict(

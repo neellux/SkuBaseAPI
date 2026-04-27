@@ -1387,6 +1387,19 @@ class ProductService:
         try:
             conn = await ProductService._get_connection()
 
+            redirect_result = await conn.execute_query_dict(
+                "SELECT current_primary_sku FROM secondary_skus WHERE secondary_sku = $1",
+                [sku],
+            )
+            if redirect_result:
+                return {
+                    "success": True,
+                    "sku": sku,
+                    "is_parent": None,
+                    "redirect_to": redirect_result[0]["current_primary_sku"],
+                    "error": None,
+                }
+
             type_result = await conn.execute_query_dict(
                 """SELECT CASE WHEN sku = $1 THEN TRUE ELSE FALSE END as is_child
                    FROM child_products
