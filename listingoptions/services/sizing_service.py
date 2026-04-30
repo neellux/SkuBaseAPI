@@ -28,7 +28,7 @@ class SizingService:
     @staticmethod
     async def get_sizing_type_options() -> List[str]:
         try:
-            schema = await DatabaseService.get_table_schema(DatabaseService._table("types"))
+            schema = await DatabaseService.get_table_schema("types")
             if not schema or not schema.column_schema:
                 logger.warning("Schema for 'types' table not found or is empty.")
                 return []
