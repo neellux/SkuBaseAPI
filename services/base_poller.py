@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 from abc import ABC, abstractmethod
 
@@ -43,9 +44,17 @@ class BasePoller(ABC):
 
     async def _run(self) -> None:
         while not self._shutdown_event.is_set():
+            # Run each cycle in a fresh contextvars.Context so any tortoise
+            # connection-context leak from a prior cycle (stale TransactionWrapper
+            # left in the connections ContextVar after a nested in_transaction
+            # unwinds out of order) cannot poison the next cycle.
+            cycle_task = asyncio.get_running_loop().create_task(
+                self._poll_cycle(), context=contextvars.Context()
+            )
             try:
-                await self._poll_cycle()
+                await cycle_task
             except asyncio.CancelledError:
+                cycle_task.cancel()
                 raise
             except Exception:
                 logger.exception(f"{self.name}: poll cycle error")
