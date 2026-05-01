@@ -1498,13 +1498,9 @@ class ProductService:
             parent_sku = resolved[0]["parent_sku"]
             child_sku = resolved[0]["child_sku"]
 
-            parent_payload, child_payload = await asyncio.gather(
-                ProductService._build_parent_payload(conn, parent_sku),
-                ProductService._build_selected_child_payload(conn, child_sku)
-                if child_sku
-                else asyncio.sleep(0, result=None),
+            parent_payload = await ProductService._build_parent_payload(
+                conn, parent_sku
             )
-
             if not parent_payload:
                 return {
                     "success": False,
@@ -1513,7 +1509,17 @@ class ProductService:
                     "error": "Parent product not found",
                 }
 
-            return {**parent_payload, "selected_child": child_payload}
+            # Children list entries are full SelectedChild equivalents — when
+            # the requested SKU was a child, just point `selected_child` at
+            # the matching entry.
+            selected_child = None
+            if child_sku:
+                selected_child = next(
+                    (c for c in parent_payload["children"] if c["sku"] == child_sku),
+                    None,
+                )
+
+            return {**parent_payload, "selected_child": selected_child}
 
         except Exception as e:
             logger.error(f"Error getting product details for '{sku}': {e}")
@@ -1553,8 +1559,10 @@ class ProductService:
                 cp.sku,
                 cp.size,
                 cp.is_primary,
+                cp.keywords,
                 cu.upc,
-                cu.is_primary_upc
+                cu.is_primary_upc,
+                cu.upc_type
             FROM child_products cp
             LEFT JOIN child_upcs cu ON cu.child_sku = cp.sku
             WHERE cp.parent_sku = $1 AND cp.is_active = TRUE
@@ -1571,12 +1579,18 @@ class ProductService:
                     "sku": sku_key,
                     "size": c["size"],
                     "is_primary": c["is_primary"],
+                    "parent_sku": parent_sku,
                     "primary_upc": None,
-                    "upcs": [],
+                    "all_upcs": [],
+                    "keywords": c.get("keywords") or [],
                 }
             if c.get("upc"):
-                children_map[sku_key]["upcs"].append(
-                    {"upc": c["upc"], "is_primary_upc": c["is_primary_upc"]}
+                children_map[sku_key]["all_upcs"].append(
+                    {
+                        "upc": c["upc"],
+                        "is_primary_upc": c["is_primary_upc"],
+                        "upc_type": c.get("upc_type"),
+                    }
                 )
                 if c["is_primary_upc"]:
                     children_map[sku_key]["primary_upc"] = c["upc"]
@@ -1622,55 +1636,6 @@ class ProductService:
             "child_count": len(children),
             "children": children,
             "error": None,
-        }
-
-    @staticmethod
-    async def _build_selected_child_payload(conn, child_sku: str) -> Optional[Dict[str, Any]]:
-        child_result, upcs_result = await asyncio.gather(
-            conn.execute_query_dict(
-                """
-                SELECT sku, size, is_primary, parent_sku, keywords
-                FROM child_products
-                WHERE sku = $1 AND is_active = TRUE
-                """,
-                [child_sku],
-            ),
-            conn.execute_query_dict(
-                """
-                SELECT upc, is_primary_upc, upc_type
-                FROM child_upcs
-                WHERE child_sku = $1
-                """,
-                [child_sku],
-            ),
-        )
-
-        if not child_result:
-            return None
-
-        child = child_result[0]
-
-        primary_upc = None
-        all_upcs: List[Dict[str, Any]] = []
-        for u in upcs_result:
-            all_upcs.append(
-                {
-                    "upc": u["upc"],
-                    "is_primary_upc": u["is_primary_upc"],
-                    "upc_type": u.get("upc_type"),
-                }
-            )
-            if u["is_primary_upc"]:
-                primary_upc = u["upc"]
-
-        return {
-            "sku": child.get("sku"),
-            "size": child.get("size"),
-            "is_primary": child.get("is_primary"),
-            "parent_sku": child.get("parent_sku"),
-            "primary_upc": primary_upc,
-            "all_upcs": all_upcs,
-            "keywords": child.get("keywords") or [],
         }
 
     @staticmethod
