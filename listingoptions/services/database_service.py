@@ -131,7 +131,7 @@ class DatabaseService:
             )
 
             schema_entry = await Schema.create(
-                table=DatabaseService._table(request.table_name),
+                table=request.table_name,
                 display_name=request.display_name,
                 primary_business_column=request.primary_business_column,
                 column_schema=[primary_column_def.dict()],

@@ -756,23 +756,46 @@ class ProductSearchResponse(BaseModel):
     exact_match: bool = False
 
 
+class SelectedChildUpc(BaseModel):
+
+    upc: str
+    is_primary_upc: bool
+    upc_type: Optional[str] = None
+
+
+class SelectedChild(BaseModel):
+    """Child-specific data for the SKU the user requested (when that SKU was a child)."""
+
+    sku: str
+    size: Optional[str] = None
+    is_primary: Optional[bool] = None
+    parent_sku: Optional[str] = None
+    primary_upc: Optional[str] = None
+    all_upcs: List[SelectedChildUpc] = Field(default_factory=list)
+    keywords: List[str] = Field(default_factory=list)
+
+
 class ProductDetailsResponse(BaseModel):
+    """
+    Unified parent-shaped response. Top-level fields describe the parent;
+    `children` is the parent's child list. When the requested SKU was a
+    child, `selected_child` carries that child's per-row data (size, UPCs,
+    keywords). When the requested SKU was a parent itself,
+    `selected_child` is `None`.
+    """
 
     success: bool
     sku: str
-    is_parent: Optional[bool] = Field(None, description="True if parent product, False if child")
+    is_parent: Optional[bool] = Field(
+        None,
+        description="True for resolved products. None on redirect/not-found responses.",
+    )
     title: Optional[str] = None
     mpn: Optional[str] = None
     brand: Optional[str] = None
     type_code: Optional[str] = None
     serial_number: Optional[int] = None
     company_code: Optional[int] = None
-    size: Optional[str] = None
-    is_primary: Optional[bool] = None
-    parent_sku: Optional[str] = None
-    primary_upc: Optional[str] = None
-    all_upcs: Optional[List[Dict[str, Any]]] = None
-    keywords: Optional[List[str]] = None
     product_type: Optional[str] = None
     sizing_scheme: Optional[str] = None
     style_name: Optional[str] = None
@@ -780,10 +803,15 @@ class ProductDetailsResponse(BaseModel):
     color: Optional[str] = None
     child_count: Optional[int] = None
     children: Optional[List[Dict[str, Any]]] = None
+    selected_child: Optional[SelectedChild] = Field(
+        None,
+        description="Populated when the requested SKU was a child; carries that child's size, UPCs, keywords, and primary flag.",
+    )
     redirect_to: Optional[str] = Field(
         None,
         description="If the requested SKU is a reassigned secondary SKU, the live primary SKU it now maps to.",
     )
+    error: Optional[str] = None
 
 
 class BulkMappingItem(BaseModel):

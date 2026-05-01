@@ -439,6 +439,18 @@ class UpdateSizeOrderRequest(BaseModel):
         None, description="Updated list of applicable types for this sizing scheme."
     )
 
+    @validator("sizes")
+    def sizes_must_not_be_empty(cls, v):
+        if not v:
+            raise ValueError("Sizing scheme must have at least one size.")
+        return v
+
+    @validator("sizing_types")
+    def sizing_types_must_not_be_empty(cls, v):
+        if v is None or len([t for t in v if t and t.strip()]) == 0:
+            raise ValueError("Sizing scheme must have at least one sizing type.")
+        return v
+
 
 class FullSizingSchemeCreate(BaseModel):
 
@@ -449,6 +461,18 @@ class FullSizingSchemeCreate(BaseModel):
     sizing_types: Optional[List[str]] = Field(
         None, description="List of applicable types for this sizing scheme."
     )
+
+    @validator("sizes")
+    def sizes_must_not_be_empty(cls, v):
+        if not v:
+            raise ValueError("Sizing scheme must have at least one size.")
+        return v
+
+    @validator("sizing_types")
+    def sizing_types_must_not_be_empty(cls, v):
+        if v is None or len([t for t in v if t and t.strip()]) == 0:
+            raise ValueError("Sizing scheme must have at least one sizing type.")
+        return v
 
 
 class SizingListPlatformEntryBase(BaseModel):

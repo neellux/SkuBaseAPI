@@ -1445,6 +1445,14 @@ class ProductService:
 
     @staticmethod
     async def get_product_details(sku: str) -> Dict[str, Any]:
+        """
+        Resolve any SKU (parent or child) to a unified parent-shaped payload.
+
+        Always returns the parent's fields at the top level plus a `children`
+        list. When the input SKU was a child, `selected_child` carries that
+        child's size/UPCs/keywords. When the input was a parent itself,
+        `selected_child` is `None`.
+        """
         try:
             conn = await ProductService._get_connection()
 
@@ -1461,15 +1469,25 @@ class ProductService:
                     "error": None,
                 }
 
-            type_result = await conn.execute_query_dict(
-                """SELECT CASE WHEN sku = $1 THEN TRUE ELSE FALSE END as is_child
-                   FROM child_products
-                   WHERE (sku = $1 OR parent_sku = $1) AND is_active = TRUE
-                   LIMIT 1""",
+            # Resolve the input SKU to (parent_sku, child_sku) in one query.
+            # `child_sku` is set only when the input matches an active child.
+            resolved = await conn.execute_query_dict(
+                """
+                SELECT
+                    COALESCE(cp.parent_sku, pp.sku) AS parent_sku,
+                    cp.sku                          AS child_sku
+                FROM (SELECT $1::text AS sku) i
+                LEFT JOIN child_products  cp
+                       ON cp.sku = i.sku AND cp.is_active = TRUE
+                LEFT JOIN parent_products pp
+                       ON pp.sku = i.sku AND pp.is_active = TRUE
+                WHERE cp.sku IS NOT NULL OR pp.sku IS NOT NULL
+                LIMIT 1
+                """,
                 [sku],
             )
 
-            if not type_result:
+            if not resolved:
                 return {
                     "success": False,
                     "sku": sku,
@@ -1477,219 +1495,183 @@ class ProductService:
                     "error": "Product not found",
                 }
 
-            is_child = type_result[0]["is_child"]
+            parent_sku = resolved[0]["parent_sku"]
+            child_sku = resolved[0]["child_sku"]
 
-            if is_child:
-                child_result = await conn.execute_query_dict(
-                    """
-                    SELECT
-                        cp.sku,
-                        cp.size,
-                        cp.is_primary,
-                        cp.parent_sku,
-                        pp.title,
-                        pp.mpn,
-                        pp.brand,
-                        pp.type_code,
-                        pp.serial_number,
-                        pp.company_code,
-                        pp.product_type,
-                        pp.sizing_scheme,
-                        pp.style_name,
-                        pp.brand_color,
-                        pp.color
-                    FROM child_products cp
-                    LEFT JOIN parent_products pp ON cp.parent_sku = pp.sku
-                    WHERE cp.sku = $1 AND cp.is_active = TRUE
-                    """,
-                    [sku],
-                )
+            parent_payload, child_payload = await asyncio.gather(
+                ProductService._build_parent_payload(conn, parent_sku),
+                ProductService._build_selected_child_payload(conn, child_sku)
+                if child_sku
+                else asyncio.sleep(0, result=None),
+            )
 
-                if not child_result:
-                    return {
-                        "success": False,
-                        "sku": sku,
-                        "is_parent": False,
-                        "error": "Child product not found",
-                    }
-
-                child = child_result[0]
-
-                upcs_result = await conn.execute_query_dict(
-                    """
-                    SELECT upc, is_primary_upc, upc_type
-                    FROM child_upcs
-                    WHERE child_sku = $1
-                    """,
-                    [sku],
-                )
-
-                primary_upc = None
-                all_upcs = []
-                for u in upcs_result:
-                    all_upcs.append(
-                        {
-                            "upc": u["upc"],
-                            "is_primary_upc": u["is_primary_upc"],
-                            "upc_type": u.get("upc_type"),
-                        }
-                    )
-                    if u["is_primary_upc"]:
-                        primary_upc = u["upc"]
-
-                keywords_result = await conn.execute_query_dict(
-                    "SELECT keywords FROM child_products WHERE sku = $1",
-                    [sku],
-                )
-                keywords = (
-                    keywords_result[0]["keywords"]
-                    if keywords_result and keywords_result[0]["keywords"]
-                    else []
-                )
-
+            if not parent_payload:
                 return {
-                    "success": True,
+                    "success": False,
                     "sku": sku,
-                    "is_parent": False,
-                    "title": child.get("title"),
-                    "mpn": child.get("mpn"),
-                    "brand": child.get("brand"),
-                    "type_code": child.get("type_code"),
-                    "serial_number": child.get("serial_number"),
-                    "company_code": child.get("company_code"),
-                    "product_type": child.get("product_type"),
-                    "sizing_scheme": child.get("sizing_scheme"),
-                    "style_name": child.get("style_name"),
-                    "brand_color": child.get("brand_color"),
-                    "color": child.get("color"),
-                    "size": child.get("size"),
-                    "is_primary": child.get("is_primary"),
-                    "parent_sku": child.get("parent_sku"),
-                    "primary_upc": primary_upc,
-                    "all_upcs": all_upcs,
-                    "keywords": keywords,
-                    "child_count": None,
-                    "children": None,
-                    "error": None,
+                    "is_parent": None,
+                    "error": "Parent product not found",
                 }
 
-            else:
-                parent_result = await conn.execute_query_dict(
-                    """
-                    SELECT
-                        pp.sku,
-                        pp.title,
-                        pp.mpn,
-                        pp.brand,
-                        pp.type_code,
-                        pp.serial_number,
-                        pp.company_code,
-                        pp.product_type,
-                        pp.sizing_scheme,
-                        pp.style_name,
-                        pp.brand_color,
-                        pp.color
-                    FROM parent_products pp
-                    WHERE pp.sku = $1 AND pp.is_active = TRUE
-                    """,
-                    [sku],
-                )
-
-                if not parent_result:
-                    return {
-                        "success": False,
-                        "sku": sku,
-                        "is_parent": True,
-                        "error": "Parent product not found",
-                    }
-
-                parent = parent_result[0]
-
-                children_result = await conn.execute_query_dict(
-                    """
-                    SELECT
-                        cp.sku,
-                        cp.size,
-                        cp.is_primary,
-                        cu.upc,
-                        cu.is_primary_upc
-                    FROM child_products cp
-                    LEFT JOIN child_upcs cu ON cu.child_sku = cp.sku
-                    WHERE cp.parent_sku = $1 AND cp.is_active = TRUE
-                    ORDER BY cp.size, cp.is_primary DESC, cu.is_primary_upc DESC
-                    """,
-                    [sku],
-                )
-
-                children_map = {}
-                for c in children_result:
-                    sku_key = c["sku"]
-                    if sku_key not in children_map:
-                        children_map[sku_key] = {
-                            "sku": sku_key,
-                            "size": c["size"],
-                            "is_primary": c["is_primary"],
-                            "primary_upc": None,
-                            "upcs": [],
-                        }
-                    if c.get("upc"):
-                        children_map[sku_key]["upcs"].append(
-                            {"upc": c["upc"], "is_primary_upc": c["is_primary_upc"]}
-                        )
-                        if c["is_primary_upc"]:
-                            children_map[sku_key]["primary_upc"] = c["upc"]
-
-                children = list(children_map.values())
-
-                parent_sizing_scheme = parent.get("sizing_scheme")
-                if parent_sizing_scheme:
-                    default_conn = connections.get("default")
-                    scheme_rows = await default_conn.execute_query_dict(
-                        """
-                        SELECT size, "order"
-                        FROM listingoptions_sizing_schemes
-                        WHERE sizing_scheme = $1
-                        ORDER BY "order"
-                        """,
-                        [parent_sizing_scheme],
-                    )
-                    if scheme_rows:
-                        size_order = {row["size"]: row["order"] for row in scheme_rows}
-                        children.sort(
-                            key=lambda c: (
-                                size_order.get(c["size"], float("inf")),
-                                not c["is_primary"],
-                            )
-                        )
-
-                return {
-                    "success": True,
-                    "sku": sku,
-                    "is_parent": True,
-                    "title": parent.get("title"),
-                    "mpn": parent.get("mpn"),
-                    "brand": parent.get("brand"),
-                    "type_code": parent.get("type_code"),
-                    "serial_number": parent.get("serial_number"),
-                    "company_code": parent.get("company_code"),
-                    "product_type": parent.get("product_type"),
-                    "sizing_scheme": parent.get("sizing_scheme"),
-                    "style_name": parent.get("style_name"),
-                    "brand_color": parent.get("brand_color"),
-                    "color": parent.get("color"),
-                    "size": None,
-                    "is_primary": None,
-                    "parent_sku": None,
-                    "primary_upc": None,
-                    "all_upcs": None,
-                    "child_count": len(children),
-                    "children": children,
-                    "error": None,
-                }
+            return {**parent_payload, "selected_child": child_payload}
 
         except Exception as e:
             logger.error(f"Error getting product details for '{sku}': {e}")
             return {"success": False, "sku": sku, "is_parent": None, "error": str(e)}
+
+    @staticmethod
+    async def _build_parent_payload(conn, parent_sku: str) -> Optional[Dict[str, Any]]:
+        parent_result = await conn.execute_query_dict(
+            """
+            SELECT
+                pp.sku,
+                pp.title,
+                pp.mpn,
+                pp.brand,
+                pp.type_code,
+                pp.serial_number,
+                pp.company_code,
+                pp.product_type,
+                pp.sizing_scheme,
+                pp.style_name,
+                pp.brand_color,
+                pp.color
+            FROM parent_products pp
+            WHERE pp.sku = $1 AND pp.is_active = TRUE
+            """,
+            [parent_sku],
+        )
+
+        if not parent_result:
+            return None
+
+        parent = parent_result[0]
+
+        children_result = await conn.execute_query_dict(
+            """
+            SELECT
+                cp.sku,
+                cp.size,
+                cp.is_primary,
+                cu.upc,
+                cu.is_primary_upc
+            FROM child_products cp
+            LEFT JOIN child_upcs cu ON cu.child_sku = cp.sku
+            WHERE cp.parent_sku = $1 AND cp.is_active = TRUE
+            ORDER BY cp.size, cp.is_primary DESC, cu.is_primary_upc DESC
+            """,
+            [parent_sku],
+        )
+
+        children_map: Dict[str, Dict[str, Any]] = {}
+        for c in children_result:
+            sku_key = c["sku"]
+            if sku_key not in children_map:
+                children_map[sku_key] = {
+                    "sku": sku_key,
+                    "size": c["size"],
+                    "is_primary": c["is_primary"],
+                    "primary_upc": None,
+                    "upcs": [],
+                }
+            if c.get("upc"):
+                children_map[sku_key]["upcs"].append(
+                    {"upc": c["upc"], "is_primary_upc": c["is_primary_upc"]}
+                )
+                if c["is_primary_upc"]:
+                    children_map[sku_key]["primary_upc"] = c["upc"]
+
+        children = list(children_map.values())
+
+        parent_sizing_scheme = parent.get("sizing_scheme")
+        if parent_sizing_scheme:
+            default_conn = connections.get("default")
+            scheme_rows = await default_conn.execute_query_dict(
+                """
+                SELECT size, "order"
+                FROM listingoptions_sizing_schemes
+                WHERE sizing_scheme = $1
+                ORDER BY "order"
+                """,
+                [parent_sizing_scheme],
+            )
+            if scheme_rows:
+                size_order = {row["size"]: row["order"] for row in scheme_rows}
+                children.sort(
+                    key=lambda c: (
+                        size_order.get(c["size"], float("inf")),
+                        not c["is_primary"],
+                    )
+                )
+
+        return {
+            "success": True,
+            "sku": parent_sku,
+            "is_parent": True,
+            "title": parent.get("title"),
+            "mpn": parent.get("mpn"),
+            "brand": parent.get("brand"),
+            "type_code": parent.get("type_code"),
+            "serial_number": parent.get("serial_number"),
+            "company_code": parent.get("company_code"),
+            "product_type": parent.get("product_type"),
+            "sizing_scheme": parent.get("sizing_scheme"),
+            "style_name": parent.get("style_name"),
+            "brand_color": parent.get("brand_color"),
+            "color": parent.get("color"),
+            "child_count": len(children),
+            "children": children,
+            "error": None,
+        }
+
+    @staticmethod
+    async def _build_selected_child_payload(conn, child_sku: str) -> Optional[Dict[str, Any]]:
+        child_result, upcs_result = await asyncio.gather(
+            conn.execute_query_dict(
+                """
+                SELECT sku, size, is_primary, parent_sku, keywords
+                FROM child_products
+                WHERE sku = $1 AND is_active = TRUE
+                """,
+                [child_sku],
+            ),
+            conn.execute_query_dict(
+                """
+                SELECT upc, is_primary_upc, upc_type
+                FROM child_upcs
+                WHERE child_sku = $1
+                """,
+                [child_sku],
+            ),
+        )
+
+        if not child_result:
+            return None
+
+        child = child_result[0]
+
+        primary_upc = None
+        all_upcs: List[Dict[str, Any]] = []
+        for u in upcs_result:
+            all_upcs.append(
+                {
+                    "upc": u["upc"],
+                    "is_primary_upc": u["is_primary_upc"],
+                    "upc_type": u.get("upc_type"),
+                }
+            )
+            if u["is_primary_upc"]:
+                primary_upc = u["upc"]
+
+        return {
+            "sku": child.get("sku"),
+            "size": child.get("size"),
+            "is_primary": child.get("is_primary"),
+            "parent_sku": child.get("parent_sku"),
+            "primary_upc": primary_upc,
+            "all_upcs": all_upcs,
+            "keywords": child.get("keywords") or [],
+        }
 
     @staticmethod
     async def get_bulk_reassign_preview(old_parent_sku: str, new_parent_sku: str) -> Dict[str, Any]:
