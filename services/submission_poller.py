@@ -15,7 +15,6 @@ from services.grailed_service import grailed_service
 from services.listing_service import ListingService
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
-from tortoise import connections
 from tortoise.transactions import in_transaction
 
 logger = logging.getLogger(__name__)
@@ -28,14 +27,12 @@ class SubmissionPoller(BasePoller):
     def __init__(self) -> None:
         super().__init__(config_section="submission_poller", name="SubmissionPoller")
         cfg = config.get("submission_poller", {})
-        self.max_auto_submit_per_cycle: int = cfg.get("max_auto_submit_per_cycle", 50)
         self.max_concurrent: int = cfg.get("max_concurrent", 1)
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(self.max_concurrent)
 
     async def _poll_cycle(self) -> None:
         await self._recover_stale_submissions()
         await self._process_queued_submissions()
-        await self._auto_submit_new()
 
     async def _recover_stale_submissions(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_PENDING_MINUTES)
@@ -91,74 +88,6 @@ class SubmissionPoller(BasePoller):
         ]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _auto_submit_new(self) -> None:
-        settings = await AppSettings.first()
-        if not settings:
-            return
-        platform_settings = settings.platform_settings or {}
-
-        for platform_id, ps in platform_settings.items():
-            if not ps.get("auto_submit", False):
-                continue
-
-            conn = connections.get("default")
-            rows = await conn.execute_query_dict(
-                """
-                SELECT l.id FROM listings l
-                WHERE l.upload_status = 'uploaded'
-                AND NOT EXISTS (
-                    SELECT 1 FROM listing_submissions ls
-                    WHERE ls.listing_id = l.id
-                    AND ls.platform_id = $1
-                    AND ls.status IN ('queued', 'pending', 'processing', 'success')
-                )
-                LIMIT $2
-                """,
-                [platform_id, self.max_auto_submit_per_cycle],
-            )
-
-            if not rows:
-                continue
-
-            logger.info(f"{self.name}: auto-submitting {len(rows)} listings to {platform_id}")
-
-            submissions: list[ListingSubmission] = []
-            for row in rows:
-                listing_id = row["id"]
-                try:
-                    latest = await (
-                        ListingSubmission.filter(
-                            listing_id=listing_id,
-                            platform_id=platform_id,
-                        )
-                        .order_by("-attempt_number")
-                        .first()
-                    )
-                    attempt_number = (latest.attempt_number + 1) if latest else 1
-
-                    submission = await ListingSubmission.create(
-                        listing_id=listing_id,
-                        platform_id=platform_id,
-                        status=SubmissionStatus.PENDING,
-                        attempt_number=attempt_number,
-                    )
-                    if not ps.get("batch_submit", False):
-                        submissions.append(submission)
-                except Exception:
-                    logger.exception(
-                        f"{self.name}: failed to create auto-submit for listing {listing_id} on {platform_id}"
-                    )
-
-            async def _submit(sub):
-                async with self._semaphore:
-                    await self._submit_to_platform(sub)
-
-            if submissions:
-                await asyncio.gather(
-                    *[_submit(sub) for sub in submissions],
-                    return_exceptions=True,
-                )
 
     async def _submit_to_platform(self, submission: ListingSubmission) -> None:
         listing = await Listing.get_or_none(id=submission.listing_id)

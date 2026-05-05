@@ -541,7 +541,7 @@ class PlatformMeta(BaseModel):
     )
     settings: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Platform settings from app_settings.platform_settings (auto_submit, batch_submit, allow_resubmit, requires_images, etc.)",
+        description="Platform settings from app_settings.platform_settings (batch_submit, allow_resubmit, requires_images, etc.)",
     )
 
 
