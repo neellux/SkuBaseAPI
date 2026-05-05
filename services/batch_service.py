@@ -4,6 +4,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 from fastapi import HTTPException
 from tortoise import transactions
+from tortoise.expressions import Subquery
 from models.db_models import Batch, Listing, AppSettings
 from exceptions.batch_exceptions import BatchCreationError
 from models.api_models import (
@@ -245,7 +246,10 @@ class BatchService:
                     if "/" in normalized_search
                     else normalized_search
                 )
-                query = query.filter(listings__product_id__icontains=parent_search_id)
+                matching_batch_ids = Listing.filter(
+                    product_id__icontains=parent_search_id
+                ).values("batch_id")
+                query = query.filter(id__in=Subquery(matching_batch_ids))
 
             total = await query.count()
 
