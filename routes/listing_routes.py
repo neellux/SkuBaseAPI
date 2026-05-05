@@ -616,7 +616,8 @@ async def _run_submissions_background(
     )
 
     submission_tasks = []
-    for platform_id, sid in submission_record_ids.items():
+    for platform_id in platforms:
+        sid = submission_record_ids[platform_id]
         if platform_settings.get(platform_id, {}).get("batch_submit", False):
             continue
         if platform_id == "sellercloud":
