@@ -893,7 +893,7 @@ class SellerCloudService:
         if not changes:
             return {"success": True, "updated": 0, "failed": []}
 
-        conn = Tortoise.get_connection("default")
+        conn = Tortoise.get_connection("product_db")
         rows = await conn.execute_query_dict(
             "SELECT sku, size FROM child_products "
             "WHERE parent_sku = $1 AND is_active = TRUE",

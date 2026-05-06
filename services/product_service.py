@@ -1243,6 +1243,7 @@ class ProductService:
                         pp.title,
                         pp.mpn,
                         pp.brand,
+                        d.rank AS _rank,
                         (SELECT COUNT(*) FROM child_products cp
                          WHERE cp.parent_sku = pp.sku AND cp.is_active = TRUE) AS child_count
                     FROM deduped d
@@ -1263,6 +1264,7 @@ class ProductService:
                         "parent_sku": None,
                         "child_count": p.get("child_count", 0),
                         "is_parent": True,
+                        "_rank": p.get("_rank"),
                     }
                     for p in rows
                 ]
@@ -1328,7 +1330,8 @@ class ProductService:
                         cp.keywords,
                         pp.title,
                         pp.mpn,
-                        pp.brand
+                        pp.brand,
+                        d.rank AS _rank
                     FROM deduped d
                     JOIN child_products cp ON cp.sku = d.sku AND cp.is_active = TRUE
                     LEFT JOIN parent_products pp ON cp.parent_sku = pp.sku
@@ -1349,6 +1352,7 @@ class ProductService:
                         "child_count": None,
                         "is_parent": False,
                         "_keywords": c.get("keywords") or [],
+                        "_rank": c.get("_rank"),
                     }
                     for c in rows
                 ]
@@ -1405,27 +1409,25 @@ class ProductService:
             child_results = _take([]) if child_task else []
             secondary_result = _take(None) if secondary_task else None
 
-            results = [*parent_results, *child_results]
+            # Sort the merged list by SQL rank so the top result is the best
+            # exact-equality hit across both parents and children.
+            results = sorted(
+                [*parent_results, *child_results],
+                key=lambda r: (r.get("_rank") if r.get("_rank") is not None else 99),
+            )
 
+            # An "exact" match is one that came from an equality SQL branch:
+            #   parents:  rank 0 = SKU eq, rank 1 = MPN eq          → cutoff 1
+            #   children: rank 0 = UPC/keyword eq, rank 1 = SKU eq,
+            #             rank 2 = parent-MPN eq                    → cutoff 2
+            # Rank above the cutoff is prefix/contains and must NOT auto-select.
             exact_match = False
             if results:
-                first = results[0]
-                first_sku_lower = first["sku"].lower()
-                first_mpn = first.get("mpn")
-                first_keywords = first.get("_keywords", [])
-
-                exact_match = (
-                    first_sku_lower == search_lower
-                    or (first_mpn and first_mpn.lower() == search_lower)
-                    or search_term in first_keywords
-                )
-
-                if not exact_match and not first["is_parent"]:
-                    upc_check = await conn.execute_query_dict(
-                        "SELECT 1 FROM child_upcs WHERE child_sku = $1 AND upc = $2 LIMIT 1",
-                        [first["sku"], search_term],
-                    )
-                    exact_match = len(upc_check) > 0
+                top = results[0]
+                top_rank = top.get("_rank")
+                if top_rank is not None:
+                    cutoff = 1 if top.get("is_parent") else 2
+                    exact_match = top_rank <= cutoff
 
             # If the term is an exact secondary SKU and the main search didn't
             # already nail an exact match, swap in the live primary as the sole
@@ -1436,6 +1438,7 @@ class ProductService:
 
             for r in results:
                 r.pop("_keywords", None)
+                r.pop("_rank", None)
 
             return {"results": results[:limit], "total": len(results), "exact_match": exact_match}
 
