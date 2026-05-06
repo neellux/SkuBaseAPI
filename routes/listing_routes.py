@@ -664,6 +664,7 @@ async def _run_submissions_background(
     sizing_scheme_value = form_data.get("SIZING_SCHEME")
     brand_color_value = form_data.get("brand_color")
     color_value = form_data.get("standard_color")
+    product_type_value = form_data.get("product_type") or form_data.get("ProductType")
 
     parent_fields = {
         "title": title_value,
@@ -673,6 +674,7 @@ async def _run_submissions_background(
         "sizing_scheme": sizing_scheme_value,
         "brand_color": brand_color_value,
         "color": color_value,
+        "product_type": product_type_value,
     }
     parent_fields_to_update = {k: v for k, v in parent_fields.items() if v}
 
