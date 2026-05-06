@@ -1416,18 +1416,22 @@ class ProductService:
                 key=lambda r: (r.get("_rank") if r.get("_rank") is not None else 99),
             )
 
-            # An "exact" match is one that came from an equality SQL branch:
-            #   parents:  rank 0 = SKU eq, rank 1 = MPN eq          → cutoff 1
-            #   children: rank 0 = UPC/keyword eq, rank 1 = SKU eq,
-            #             rank 2 = parent-MPN eq                    → cutoff 2
-            # Rank above the cutoff is prefix/contains and must NOT auto-select.
+            # An "exact" match auto-selects on the UI. Qualifying SQL branches:
+            #   parent rank 1 = parent-MPN equality
+            #   child  rank 0 = UPC/keyword equality
+            #   child  rank 1 = child SKU equality
+            #   child  rank 2 = parent-MPN equality (resolved to a child)
+            # Parent SKU equality (rank 0) and any prefix/contains (>=3 child,
+            # >=2 parent) must NOT auto-select.
             exact_match = False
             if results:
                 top = results[0]
                 top_rank = top.get("_rank")
                 if top_rank is not None:
-                    cutoff = 1 if top.get("is_parent") else 2
-                    exact_match = top_rank <= cutoff
+                    if top.get("is_parent"):
+                        exact_match = top_rank == 1
+                    else:
+                        exact_match = top_rank <= 2
 
             # If the term is an exact secondary SKU and the main search didn't
             # already nail an exact match, swap in the live primary as the sole
