@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from tortoise import Tortoise
+from models.db_models import Template
 from models.api_models import (
     AddProductRequest,
     AddProductResponse,
@@ -146,6 +147,44 @@ async def update_product_info(
 
         if not result.get("success"):
             raise HTTPException(status_code=404, detail=result.get("error", "Product not found"))
+
+        changes = {
+            k: v
+            for k, v in {
+                "title": request.title,
+                "product_type": request.product_type,
+                "sizing_scheme": request.sizing_scheme,
+                "style_name": request.style_name,
+                "brand_color": request.brand_color,
+                "color": request.color,
+                "mpn": request.mpn,
+                "brand": request.brand,
+            }.items()
+            if v is not None
+        }
+
+        if changes:
+            try:
+                template = await Template.get_or_none(id="default")
+                field_defs = template.field_definitions if template else []
+                sync_result = await sellercloud_service.update_children_basic_info(
+                    parent_sku=parent_sku,
+                    changes=changes,
+                    field_definitions=field_defs,
+                )
+                if not sync_result.get("success"):
+                    failed = sync_result.get("failed", [])
+                    result["sellercloud_warning"] = (
+                        f"Updated locally; SellerCloud sync failed for "
+                        f"{len(failed)} child product(s)."
+                    )
+            except Exception as e:
+                logger.error(
+                    f"SellerCloud sync failed for {parent_sku}: {e}", exc_info=True
+                )
+                result["sellercloud_warning"] = (
+                    "Updated locally; SellerCloud sync failed."
+                )
 
         return UpdateParentProductResponse(**result)
 

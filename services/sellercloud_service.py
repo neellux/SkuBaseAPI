@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 
 CUSTOM_COLUMN_FIELDS = {"SIZING_SCHEME", "GENDER", "HTMLDESCRIPTION_FIXED"}
 
+CHILD_UPDATE_CONCURRENCY = 3
+
 FIELD_NAME_OVERRIDES = {
     "ProductType": "ProductTypeName",
 }
@@ -880,6 +882,120 @@ class SellerCloudService:
             "children": children_data,
             "product_type": sellercloud_product_type,
             "sizing_scheme": sizing_scheme,
+        }
+
+    async def update_children_basic_info(
+        self,
+        parent_sku: str,
+        changes: Dict[str, Any],
+        field_definitions: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        if not changes:
+            return {"success": True, "updated": 0, "failed": []}
+
+        conn = Tortoise.get_connection("default")
+        rows = await conn.execute_query_dict(
+            "SELECT sku, size FROM child_products "
+            "WHERE parent_sku = $1 AND is_active = TRUE",
+            [parent_sku],
+        )
+        if not rows:
+            return {"success": True, "updated": 0, "failed": []}
+
+        sc_field_map: Dict[str, Dict[str, Any]] = {}
+        for field_def in field_definitions or []:
+            local_name = field_def.get("name")
+            if not local_name:
+                continue
+            for platform in field_def.get("platforms") or []:
+                if platform.get("platform_id") == "sellercloud":
+                    sc_field_map[local_name] = {
+                        "field_id": platform.get("field_id") or local_name,
+                        "is_custom": bool(platform.get("is_custom", False)),
+                    }
+                    break
+
+        local_to_form_name = {"color": "standard_color", "mpn": "manufacturer_sku", "brand": "brand_name"}
+
+        base_normal_fields: List[Dict[str, Any]] = []
+        base_custom_fields: List[Dict[str, Any]] = []
+        title_value: Optional[str] = None
+
+        for local_name, value in changes.items():
+            if value is None:
+                continue
+            if local_name == "title":
+                title_value = value
+                continue
+
+            mapping = sc_field_map.get(local_name) or sc_field_map.get(
+                local_to_form_name.get(local_name, "")
+            )
+
+            if mapping:
+                sc_field_id = mapping["field_id"]
+                if mapping["is_custom"]:
+                    base_custom_fields.append(
+                        {"ColumnName": sc_field_id, "Value": value}
+                    )
+                else:
+                    target = FIELD_NAME_OVERRIDES.get(sc_field_id, sc_field_id)
+                    base_normal_fields.append({"Name": target, "Value": value})
+            elif local_name in CUSTOM_COLUMN_FIELDS:
+                base_custom_fields.append({"ColumnName": local_name, "Value": value})
+            else:
+                logger.warning(
+                    f"No SellerCloud mapping for '{local_name}'; skipping for parent {parent_sku}"
+                )
+
+        semaphore = asyncio.Semaphore(CHILD_UPDATE_CONCURRENCY)
+        failures: List[Dict[str, str]] = []
+
+        async def update_one(child_sku: str, size: str) -> None:
+            async with semaphore:
+                normal_fields = list(base_normal_fields)
+                custom_fields = list(base_custom_fields)
+
+                if title_value is not None:
+                    list_price = ""
+                    try:
+                        sc_product = await self.get_product_by_id(
+                            child_sku, only_required_fields=False
+                        )
+                        if sc_product:
+                            list_price = sc_product.get("ListPrice", "") or ""
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to fetch ListPrice for {child_sku}: {e}"
+                        )
+
+                    if size and list_price not in ("", None):
+                        product_name = f"{title_value} SIZE {size} ${list_price}"
+                    elif size:
+                        product_name = f"{title_value} SIZE {size}"
+                    else:
+                        product_name = title_value
+                    normal_fields.append({"Name": "ProductName", "Value": product_name})
+
+                try:
+                    await self._update_single_product_with_retry(
+                        child_sku, normal_fields, custom_fields
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"SellerCloud update failed for child {child_sku}: {e}"
+                    )
+                    failures.append({"sku": child_sku, "error": str(e)})
+
+        await asyncio.gather(
+            *[update_one(r["sku"], r.get("size") or "") for r in rows],
+            return_exceptions=False,
+        )
+
+        return {
+            "success": len(failures) == 0,
+            "updated": len(rows) - len(failures),
+            "failed": failures,
         }
 
     async def _update_single_product_with_retry(

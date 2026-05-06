@@ -702,6 +702,7 @@ class UpdateParentProductResponse(BaseModel):
     color: Optional[str] = None
     mpn: Optional[str] = None
     brand: Optional[str] = None
+    sellercloud_warning: Optional[str] = None
 
 
 class ReassignChildRequest(BaseModel):

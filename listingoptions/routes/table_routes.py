@@ -258,7 +258,7 @@ async def get_table_schema(
 
             field_definition = {
                 "type": "string",
-                "title": f"{platform_name} Value for {primary_col_display_name_text}",
+                "title": f"{platform_name} {primary_col_display_name_text}",
             }
 
             if list_schema.get("min_length"):
