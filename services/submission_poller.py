@@ -12,7 +12,6 @@ from models.db_models import (
 )
 from services.base_poller import BasePoller
 from services.grailed_service import grailed_service
-from services.listing_service import ListingService
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
 from tortoise.transactions import in_transaction
@@ -111,18 +110,12 @@ class SubmissionPoller(BasePoller):
                 )
                 submission.status = SubmissionStatus.SUCCESS
                 await submission.save()
-                await ListingService.mark_submitted_if_all_platforms_succeeded(
-                    submission.listing_id
-                )
             elif submission.platform_id == "grailed":
                 await grailed_service.submit_listing(
                     listing=listing,
                     form_data=form_data,
                     field_definitions=field_definitions,
                     submission=submission,
-                )
-                await ListingService.mark_submitted_if_all_platforms_succeeded(
-                    submission.listing_id
                 )
             elif submission.platform_id == "spo":
                 pass

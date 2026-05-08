@@ -718,8 +718,6 @@ async def _run_submissions_background(
         logger.error(f"Failed to save to product_info: {e}", exc_info=True)
         post_submission_errors.append(f"product_info: {traceback.format_exc()}")
 
-    await ListingService.mark_submitted_if_all_platforms_succeeded(listing_id)
-
     listing_model = await Listing.get_or_none(id=listing_id)
     if listing_model:
         if post_submission_errors:

@@ -790,54 +790,6 @@ class ListingService:
             return user_data
 
     @staticmethod
-    async def mark_submitted_if_all_platforms_succeeded(listing_id: str) -> bool:
-        settings = await AppSettings.first()
-        enabled_platforms = (
-            settings.platforms if settings and settings.platforms else ["sellercloud"]
-        )
-        if not enabled_platforms:
-            return False
-
-        conn = connections.get("default")
-        rows = await conn.execute_query_dict(
-            """
-            UPDATE listings l
-            SET submitted = TRUE,
-                submitted_at = COALESCE(
-                    (SELECT MAX(s.submitted_at)
-                     FROM listing_submissions s
-                     WHERE s.listing_id = l.id AND s.status = 'success'),
-                    NOW()
-                )
-            WHERE l.id = $1
-              AND l.submitted = FALSE
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM unnest($2::text[]) AS req(platform_id)
-                  WHERE NOT EXISTS (
-                      SELECT 1 FROM (
-                          SELECT DISTINCT ON (platform_id) platform_id, status
-                          FROM listing_submissions
-                          WHERE listing_id = l.id
-                            AND platform_id = req.platform_id
-                          ORDER BY platform_id, attempt_number DESC
-                      ) latest
-                      WHERE latest.status = 'success'
-                  )
-              )
-            RETURNING l.id
-            """,
-            [listing_id, enabled_platforms],
-        )
-        if rows:
-            logger.info(
-                f"Listing {listing_id} marked submitted "
-                f"(all enabled platforms {sorted(enabled_platforms)} latest=success)"
-            )
-            return True
-        return False
-
-    @staticmethod
     async def _to_response(listing: Listing) -> ListingResponse:
         successful_submissions = await listing.submissions.filter(status="success").all()
         submitted_platforms = list(set(s.platform_id for s in successful_submissions))
