@@ -549,7 +549,7 @@ async def create_record(
 
         if not force:
             collected_warnings: Dict[str, FuzzyCheckResponse] = {}
-            fuzzy_check_threshold = 0.8
+            fuzzy_check_threshold = 0.2 if table_name == "types" else 0.8
             columns_to_check_for_duplicates: Dict[str, Any] = {}
 
             for col_schema in table_schema.column_schema:
@@ -771,7 +771,7 @@ async def update_record(
 
         if not force:
             collected_warnings: Dict[str, FuzzyCheckResponse] = {}
-            fuzzy_check_threshold = 0.3
+            fuzzy_check_threshold = 0.2 if table_name == "types" else 0.3
             columns_to_check_for_duplicates: Dict[str, Any] = {}
 
             for col_schema in table_schema.column_schema:
@@ -886,9 +886,13 @@ async def fuzzy_check_value_route(
     table_name: str = Query(..., description="Name of the table"),
     column_name: str = Query(..., description="Name of the column"),
     value: str = Query(..., description="Value to check for duplicates"),
-    threshold: float = Query(0.3, ge=0.0, le=1.0, description="Similarity threshold"),
+    threshold: Optional[float] = Query(
+        None, ge=0.0, le=1.0, description="Similarity threshold"
+    ),
 ):
     try:
+        if threshold is None:
+            threshold = 0.2 if table_name == "types" else 0.3
         similar_values, exact_matches = await DatabaseService.fuzzy_check_value(
             table_name, column_name, value, threshold
         )
@@ -903,12 +907,16 @@ async def fuzzy_check_list_route(
     table_name: str = Query(..., description="Name of the table"),
     column_name: str = Query(..., description="Name of the column"),
     values: List[str] = Body(..., description="Values to check"),
-    threshold: float = Query(0.3, ge=0.0, le=1.0, description="Similarity threshold"),
+    threshold: Optional[float] = Query(
+        None, ge=0.0, le=1.0, description="Similarity threshold"
+    ),
     exclude_record_id: Optional[str] = Query(
         None, description="ID of the record to exclude from the check"
     ),
 ):
     try:
+        if threshold is None:
+            threshold = 0.2 if table_name == "types" else 0.3
         results = await DatabaseService.batch_fuzzy_check_values(
             table_name=table_name,
             columns_to_check={column_name: values},
