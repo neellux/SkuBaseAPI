@@ -1417,21 +1417,18 @@ class ProductService:
             )
 
             # An "exact" match auto-selects on the UI. Qualifying SQL branches:
-            #   parent rank 1 = parent-MPN equality
             #   child  rank 0 = UPC/keyword equality
             #   child  rank 1 = child SKU equality
-            #   child  rank 2 = parent-MPN equality (resolved to a child)
-            # Parent SKU equality (rank 0) and any prefix/contains (>=3 child,
-            # >=2 parent) must NOT auto-select.
+            # MPN equality (parent rank 1, child rank 2) must NOT auto-select —
+            # MPNs are not unique enough to load a product on. Parent SKU equality
+            # (rank 0) and any prefix/contains (>=3 child, >=2 parent) also must
+            # not auto-select.
             exact_match = False
             if results:
                 top = results[0]
                 top_rank = top.get("_rank")
-                if top_rank is not None:
-                    if top.get("is_parent"):
-                        exact_match = top_rank == 1
-                    else:
-                        exact_match = top_rank <= 2
+                if top_rank is not None and not top.get("is_parent"):
+                    exact_match = top_rank <= 1
 
             # If the term is an exact secondary SKU and the main search didn't
             # already nail an exact match, swap in the live primary as the sole
