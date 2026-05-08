@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List, Optional
 
 import orjson
@@ -718,24 +718,10 @@ async def _run_submissions_background(
         logger.error(f"Failed to save to product_info: {e}", exc_info=True)
         post_submission_errors.append(f"product_info: {traceback.format_exc()}")
 
+    await ListingService.mark_submitted_if_all_platforms_succeeded(listing_id)
+
     listing_model = await Listing.get_or_none(id=listing_id)
     if listing_model:
-        settings = await AppSettings.first()
-        enabled_platforms = (
-            settings.platforms if settings and settings.platforms else ["sellercloud"]
-        )
-        successful_platforms = set(
-            await ListingSubmission.filter(
-                listing=listing_model,
-                platform_id__in=enabled_platforms,
-                status="success",
-            ).values_list("platform_id", flat=True)
-        )
-        all_succeeded = set(enabled_platforms) == successful_platforms
-        if all_succeeded and not listing_model.submitted:
-            listing_model.submitted = True
-            listing_model.submitted_at = datetime.now(timezone.utc)
-
         if post_submission_errors:
             listing_model.error = "\n---\n".join(post_submission_errors)
         else:

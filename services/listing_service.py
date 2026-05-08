@@ -1,7 +1,7 @@
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from models.api_models import (
@@ -12,7 +12,7 @@ from models.api_models import (
     TemplateResponse,
     UpdateListingRequest,
 )
-from models.db_models import AppSettings, Listing, Template
+from models.db_models import AppSettings, Listing, ListingSubmission, Template
 from services.ai_service import AIService
 from services.listing_options_service import listing_options_service
 from services.sellercloud_service import sellercloud_service
@@ -788,6 +788,37 @@ class ListingService:
         except Exception as e:
             logger.error(f"Error processing product data for template: {e}")
             return user_data
+
+    @staticmethod
+    async def mark_submitted_if_all_platforms_succeeded(listing_id: str) -> bool:
+        listing = await Listing.get_or_none(id=listing_id)
+        if not listing or listing.submitted:
+            return False
+
+        settings = await AppSettings.first()
+        enabled_platforms = (
+            settings.platforms if settings and settings.platforms else ["sellercloud"]
+        )
+        if not enabled_platforms:
+            return False
+
+        successful_platforms = set(
+            await ListingSubmission.filter(
+                listing_id=listing.id,
+                platform_id__in=enabled_platforms,
+                status="success",
+            ).values_list("platform_id", flat=True)
+        )
+        if set(enabled_platforms) != successful_platforms:
+            return False
+
+        listing.submitted = True
+        listing.submitted_at = datetime.now(timezone.utc)
+        await listing.save()
+        logger.info(
+            f"Listing {listing.id} marked submitted (all platforms {sorted(enabled_platforms)} succeeded)"
+        )
+        return True
 
     @staticmethod
     async def _to_response(listing: Listing) -> ListingResponse:
