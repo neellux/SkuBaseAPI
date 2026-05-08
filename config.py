@@ -35,3 +35,5 @@ TORTOISE_ORM_CONFIG = {
 }
 
 CORS_ORIGINS = config.get("cors", {}).get("allowed_origins", ["*"])
+
+LISTING_OPTIONS = config.get("listing_options", {})

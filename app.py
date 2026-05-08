@@ -20,6 +20,7 @@ from listingoptions.routes.sizing_routes import router as lo_sizing_router
 from listingoptions.routes.sizing_lists_routes import router as lo_sizing_lists_router
 from listingoptions.routes.parent_type_routes import router as lo_parent_type_router
 from listingoptions.routes.api_routes import router as lo_api_router
+from listingoptions.services.spreadsheet_service import spreadsheet_service
 from services.image_service import image_service
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
@@ -116,6 +117,8 @@ async def startup_event():
     logger.info("Image service initialized successfully")
 
     asyncio.create_task(periodic_tasks_1min())
+
+    await spreadsheet_service.start()
 
     await submission_poller.start()
     await spo_poller.start()

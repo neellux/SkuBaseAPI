@@ -32,6 +32,30 @@ def validate_sql_identifier(name: str) -> str:
     return name
 
 
+_TYPE_PREFIX_REGEX = r"^(Men''s |Women''s |Boy''s |Girl''s |Unisex )"
+
+
+def _is_type_name_column(table_name: str, column_name: str) -> bool:
+    return table_name == "types" and column_name == "type"
+
+
+def _strip_expr(table_name: str, column_name: str, sql_expr: str) -> str:
+    if _is_type_name_column(table_name, column_name):
+        return f"regexp_replace({sql_expr}, '{_TYPE_PREFIX_REGEX}', '')"
+    return sql_expr
+
+
+def _same_prefix_clause(
+    table_name: str, column_name: str, col_sql: str, input_sql: str
+) -> str:
+    if not _is_type_name_column(table_name, column_name):
+        return ""
+    return (
+        f" AND (regexp_match({col_sql}, '{_TYPE_PREFIX_REGEX}'))[1] "
+        f"IS NOT DISTINCT FROM (regexp_match({input_sql}, '{_TYPE_PREFIX_REGEX}'))[1] "
+    )
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -807,6 +831,11 @@ class DatabaseService:
                 params_exact.append(exclude_record_id)
                 exclude_clause_exact = f" AND id != ${len(params_exact)}"
 
+            col_raw = f'"{column_name}"'
+            col_expr = _strip_expr(table_name, column_name, col_raw)
+            input_expr = _strip_expr(table_name, column_name, "$1")
+            prefix_clause = _same_prefix_clause(table_name, column_name, col_raw, "$1")
+
             exact_match_sql = f"""
                 SELECT "{column_name}" FROM "{DatabaseService._table(table_name)}"
                 WHERE "{column_name}" = $1
@@ -828,10 +857,11 @@ class DatabaseService:
             similarity_sql = f"""
                 SELECT "{column_name}"
                 FROM "{DatabaseService._table(table_name)}"
-                WHERE similarity("{column_name}", $1) > $2
-                AND "{column_name}" != $1
+                WHERE similarity({col_expr}, {input_expr}) > $2
+                AND {col_expr} != {input_expr}
+                {prefix_clause}
                 {exclude_clause_similar}
-                ORDER BY similarity("{column_name}", $1) DESC
+                ORDER BY similarity({col_expr}, {input_expr}) DESC
                 LIMIT 10
             """
             similar_records_dicts = await Tortoise.get_connection("default").execute_query_dict(
@@ -934,10 +964,18 @@ class DatabaseService:
                             f"Error on text_list fuzzy match for {table_name}.{col_name}: {e}"
                         )
             else:
+                col_raw = f't."{col_name}"'
+                col_expr = _strip_expr(table_name, col_name, col_raw)
+                input_param = f"${len(base_params) + 1}"
+                input_expr = _strip_expr(table_name, col_name, input_param)
+                prefix_clause = _same_prefix_clause(
+                    table_name, col_name, col_raw, input_param
+                )
+
                 if is_unique:
                     params = list(base_params) + [value]
                     sql = f"""
-                        SELECT "{col_name}" FROM "{DatabaseService._table(table_name)}" t WHERE t."{col_name}" = ${len(base_params) + 1} {exclude_clause} LIMIT 1
+                        SELECT "{col_name}" FROM "{DatabaseService._table(table_name)}" t WHERE t."{col_name}" = {input_param} {exclude_clause} LIMIT 1
                     """
                     try:
                         result = await conn.execute_query_dict(sql, params)
@@ -950,9 +988,9 @@ class DatabaseService:
                     params = list(base_params) + [value, threshold]
                     sql = f"""
                         SELECT "{col_name}" as similar_value FROM "{DatabaseService._table(table_name)}" t
-                        WHERE similarity(t."{col_name}", ${len(base_params) + 1}) > ${len(base_params) + 2}
-                        AND t."{col_name}" != ${len(base_params) + 1} {exclude_clause}
-                        ORDER BY similarity(t."{col_name}", ${len(base_params) + 1}) DESC LIMIT 10
+                        WHERE similarity({col_expr}, {input_expr}) > ${len(base_params) + 2}
+                        AND {col_expr} != {input_expr} {prefix_clause} {exclude_clause}
+                        ORDER BY similarity({col_expr}, {input_expr}) DESC LIMIT 10
                     """
                     try:
                         result = await conn.execute_query_dict(sql, params)

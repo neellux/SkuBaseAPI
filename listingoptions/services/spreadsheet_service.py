@@ -7,22 +7,32 @@ import logging
 import orjson
 import pandas as pd
 
+from config import LISTING_OPTIONS as _cfg
+
 logger = logging.getLogger(__name__)
 
 
 class SpreadsheetService:
     def __init__(self):
-        self.appscript_url = os.environ.get("APPSCRIPT_URL")
-        self.appscript_secret = os.environ.get("APPSCRIPT_SECRET")
+        self.appscript_url = os.environ.get("APPSCRIPT_URL", _cfg.get("appscript_url"))
+        self.appscript_secret = os.environ.get(
+            "APPSCRIPT_SECRET", _cfg.get("appscript_secret")
+        )
         self.rate_limit = timedelta(
-            seconds=int(os.environ.get("SPREADSHEET_UPDATE_RATE_LIMIT_SECONDS", 30))
+            seconds=int(
+                os.environ.get(
+                    "SPREADSHEET_UPDATE_RATE_LIMIT_SECONDS",
+                    _cfg.get("rate_limit_seconds", 30),
+                )
+            )
         )
 
         self._table_states: Dict[str, Dict[str, Any]] = {}
+        self._checker_task: asyncio.Task | None = None
 
         if not self.appscript_url or not self.appscript_secret:
             logger.warning(
-                "SpreadsheetService disabled: APPSCRIPT_URL or APPSCRIPT_SECRET not set."
+                "SpreadsheetService disabled: appscript_url or appscript_secret not set."
             )
             self.enabled = False
         else:
@@ -30,8 +40,10 @@ class SpreadsheetService:
 
         self.client = httpx.AsyncClient(follow_redirects=True, timeout=120)
 
-        if self.enabled:
-            asyncio.create_task(self._periodic_checker())
+    async def start(self):
+        if self.enabled and self._checker_task is None:
+            self._checker_task = asyncio.create_task(self._periodic_checker())
+            logger.info("SpreadsheetService periodic checker started.")
 
     async def _periodic_checker(self):
         while True:
