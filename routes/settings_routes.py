@@ -147,6 +147,23 @@ async def update_app_variables(request: UpdateAppVariablesRequest):
         raise HTTPException(status_code=500, detail="Failed to update app variables")
 
 
+SPO_DEFAULT_SETTINGS = {
+    "manual_fallback": False,
+    "min_batch_size": 200,
+    "require_type_mapping": False,
+    "require_color_mapping": False,
+}
+
+
+def _hydrate_platform_settings(platform_settings: dict) -> dict:
+    merged = dict(platform_settings or {})
+    spo = dict(merged.get("spo") or {})
+    for key, default_value in SPO_DEFAULT_SETTINGS.items():
+        spo.setdefault(key, default_value)
+    merged["spo"] = spo
+    return merged
+
+
 @router.get("/platform_settings", response_model=PlatformSettingsResponse)
 async def get_platform_settings():
     try:
@@ -156,7 +173,7 @@ async def get_platform_settings():
             settings = await AppSettings.create(field_templates={}, platform_settings={})
 
         return PlatformSettingsResponse(
-            platform_settings=settings.platform_settings or {},
+            platform_settings=_hydrate_platform_settings(settings.platform_settings or {}),
             updated_at=settings.updated_at,
         )
     except Exception as e:

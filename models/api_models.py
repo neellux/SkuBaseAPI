@@ -541,7 +541,7 @@ class PlatformMeta(BaseModel):
     )
     settings: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Platform settings from app_settings.platform_settings (batch_submit, allow_resubmit, requires_images, etc.)",
+        description="Platform settings from app_settings.platform_settings (manual_fallback, allow_resubmit, requires_images, etc.)",
     )
 
 
@@ -585,6 +585,62 @@ class SubmissionSummary(BaseModel):
     pending: int = Field(..., description="Number of pending submissions")
     platforms: Dict[str, Dict[str, Any]] = Field(
         default_factory=dict, description="Latest status per platform"
+    )
+
+
+class ImportSummary(BaseModel):
+    import_id: int = Field(..., description="Platform-side import id (e.g. SPO product_import_id)")
+    platform_id: str = Field(..., description="Platform identifier this import belongs to")
+    submission_count: int = Field(..., description="Number of ListingSubmissions in this import")
+    status_counts: Dict[str, int] = Field(
+        default_factory=dict, description="Count of submissions per status"
+    )
+    created_at: Optional[datetime] = Field(None, description="Earliest submission created_at")
+    updated_at: Optional[datetime] = Field(None, description="Latest submission updated_at")
+
+
+class SubmissionsDashboardResponse(BaseModel):
+    platform_id: str = Field(..., description="Platform identifier")
+    pending_count: int = Field(..., description="ListingSubmissions awaiting upload")
+    processing_count: int = Field(..., description="ListingSubmissions in flight")
+    failed_count: int = Field(..., description="ListingSubmissions in terminal failure")
+    success_count: int = Field(..., description="ListingSubmissions completed successfully")
+    min_batch_size: int = Field(
+        ...,
+        description="Per-platform minimum pending count before auto-batch from platform_settings",
+    )
+    imports: List[ImportSummary] = Field(default_factory=list)
+    total_imports: int = Field(0, description="Total imports for this platform")
+    page: int = Field(1, description="Current page (1-indexed)")
+    page_size: int = Field(50, description="Imports per page")
+
+
+class ImportListingDetail(BaseModel):
+    submission_id: int
+    listing_id: Optional[str] = None
+    product_id: Optional[str] = None
+    title: Optional[str] = None
+    status: str
+    platform_status: Optional[str] = None
+    error_display: Optional[str] = None
+    updated_at: Optional[datetime] = None
+    reviewed_at: Optional[datetime] = Field(
+        None, description="Set when a failed submission was manually reviewed"
+    )
+
+
+class ImportDetailResponse(BaseModel):
+    import_id: int
+    platform_id: str
+    submissions: List[ImportListingDetail] = Field(default_factory=list)
+    status_counts: Dict[str, int] = Field(default_factory=dict)
+
+
+class CreateBatchResponse(BaseModel):
+    platform: str = Field(..., description="Platform identifier the batch was created for")
+    submission_count: int = Field(..., description="Number of submissions included in the batch")
+    product_import_id: Optional[int] = Field(
+        None, description="Platform-side import id, if a batch was uploaded"
     )
 
 

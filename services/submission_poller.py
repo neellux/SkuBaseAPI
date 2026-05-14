@@ -83,7 +83,7 @@ class SubmissionPoller(BasePoller):
         tasks = [
             _submit(sub)
             for sub in claimed_subs
-            if not ps_all.get(sub.platform_id, {}).get("batch_submit", False)
+            if not ps_all.get(sub.platform_id, {}).get("manual_fallback", False)
         ]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

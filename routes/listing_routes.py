@@ -495,9 +495,9 @@ async def submit_listing(
                     logger.info(f"Skipping {platform_id}: resubmission not allowed")
                     continue
 
-                batch_submit = ps.get("batch_submit", False)
+                manual_fallback = ps.get("manual_fallback", False)
                 requires_images = ps.get("requires_images", False)
-                if batch_submit or (listing_model.upload_status == "pending" and requires_images):
+                if manual_fallback or (listing_model.upload_status == "pending" and requires_images):
                     platform_initial_status = "queued"
                 else:
                     platform_initial_status = "pending"
@@ -530,7 +530,7 @@ async def submit_listing(
     pending_platforms = [
         p
         for p in platforms
-        if not platform_settings.get(p, {}).get("batch_submit", False)
+        if not platform_settings.get(p, {}).get("manual_fallback", False)
         and not (
             listing_model.upload_status == "pending"
             and platform_settings.get(p, {}).get("requires_images", False)
@@ -618,7 +618,7 @@ async def _run_submissions_background(
     submission_tasks = []
     for platform_id in platforms:
         sid = submission_record_ids[platform_id]
-        if platform_settings.get(platform_id, {}).get("batch_submit", False):
+        if platform_settings.get(platform_id, {}).get("manual_fallback", False):
             continue
         if platform_id == "sellercloud":
             submission_tasks.append(_submit_to_sellercloud(sid))

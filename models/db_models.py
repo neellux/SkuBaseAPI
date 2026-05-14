@@ -348,6 +348,16 @@ class ListingSubmission(Model):
         description="ID/reference(s) from the external platform after successful submission",
     )
 
+    reviewed_at = fields.DatetimeField(
+        null=True,
+        description="When a failed manual-fallback submission was acknowledged/triaged",
+    )
+    reviewed_by = fields.CharField(
+        max_length=100,
+        null=True,
+        description="User ID who marked the failed submission as reviewed",
+    )
+
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 
@@ -374,7 +384,15 @@ class AppSettings(Model):
 
     platform_settings = fields.JSONField(
         default={},
-        description="Platform-specific settings: {platform_id: {enabled, price_multiplier, shipping}}",
+        description=(
+            "Platform-specific settings keyed by platform_id. "
+            "Common keys: enabled, price_multiplier, shipping. "
+            "manual_fallback (bool) - when true the platform shows in the "
+            "Submissions Dashboard and exposes a manual 'Submit Now' batch action. "
+            "min_batch_size (int) - minimum pending count before the auto-poller "
+            "groups a batch. Manual 'Submit Now' bypasses this threshold. "
+            "(e.g. SPO reads platform_settings.spo.min_batch_size)."
+        ),
     )
 
     platforms = fields.JSONField(

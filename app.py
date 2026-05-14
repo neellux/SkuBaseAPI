@@ -12,6 +12,7 @@ from routes.image_routes import router as image_router
 from routes.listing_routes import router as listing_router
 from routes.product_routes import router as product_router
 from routes.settings_routes import router as settings_router
+from routes.submissions_routes import router as submissions_router
 from routes.template_routes import router as template_router
 from listingoptions.routes.table_routes import router as lo_table_router
 from listingoptions.routes.list_routes import router as lo_list_router
@@ -28,6 +29,7 @@ from services.alias_bulk_import_poller import alias_bulk_import_poller
 from services.photo_upload_poller import photo_upload_poller
 from services.secondary_inventory_transfer_poller import secondary_inventory_transfer_poller
 from services.sellercloud_sync_poller import sellercloud_sync_poller
+from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.spo_poller import spo_poller
 from services.submission_poller import submission_poller
 from tortoise.contrib.fastapi import register_tortoise
@@ -72,6 +74,7 @@ app.add_middleware(
 app.include_router(template_router)
 app.include_router(listing_router)
 app.include_router(settings_router)
+app.include_router(submissions_router)
 app.include_router(product_router)
 app.include_router(image_router)
 
@@ -126,12 +129,14 @@ async def startup_event():
     await alias_bulk_import_poller.start()
     await photo_upload_poller.start()
     await secondary_inventory_transfer_poller.start()
+    await daily_sellercloud_sync_poller.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("SkuBase API shutdown...")
 
+    await daily_sellercloud_sync_poller.stop()
     await secondary_inventory_transfer_poller.stop()
     await photo_upload_poller.stop()
     await alias_bulk_import_poller.stop()

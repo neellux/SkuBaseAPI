@@ -8,6 +8,7 @@ from typing import Any
 
 from config import config
 from models.db_models import (
+    AppSettings,
     Listing,
     ListingSubmission,
     SubmissionStatus,
@@ -25,14 +26,26 @@ class SpoPoller(BasePoller):
     def __init__(self) -> None:
         super().__init__(config_section="spo_poller", name="SpoPoller")
         cfg = config.get("spo_poller", {})
-        self.max_polls_per_submission: int = cfg.get("max_polls_per_submission", 40)
-        self.max_batch_size: int = cfg.get("max_batch_size", 200)
         self.stale_timeout_minutes: int = cfg.get("stale_processing_timeout_minutes", 1440)
+
+    async def _get_spo_settings(self) -> dict[str, Any]:
+        settings = await AppSettings.first()
+        if not settings:
+            return {}
+        return (settings.platform_settings or {}).get("spo") or {}
+
+    @staticmethod
+    def _parse_min_batch_size(spo_settings: dict[str, Any]) -> int:
+        value = spo_settings.get("min_batch_size", 200)
+        try:
+            return max(1, int(value))
+        except (TypeError, ValueError):
+            return 200
 
     async def _poll_cycle(self) -> None:
         await self._recover_stale_processing()
         await self._resume_products_complete()
-        await self._batch_upload_pending()
+        await self._batch_upload_pending(force=False)
         await self._check_processing()
 
     async def _recover_stale_processing(self) -> None:
@@ -43,10 +56,16 @@ class SpoPoller(BasePoller):
             updated_at__lt=cutoff,
         ).all()
 
+        timeout_hours = self.stale_timeout_minutes / 60
+        if timeout_hours >= 24 and timeout_hours % 24 == 0:
+            timeout_label = f"{int(timeout_hours // 24)} days"
+        else:
+            timeout_label = f"{timeout_hours:g} hours"
+
         for sub in stale:
             logger.warning(f"{self.name}: stale processing submission {sub.id}, marking failed")
             sub.status = SubmissionStatus.FAILED
-            sub.error_display = "Import timed out after 24 hours"
+            sub.error_display = f"Import timed out after {timeout_label}"
             await sub.save()
 
     async def _resume_products_complete(self) -> None:
@@ -74,9 +93,17 @@ class SpoPoller(BasePoller):
                 sub.error_display = "Failed to upload offers"
                 await sub.save()
 
-    async def _batch_upload_pending(self) -> None:
+    async def _batch_upload_pending(self, force: bool = False) -> dict[str, Any]:
+        spo_settings = await self._get_spo_settings()
+        manual_fallback = bool(spo_settings.get("manual_fallback"))
+        min_batch_size = self._parse_min_batch_size(spo_settings)
+
         submission_ids: list[int] = []
         async with in_transaction("default") as conn:
+            # One locked fetch: skip_locked means a concurrent caller (other
+            # poll cycle or manual_flush) cannot grab the same rows. We hold
+            # the lock for the duration of this transaction and only flip the
+            # rows to PROCESSING if we actually commit to uploading them.
             pending = await (
                 ListingSubmission.filter(
                     platform_id="spo",
@@ -84,11 +111,22 @@ class SpoPoller(BasePoller):
                 )
                 .select_for_update(skip_locked=True)
                 .using_db(conn)
-                .limit(self.max_batch_size)
             )
 
             if not pending:
-                return
+                return {"submission_count": 0, "product_import_id": None}
+
+            # Manual flush ignores both gates. The scheduled poll cycle only
+            # applies the min-batch gate when manual_fallback is enabled for
+            # SPO; otherwise it flushes whatever is pending the same as before.
+            if not force and manual_fallback and len(pending) < min_batch_size:
+                logger.debug(
+                    "%s: %d pending below min_batch_size %d, skipping auto batch",
+                    self.name,
+                    len(pending),
+                    min_batch_size,
+                )
+                return {"submission_count": 0, "product_import_id": None}
 
             submission_ids = [s.id for s in pending]
             await (
@@ -132,13 +170,14 @@ class SpoPoller(BasePoller):
                 submission_ids.remove(sub.id)
 
         if not all_products or not submission_ids:
-            return
+            return {"submission_count": 0, "product_import_id": None}
 
         tmp_dir = tempfile.mkdtemp(prefix="spo_")
         xlsx_path = os.path.join(
             tmp_dir, f"spo_products_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         )
 
+        import_id: int | None = None
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -152,19 +191,25 @@ class SpoPoller(BasePoller):
             )
             logger.info(f"{self.name}: P41 upload successful, import_id={import_id}")
 
-        except Exception as e:
+        except Exception:
             logger.exception(f"{self.name}: P41 upload failed")
             await ListingSubmission.filter(id__in=submission_ids).update(
                 status=SubmissionStatus.FAILED,
                 error=traceback.format_exc(),
                 error_display="Failed to submit to SPO",
             )
+            return {"submission_count": 0, "product_import_id": None}
         finally:
             try:
                 os.remove(xlsx_path)
                 os.rmdir(tmp_dir)
             except OSError:
                 pass
+
+        return {"submission_count": len(submission_ids), "product_import_id": import_id}
+
+    async def manual_flush(self) -> dict[str, Any]:
+        return await self._batch_upload_pending(force=True)
 
     async def _check_processing(self) -> None:
         processing = await ListingSubmission.filter(
@@ -255,6 +300,7 @@ class SpoPoller(BasePoller):
                 error_parts = [f"{sku}: {err}" for sku, err in sub_failed.items()]
                 sub.status = SubmissionStatus.FAILED
                 sub.error_display = f"{', '.join(error_parts)}"[:500]
+                sub.platform_meta = {**(sub.platform_meta or {}), "sku_errors": sub_failed}
                 await sub.save()
                 logger.info(f"{self.name}: submission {sub.id} failed with transformation errors")
 
@@ -280,6 +326,7 @@ class SpoPoller(BasePoller):
                 error_parts = [f"{sku} ({err})" for sku, err in sub_failed.items()]
                 sub.status = SubmissionStatus.FAILED
                 sub.error_display = f"Failed SKUs: {', '.join(error_parts)}"[:500]
+                sub.platform_meta = {**(sub.platform_meta or {}), "sku_errors": sub_failed}
                 await sub.save()
             else:
                 sub.platform_status = "products_complete"
@@ -346,6 +393,7 @@ class SpoPoller(BasePoller):
                 error_parts = [f"{sku} ({err})" for sku, err in sub_failed.items()]
                 sub.status = SubmissionStatus.FAILED
                 sub.error_display = f"Offer failed: {', '.join(error_parts)}"[:500]
+                sub.platform_meta = {**(sub.platform_meta or {}), "sku_errors": sub_failed}
                 await sub.save()
             else:
                 sub.status = SubmissionStatus.SUCCESS
