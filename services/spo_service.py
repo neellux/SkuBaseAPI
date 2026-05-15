@@ -275,7 +275,6 @@ class SpoService:
 
     def build_offer_rows(self, form_data: dict[str, Any]) -> list[dict[str, Any]]:
         child_size_overrides = form_data.get("child_size_overrides", {})
-        list_price = form_data.get("list_price", 0)
 
         offers = []
         for child_sku in child_size_overrides:
@@ -284,14 +283,13 @@ class SpoService:
                     "sku": child_sku,
                     "product-id": child_sku,
                     "product-id-type": "SHOP_SKU",
-                    "price": list_price,
-                    "quantity": 1,
-                    "state-code": "11",
                 }
             )
         return offers
 
-    async def submit_offers(self, offers: list[dict[str, Any]]) -> dict[str, Any]:
+    async def submit_offers(
+        self, offers: list[dict[str, Any]], max_attempts: int = 3
+    ) -> dict[str, Any]:
         if not offers:
             raise ValueError("No offers to submit to SPO AppScript")
         if not self.appscript_endpoint:
@@ -299,28 +297,42 @@ class SpoService:
                 "SPO AppScript endpoint not configured in config.toml [spo] section"
             )
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(
-                self.appscript_endpoint,
-                follow_redirects=True,
-                json={
-                    "key": self.appscript_key,
-                    "action": "addOffers",
-                    "data": offers,
-                },
-            )
-        response_data = response.json()
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    response = await client.post(
+                        self.appscript_endpoint,
+                        follow_redirects=True,
+                        json={
+                            "key": self.appscript_key,
+                            "action": "addOffers",
+                            "data": offers,
+                        },
+                    )
+                response_data = response.json()
 
-        if not response_data.get("success"):
-            error_msg = response_data.get("error", "Unknown error from SPO AppScript")
-            raise ValueError(f"SPO AppScript submission failed: {error_msg}")
+                if not response_data.get("success"):
+                    error_msg = response_data.get("error", "Unknown error from SPO AppScript")
+                    raise ValueError(f"SPO AppScript submission failed: {error_msg}")
 
-        logger.info(
-            f"SPO AppScript submission succeeded: "
-            f"added={response_data.get('addedCount', 0)}, "
-            f"skipped={response_data.get('skippedCount', 0)}"
+                logger.info(
+                    f"SPO AppScript submission succeeded on attempt {attempt}: "
+                    f"added={response_data.get('addedCount', 0)}, "
+                    f"skipped={response_data.get('skippedCount', 0)}"
+                )
+                return response_data
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    f"SPO AppScript submission attempt {attempt}/{max_attempts} failed: {e}"
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(2 ** (attempt - 1))
+
+        raise ValueError(
+            f"SPO AppScript submission failed after {max_attempts} attempts: {last_error}"
         )
-        return response_data
 
     async def upload_products(self, xlsx_path: str) -> int:
         client = await self._get_client()

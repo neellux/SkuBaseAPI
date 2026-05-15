@@ -140,25 +140,26 @@ class SpoPoller(BasePoller):
 
         logger.info(f"{self.name}: batch uploading {len(submission_ids)} SPO submissions")
 
-        all_products: list[dict[str, Any]] = []
         template = await TemplateService.get_template_by_id("default")
         field_definitions = template.field_definitions if template else []
 
         submissions = await ListingSubmission.filter(id__in=submission_ids).prefetch_related(
             "listing"
         )
+        submission_products: dict[int, list[dict[str, Any]]] = {}
         for sub in submissions:
             listing = sub.listing
             if not listing:
                 sub.status = SubmissionStatus.FAILED
                 sub.error_display = "Listing not found"
                 await sub.save()
+                submission_ids.remove(sub.id)
                 continue
             try:
                 products = await spo_service.build_product_rows(
                     listing, listing.data or {}, field_definitions
                 )
-                all_products.extend(products)
+                submission_products[sub.id] = products
             except Exception:
                 logger.exception(
                     f"{self.name}: failed to build product rows for submission {sub.id}"
@@ -168,6 +169,36 @@ class SpoPoller(BasePoller):
                 sub.error_display = "Failed to build product data"
                 await sub.save()
                 submission_ids.remove(sub.id)
+
+        # Submit offers to AppScript FIRST so they land on the sheet. Only after
+        # AppScript succeeds for a submission do we include its products in the
+        # P41 upload — failed AppScript submissions are dropped from this batch.
+        for sub in submissions:
+            if sub.id not in submission_ids:
+                continue
+            listing = sub.listing
+            if not listing:
+                continue
+            try:
+                offers = spo_service.build_offer_rows(listing.data or {})
+                if not offers:
+                    continue
+                await spo_service.submit_offers(offers)
+            except Exception:
+                logger.exception(
+                    f"{self.name}: AppScript offer submission failed for submission {sub.id}"
+                )
+                await ListingSubmission.filter(id=sub.id).update(
+                    status=SubmissionStatus.FAILED,
+                    error=traceback.format_exc(),
+                    error_display="Failed to submit offers to SPO AppScript after 3 attempts",
+                )
+                submission_ids.remove(sub.id)
+                submission_products.pop(sub.id, None)
+
+        all_products: list[dict[str, Any]] = []
+        for sub_id in submission_ids:
+            all_products.extend(submission_products.get(sub_id, []))
 
         if not all_products or not submission_ids:
             return {"submission_count": 0, "product_import_id": None}
@@ -310,7 +341,6 @@ class SpoPoller(BasePoller):
         errors = await spo_service.get_error_report(import_id)
         failed_skus = {e["sku"]: e["error"] for e in errors}
 
-        successful_subs: list[ListingSubmission] = []
         for sub in submissions:
             listing = await Listing.get_or_none(id=sub.listing_id)
             if not listing:
@@ -329,19 +359,10 @@ class SpoPoller(BasePoller):
                 sub.platform_meta = {**(sub.platform_meta or {}), "sku_errors": sub_failed}
                 await sub.save()
             else:
-                sub.platform_status = "products_complete"
+                sub.status = SubmissionStatus.SUCCESS
+                sub.platform_status = "listed"
                 await sub.save()
-                successful_subs.append(sub)
-
-        for sub in successful_subs:
-            try:
-                await self._upload_offers_for_submission(sub)
-            except Exception:
-                logger.exception(f"{self.name}: failed to upload offers for submission {sub.id}")
-                sub.status = SubmissionStatus.FAILED
-                sub.error = traceback.format_exc()
-                sub.error_display = "Failed to upload offers"
-                await sub.save()
+                logger.info(f"{self.name}: submission {sub.id} successfully listed on SPO")
 
     async def _upload_offers_for_submission(self, sub: ListingSubmission) -> None:
         listing = await Listing.get_or_none(id=sub.listing_id)
