@@ -41,6 +41,22 @@ def _effective_status(sub: ListingSubmission) -> str:
     return sub.status
 
 
+def _effective_import_status(status_counts: dict[str, int] | None) -> str:
+    """Roll a per-status breakdown up to a single dominant status for the import.
+
+    In-progress beats finished: any processing → processing; otherwise any pending
+    → pending; otherwise any failed → failed; otherwise success.
+    """
+    counts = status_counts or {}
+    if counts.get(SubmissionStatus.PROCESSING, 0) > 0:
+        return SubmissionStatus.PROCESSING
+    if counts.get(SubmissionStatus.PENDING, 0) > 0:
+        return SubmissionStatus.PENDING
+    if counts.get(SubmissionStatus.FAILED, 0) > 0:
+        return SubmissionStatus.FAILED
+    return SubmissionStatus.SUCCESS
+
+
 async def _get_platform_settings_for(platform_id: str) -> dict[str, Any]:
     settings = await AppSettings.first()
     if not settings:
@@ -114,6 +130,10 @@ async def get_dashboard(
         le=MAX_PAGE_SIZE,
         description="Imports per page",
     ),
+    status: str | None = Query(
+        None,
+        description="Optional status filter; only imports with at least one submission in this status are returned",
+    ),
 ):
     try:
         if platform == "all":
@@ -140,6 +160,13 @@ async def get_dashboard(
             failed += data["failed"]
             success += data["success"]
             all_imports.extend(data["imports"])
+
+        if status:
+            all_imports = [
+                imp
+                for imp in all_imports
+                if _effective_import_status(imp.status_counts) == status
+            ]
 
         all_imports.sort(key=lambda i: i.updated_at or i.created_at, reverse=True)
         total_imports = len(all_imports)
