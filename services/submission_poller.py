@@ -43,6 +43,20 @@ class SubmissionPoller(BasePoller):
         if not stale:
             return
 
+        # Manual-fallback platforms (e.g. SPO) legitimately park rows in
+        # PENDING while waiting for a batch flush, so they must not be
+        # swept as stale.
+        settings = await AppSettings.first()
+        ps_all = settings.platform_settings if settings else {}
+        stale = [
+            sub
+            for sub in stale
+            if not ps_all.get(sub.platform_id, {}).get("manual_fallback", False)
+        ]
+
+        if not stale:
+            return
+
         logger.warning(f"{self.name}: recovering {len(stale)} stale pending submissions")
         for sub in stale:
             sub.status = SubmissionStatus.FAILED
