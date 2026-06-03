@@ -2354,8 +2354,8 @@ class DatabaseService:
 
         pids_to_add = pids_new - pids_current
         # append_only: never remove existing mappings for this platform_value.
-        # The payload is "add these values", not "this is the complete set" —
-        # used by flows that map a single value (e.g. the listing submit
+        # The payload is "add these values", not "this is the complete set".
+        # Used by flows that map a single value (e.g. the listing submit
         # mapping-resolution dialog) so they cannot wipe sibling mappings.
         pids_to_remove = set() if append_only else (pids_current - pids_new)
 
