@@ -1166,8 +1166,13 @@ class DatabaseService:
                 idx += 1
 
             if sizing_type:
+                # Sizes rows store the sizing type in the sizing_type column
+                # (primary_table_column is always 'size'). The display must show
+                # the same rows the sync endpoint treats as current, otherwise
+                # edit mode pre-loads an incomplete set and saving deletes the
+                # mappings missing from the display.
                 where_parts.append(
-                    f"(dl.primary_table_column = ${idx} OR dl.primary_id IS NULL OR dl.primary_table_column IS NULL)"
+                    f"(dl.sizing_type = ${idx} OR dl.primary_id IS NULL OR dl.sizing_type IS NULL)"
                 )
                 params.append(sizing_type)
                 idx += 1
