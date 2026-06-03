@@ -2257,7 +2257,7 @@ class DatabaseService:
         sql = f"SELECT 1 FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2"
         params: List[Any] = [platform_id, platform_value]
         if sizing_type:
-            sql += " AND primary_table_column = $3"
+            sql += " AND sizing_type = $3"
             params.append(sizing_type)
         sql += " LIMIT 1"
 
@@ -2292,7 +2292,12 @@ class DatabaseService:
 
         if table_name == "sizes":
             pids_new = set(internal_values) if internal_values else set()
-            primary_col = sizing_type if sizing_type else "size"
+            # Sizes rows always use the literal 'size' as primary_table_column and
+            # carry the sizing type in the dedicated sizing_type column, matching
+            # save_size_mapping and the readers (get_mapped_platform_sizes /
+            # check_unmapped_sizes). Putting the sizing type into
+            # primary_table_column would make these rows invisible to the build.
+            primary_col = "size"
         else:
             schema = await DatabaseService.get_table_schema(table_name)
             if not schema or not schema.primary_business_column:
@@ -2313,8 +2318,11 @@ class DatabaseService:
             )
             find_params = [platform_id, platform_value] + pids_list
             if sizing_type:
-                find_where += f" AND primary_table_column = ${len(pids_list) + 3}"
-                find_params.append(sizing_type)
+                find_where += (
+                    f" AND primary_table_column = ${len(pids_list) + 3}"
+                    f" AND sizing_type = ${len(pids_list) + 4}"
+                )
+                find_params.extend([primary_col, sizing_type])
             sql_find_old_pvs = (
                 f"SELECT DISTINCT platform_value FROM {quoted_mapping_table} WHERE {find_where}"
             )
@@ -2325,8 +2333,11 @@ class DatabaseService:
             del_where = f"platform_id = $1 AND primary_id IN ({delete_placeholders})"
             del_params = [platform_id] + pids_list
             if sizing_type:
-                del_where += f" AND primary_table_column = ${len(pids_list) + 2}"
-                del_params.append(sizing_type)
+                del_where += (
+                    f" AND primary_table_column = ${len(pids_list) + 2}"
+                    f" AND sizing_type = ${len(pids_list) + 3}"
+                )
+                del_params.extend([primary_col, sizing_type])
             sql_delete_forced = f"DELETE FROM {quoted_mapping_table} WHERE {del_where}"
             await conn.execute_query(sql_delete_forced, del_params)
 
@@ -2334,16 +2345,27 @@ class DatabaseService:
                 sql_check_any = f"SELECT 1 FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2 LIMIT 1"
                 has_any_row = await conn.execute_query_dict(sql_check_any, [platform_id, pv_old])
                 if not has_any_row:
-                    sql_insert_null = f"""
-                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column)
-                        VALUES (NULL, $1, $2, $3)
-                    """
-                    await conn.execute_query(sql_insert_null, [pv_old, platform_id, primary_col])
+                    if sizing_type:
+                        sql_insert_null = f"""
+                            INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, sizing_type)
+                            VALUES (NULL, $1, $2, $3, $4)
+                        """
+                        await conn.execute_query(
+                            sql_insert_null, [pv_old, platform_id, primary_col, sizing_type]
+                        )
+                    else:
+                        sql_insert_null = f"""
+                            INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column)
+                            VALUES (NULL, $1, $2, $3)
+                        """
+                        await conn.execute_query(
+                            sql_insert_null, [pv_old, platform_id, primary_col]
+                        )
 
         if sizing_type:
-            sql_get_current = f"SELECT primary_id FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2 AND primary_id IS NOT NULL AND primary_table_column = $3"
+            sql_get_current = f"SELECT primary_id FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2 AND primary_id IS NOT NULL AND primary_table_column = $3 AND sizing_type = $4"
             current_pid_records = await conn.execute_query_dict(
-                sql_get_current, [platform_id, platform_value, sizing_type]
+                sql_get_current, [platform_id, platform_value, primary_col, sizing_type]
             )
         else:
             sql_get_current = f"SELECT primary_id FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2 AND primary_id IS NOT NULL"
@@ -2366,25 +2388,40 @@ class DatabaseService:
             rm_sql = f"DELETE FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2 AND primary_id IN ({placeholders})"
             rm_params = [platform_id, platform_value] + pids_remove_list
             if sizing_type:
-                rm_sql += f" AND primary_table_column = ${len(pids_remove_list) + 3}"
-                rm_params.append(sizing_type)
+                rm_sql += (
+                    f" AND primary_table_column = ${len(pids_remove_list) + 3}"
+                    f" AND sizing_type = ${len(pids_remove_list) + 4}"
+                )
+                rm_params.extend([primary_col, sizing_type])
             result = await conn.execute_query(rm_sql, rm_params)
             deleted_count = result[0] if isinstance(result, tuple) and result else 0
 
         added_count = 0
         if pids_to_add:
-            insert_params = []
-            for pid in pids_to_add:
-                insert_params.extend([pid, platform_value, platform_id, primary_col])
-
             num_rows = len(pids_to_add)
-            cols = "(primary_id, platform_value, platform_id, primary_table_column)"
-            placeholders = ", ".join(
-                [
-                    f"(${(i * 4) + 1}, ${(i * 4) + 2}, ${(i * 4) + 3}, ${(i * 4) + 4})"
-                    for i in range(num_rows)
-                ]
-            )
+            insert_params = []
+            if sizing_type:
+                cols = "(primary_id, platform_value, platform_id, primary_table_column, sizing_type)"
+                for pid in pids_to_add:
+                    insert_params.extend(
+                        [pid, platform_value, platform_id, primary_col, sizing_type]
+                    )
+                placeholders = ", ".join(
+                    [
+                        f"(${(i * 5) + 1}, ${(i * 5) + 2}, ${(i * 5) + 3}, ${(i * 5) + 4}, ${(i * 5) + 5})"
+                        for i in range(num_rows)
+                    ]
+                )
+            else:
+                cols = "(primary_id, platform_value, platform_id, primary_table_column)"
+                for pid in pids_to_add:
+                    insert_params.extend([pid, platform_value, platform_id, primary_col])
+                placeholders = ", ".join(
+                    [
+                        f"(${(i * 4) + 1}, ${(i * 4) + 2}, ${(i * 4) + 3}, ${(i * 4) + 4})"
+                        for i in range(num_rows)
+                    ]
+                )
             sql_insert = f"INSERT INTO {quoted_mapping_table} {cols} VALUES {placeholders}"
             await conn.execute_query(sql_insert, insert_params)
             added_count = num_rows
@@ -2398,11 +2435,11 @@ class DatabaseService:
                 )
                 if not has_any:
                     sql_insert_null = f"""
-                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column)
-                        VALUES (NULL, $1, $2, $3)
+                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, sizing_type)
+                        VALUES (NULL, $1, $2, $3, $4)
                     """
                     await conn.execute_query(
-                        sql_insert_null, [platform_value, platform_id, primary_col]
+                        sql_insert_null, [platform_value, platform_id, primary_col, sizing_type]
                     )
                     added_count += 1
             else:
@@ -2449,7 +2486,9 @@ class DatabaseService:
             sizing_type_clause = ""
             params = list(internal_values) + [platform_id, platform_value]
             if sizing_type:
-                sizing_type_clause = f"AND dl.primary_table_column = ${len(internal_values)+3}"
+                # Scope by the dedicated sizing_type column (primary_table_column is
+                # always the literal 'size' on sizes rows).
+                sizing_type_clause = f"AND dl.sizing_type = ${len(internal_values)+3}"
                 params.append(sizing_type)
             sql_conflict_check = f"""
                 SELECT ss.sizing_scheme || ':' || ss.size as internal_value,

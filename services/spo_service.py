@@ -238,6 +238,15 @@ class SpoService:
                         f"(child {child_sku}); expected '<column> <label>' format"
                     )
                 size_column, size_label = mapped_size.split(" ", 1)
+                # generate_product_xlsx only writes API_HEADERS columns, so a size
+                # column outside that list would be silently dropped from the
+                # import file. Fail the build instead.
+                if size_column not in API_HEADERS:
+                    raise ValueError(
+                        f"SPO: size column {size_column!r} is not an import file column "
+                        f"(child {child_sku}); fix this size mapping's platform_value prefix "
+                        f"or add the column to API_HEADERS"
+                    )
                 list_code = f"{size_column}-values"
                 value_code = value_code_map.get((list_code, size_label))
                 if value_code is None:
