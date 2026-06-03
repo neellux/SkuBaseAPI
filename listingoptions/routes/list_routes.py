@@ -121,6 +121,23 @@ async def sync_default_internal_values(
     table_name: str = Query(..., description="Name of the table"),
 ):
     try:
+        # Create mode: fail fast if the platform value already exists, before
+        # the conflict check, so the user is told to edit the existing entry
+        # instead of being walked through a remap confirmation first.
+        if payload.create and await DatabaseService.default_list_platform_value_exists(
+            table_name=table_name,
+            platform_id=payload.platform_id,
+            platform_value=payload.platform_value,
+            sizing_type=payload.sizing_type,
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Platform value '{payload.platform_value}' already exists for this "
+                    "platform. Edit the existing entry to change its mappings."
+                ),
+            )
+
         conflicts = await DatabaseService.check_internal_value_conflicts(
             table_name=table_name,
             platform_id=payload.platform_id,
@@ -142,6 +159,8 @@ async def sync_default_internal_values(
             internal_values=payload.internal_values,
             force=payload.confirmed,
             sizing_type=payload.sizing_type,
+            append_only=payload.append_only,
+            create=payload.create,
         )
         return SuccessResponse(message="Platform mapping updated successfully")
     except HTTPException:

@@ -533,7 +533,10 @@ class DefaultListInternalValuesUpdate(BaseModel):
     platform_value: str = Field(..., description="Platform value (key)")
     internal_values: List[str] = Field(
         ...,
-        description="Complete set of internal values that should be linked to this platform_value",
+        description=(
+            "Internal values to link to this platform_value. Treated as the complete "
+            "replacement set unless append_only is true, in which case values are only added."
+        ),
     )
     confirmed: bool = Field(
         default=False,
@@ -542,6 +545,20 @@ class DefaultListInternalValuesUpdate(BaseModel):
     sizing_type: Optional[str] = Field(
         default=None,
         description="Sizing type scope (only for sizes table)",
+    )
+    append_only: bool = Field(
+        default=False,
+        description=(
+            "If true, internal_values are only added to the platform_value; existing "
+            "mappings for other internal values are never removed."
+        ),
+    )
+    create: bool = Field(
+        default=False,
+        description=(
+            "If true, fails when the platform_value already exists for this platform. "
+            "Use when creating a new entry; edit the existing entry to modify it."
+        ),
     )
 
 

@@ -2241,6 +2241,30 @@ class DatabaseService:
             raise
 
     @staticmethod
+    async def default_list_platform_value_exists(
+        table_name: str,
+        platform_id: str,
+        platform_value: str,
+        sizing_type: Optional[str] = None,
+    ) -> bool:
+        mapping_table = DatabaseService._table(f"{table_name}_default_list")
+        quoted_mapping_table = f'"{mapping_table}"'
+        conn = Tortoise.get_connection("default")
+
+        if not await DatabaseService.table_exists(mapping_table):
+            raise ValueError(f"Mapping table {mapping_table} does not exist")
+
+        sql = f"SELECT 1 FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2"
+        params: List[Any] = [platform_id, platform_value]
+        if sizing_type:
+            sql += " AND primary_table_column = $3"
+            params.append(sizing_type)
+        sql += " LIMIT 1"
+
+        rows = await conn.execute_query_dict(sql, params)
+        return bool(rows)
+
+    @staticmethod
     async def sync_default_list_internal_values(
         table_name: str,
         platform_id: str,
@@ -2248,6 +2272,8 @@ class DatabaseService:
         internal_values: List[str],
         force: bool = False,
         sizing_type: Optional[str] = None,
+        append_only: bool = False,
+        create: bool = False,
     ) -> Tuple[int, int, int]:
         mapping_table = DatabaseService._table(f"{table_name}_default_list")
         quoted_mapping_table = f'"{mapping_table}"'
@@ -2255,6 +2281,14 @@ class DatabaseService:
 
         if not await DatabaseService.table_exists(mapping_table):
             raise ValueError(f"Mapping table {mapping_table} does not exist")
+
+        if create and await DatabaseService.default_list_platform_value_exists(
+            table_name, platform_id, platform_value, sizing_type
+        ):
+            raise ValueError(
+                f"Platform value '{platform_value}' already exists for this platform. "
+                "Edit the existing entry to change its mappings."
+            )
 
         if table_name == "sizes":
             pids_new = set(internal_values) if internal_values else set()
@@ -2319,7 +2353,11 @@ class DatabaseService:
         pids_current = {str(r["primary_id"]) for r in current_pid_records}
 
         pids_to_add = pids_new - pids_current
-        pids_to_remove = pids_current - pids_new
+        # append_only: never remove existing mappings for this platform_value.
+        # The payload is "add these values", not "this is the complete set" —
+        # used by flows that map a single value (e.g. the listing submit
+        # mapping-resolution dialog) so they cannot wipe sibling mappings.
+        pids_to_remove = set() if append_only else (pids_current - pids_new)
 
         deleted_count = 0
         if pids_to_remove:
