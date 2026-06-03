@@ -217,7 +217,12 @@ class SpoPoller(BasePoller):
             import_id = await spo_service.upload_products(xlsx_path)
 
             await ListingSubmission.filter(id__in=submission_ids).update(
-                platform_meta={"product_import_id": import_id},
+                platform_meta={
+                    "product_import_id": import_id,
+                    # When this batch was actually uploaded to SPO; the
+                    # submissions dashboard shows it as the import's created time.
+                    "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                },
                 platform_status="products_processing",
             )
             logger.info(f"{self.name}: P41 upload successful, import_id={import_id}")

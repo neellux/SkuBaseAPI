@@ -100,13 +100,30 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         status_counts: dict[str, int] = defaultdict(int)
         for sub in group:
             status_counts[_effective_status(sub)] += 1
+
+        # Prefer the actual upload time recorded by the sweep (platform_meta.uploaded_at).
+        # Imports that predate that field fall back to the oldest submission's
+        # created_at, which can be days earlier than the real upload.
+        uploaded_ats = []
+        for s in group:
+            raw = (s.platform_meta or {}).get("uploaded_at")
+            if raw:
+                try:
+                    uploaded_ats.append(datetime.fromisoformat(raw))
+                except (TypeError, ValueError):
+                    pass
+
         imports.append(
             ImportSummary(
                 import_id=import_id,
                 platform_id=platform_id,
                 submission_count=len(group),
                 status_counts=dict(status_counts),
-                created_at=min((s.created_at for s in group), default=None),
+                created_at=(
+                    min(uploaded_ats)
+                    if uploaded_ats
+                    else min((s.created_at for s in group), default=None)
+                ),
                 updated_at=max((s.updated_at for s in group), default=None),
             )
         )

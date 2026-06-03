@@ -595,7 +595,10 @@ class ImportSummary(BaseModel):
     status_counts: Dict[str, int] = Field(
         default_factory=dict, description="Count of submissions per status"
     )
-    created_at: Optional[datetime] = Field(None, description="Earliest submission created_at")
+    created_at: Optional[datetime] = Field(
+        None,
+        description="When the import was uploaded to the platform (falls back to earliest submission created_at for legacy imports)",
+    )
     updated_at: Optional[datetime] = Field(None, description="Latest submission updated_at")
 
 
