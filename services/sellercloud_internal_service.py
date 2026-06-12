@@ -1,11 +1,14 @@
 import asyncio
+import io
 import logging
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 import orjson
+import pandas as pd
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -781,6 +784,133 @@ class SellercloudInternalService:
         await self._retry_sc(
             f"update_product_upc({sku},{new_primary})", _do_basicinfo
         )
+
+    # ------------------------------------------------------------------
+    # Scheduled no-image export (SellerCloud scheduled task) consumption
+    # ------------------------------------------------------------------
+    async def get_scheduled_no_image_ids(
+        self,
+        *,
+        related_task_id: int = 346,
+        require_same_day: bool = True,
+        tz: str = "America/New_York",
+    ) -> List[str]:
+        """Return the no-image ProductIDs from the latest job of SellerCloud scheduled
+        task ``related_task_id``.
+
+        That scheduled task emits a one-column (``ProductID``) ``.xlsx`` listing products
+        with no image. We read the latest job; if it isn't Completed, or (when
+        ``require_same_day``) didn't run today in ``tz``, we return ``[]`` so the caller
+        does nothing this run rather than acting on stale data.
+        """
+        await self._ensure_authenticated()
+        client = await self._get_client()
+
+        payload = {
+            "Kind": 20,
+            "SelectedFilters": [
+                {"FilterId": "txtJobID", "FilterPropertyName": "JobID", "FilterSelectedValues": None},
+                {"FilterId": "ddlStatuses", "FilterPropertyName": "JobStatuses", "FilterSelectedValues": None},
+                {"FilterId": "ddlJobtype", "FilterPropertyName": "JobType", "FilterSelectedValues": None},
+                {"FilterId": "ddlSubmittedBy", "FilterPropertyName": "SubmittedBy", "FilterSelectedValues": []},
+                {"FilterId": "dtDate", "FilterSelectedValues": []},
+                {"FilterId": "lstCompanies", "FilterPropertyName": "CompanyIDList", "FilterSelectedValues": None},
+                {"FilterId": "ddlQueuedJobPriorities", "FilterPropertyName": "QueuedJobPriorities", "FilterSelectedValues": None},
+                {"FilterId": "txtRelatedTask", "FilterPropertyName": "RelatedTask", "FilterSelectedValues": [str(related_task_id)]},
+            ],
+            "PageNumber": 1,
+            "ResultsPerPage": 50,
+            "SortColumn": "SubmittedOn",
+            "SortDirection": False,
+            "IncludeTotals": True,
+            "UtcOffset": 330,
+            "GlobalSearchKeyWord": "",
+            "Key": None,
+            "SavedViewID": None,
+        }
+        resp = await client.post(
+            f"{self.base_url}/Manage/ManageEntity/GetGridData",
+            content=orjson.dumps(payload),
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+            timeout=httpx.Timeout(120.0),
+        )
+        resp.raise_for_status()
+        rows = ((orjson.loads(resp.content).get("Data") or {}).get("Grid")) or []
+        if not rows:
+            logger.warning(f"No queued jobs found for scheduled task {related_task_id}")
+            return []
+
+        job = rows[0]
+        job_id = job.get("ID")
+        status = job.get("QueuedJobStatus")
+        if status != 3:  # 3 == Completed
+            logger.info(
+                f"Latest task-{related_task_id} job {job_id} not completed "
+                f"(status={status}); skipping"
+            )
+            return []
+
+        if require_same_day:
+            stamp = job.get("CompletedOn") or job.get("SubmittedOn")
+            job_date = None
+            try:
+                job_date = datetime.fromisoformat(stamp).astimezone(ZoneInfo(tz)).date()
+            except Exception:
+                logger.warning(
+                    f"Could not parse job timestamp {stamp!r} for task {related_task_id}"
+                )
+            today = datetime.now(ZoneInfo(tz)).date()
+            if job_date != today:
+                logger.warning(
+                    f"Latest task-{related_task_id} job {job_id} dated {job_date} "
+                    f"!= today {today}; skipping (stale)"
+                )
+                return []
+
+        file_id = await self._resolve_job_output_file(str(job_id))
+        content = await self._download_file(file_id, f"{job_id}.xlsx")
+
+        df = pd.read_excel(io.BytesIO(content), dtype=str)
+        col = "ProductID" if "ProductID" in df.columns else df.columns[0]
+        ids = [str(v).strip() for v in df[col].dropna().tolist() if str(v).strip()]
+        deduped = list(dict.fromkeys(ids))
+        logger.info(
+            f"task-{related_task_id} job {job_id}: {len(deduped)} no-image ProductIDs"
+        )
+        return deduped
+
+    async def _resolve_job_output_file(self, job_id: str) -> str:
+        client = await self._get_client()
+        resp = await client.post(
+            f"{self.base_url}/QueuedJob/Details/ProcessAction",
+            content=orjson.dumps({
+                "Parameters": {
+                    "EntityKind": 10,
+                    "EntityId": str(job_id),
+                    "PathName": "/queued-jobs/queued-job-details.aspx",
+                    "QueryString": f"?id={job_id}",
+                    "SelectedGridItemIds": None,
+                },
+                "ActionKind": 1,
+            }),
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+            timeout=httpx.Timeout(60.0),
+        )
+        resp.raise_for_status()
+        downloads = (orjson.loads(resp.content).get("FileDownloads")) or []
+        if downloads and (downloads[0].get("FileID") or downloads[0].get("FileId")):
+            return downloads[0].get("FileID") or downloads[0].get("FileId")
+        raise RuntimeError(f"ProcessAction returned no FileID for job {job_id}")
+
+    async def _download_file(self, file_id: str, pretty_name: str) -> bytes:
+        client = await self._get_client()
+        resp = await client.get(
+            f"{self.base_url}/Files/Download",
+            params={"FileID": file_id, "PrettyFileName": pretty_name},
+            timeout=httpx.Timeout(600.0),
+        )
+        resp.raise_for_status()
+        return resp.content
 
     async def initialize(self):
         logger.info("Initializing SellerCloud Internal service...")

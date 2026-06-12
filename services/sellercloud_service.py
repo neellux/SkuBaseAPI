@@ -595,6 +595,37 @@ class SellerCloudService:
             },
         )
 
+    async def create_image_import(self, tsv_bytes: bytes) -> str:
+        """Submit a tab-separated image-import file to SellerCloud, return the queued job id.
+
+        This endpoint expects a FORM-ENCODED body (not JSON), so we bypass ``_make_request``
+        (which always sends JSON) and post via the authenticated client directly.
+        """
+        await self._ensure_authenticated()
+        client = await self._get_client()
+        payload = {
+            "FileContents": base64.b64encode(tsv_bytes).decode("utf-8"),
+            "FileExtension": ".txt",
+            "Format": 0,
+        }
+        url = f"{self.base_url}/Catalog/Imports/Images"
+        resp = await client.post(url, data=payload, timeout=httpx.Timeout(120.0))
+        if resp.status_code == 401:
+            await self._update_credentials()
+            client = await self._get_client()
+            resp = await client.post(url, data=payload, timeout=httpx.Timeout(120.0))
+        resp.raise_for_status()
+        link = resp.json().get("QueuedJobLink", "") or ""
+        if "id=" not in link:
+            raise RuntimeError(
+                f"Catalog/Imports/Images returned no job link: {resp.text[:200]}"
+            )
+        return link.split("id=")[1].split("&")[0]
+
+    async def get_job_status(self, job_id: str) -> Dict[str, Any]:
+        """Fetch a queued job's details (Basic.CompletedOn, TotalRecords, TotalProcessed)."""
+        return await self.get(f"/QueuedJobs/{job_id}")
+
     async def update_product_upc(self, product_id: str, upc: str) -> Dict[str, Any]:
         response = await self.put(
             "/Catalog/BasicInfo",
