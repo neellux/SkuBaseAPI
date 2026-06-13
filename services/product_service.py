@@ -1271,9 +1271,10 @@ class ProductService:
 
             async def _run_children() -> List[Dict[str, Any]]:
                 is_numeric = search_term.isdigit()
-                # Keywords are alphanumeric, so any letters-and-digits term is a
-                # keyword candidate (a numeric term is also a UPC candidate).
-                is_keyword_candidate = search_term.isalnum()
+                # Keywords allow letters, digits, and a safe symbol set, so any term
+                # made only of those is a keyword candidate (a numeric term is also a
+                # UPC candidate).
+                is_keyword_candidate = bool(re.fullmatch(r"[A-Za-z0-9_./+#&@()-]+", search_term))
 
                 # Build params and branches together. Only reference parameters
                 # that are actually used — PostgreSQL can't infer types for
@@ -2622,12 +2623,12 @@ class ProductService:
                             continue
                         item_value = clean_value
                         classification = "delete_upc"
-                    elif len(keyword_value) < 6:
-                        error_by_index[idx] = f"Keyword must be at least 6 characters (got {len(keyword_value)})"
+                    elif not 6 <= len(keyword_value) <= 20:
+                        error_by_index[idx] = f"Keyword must be 6-20 characters (got {len(keyword_value)})"
                         errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
-                    elif not re.fullmatch(r"[A-Za-z0-9]+", keyword_value):
-                        error_by_index[idx] = "Keyword must be letters or digits only"
+                    elif not re.fullmatch(r"[A-Za-z0-9_./+#&@()-]+", keyword_value):
+                        error_by_index[idx] = "Keyword has unsupported characters"
                         errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
                     else:
@@ -2644,12 +2645,12 @@ class ProductService:
                         classification = "delete_keyword"
 
                 elif action_normalized == "Keyword":
-                    if len(keyword_value) < 6:
-                        error_by_index[idx] = f"Keyword must be at least 6 characters (got {len(keyword_value)})"
+                    if not 6 <= len(keyword_value) <= 20:
+                        error_by_index[idx] = f"Keyword must be 6-20 characters (got {len(keyword_value)})"
                         errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
-                    if not re.fullmatch(r"[A-Za-z0-9]+", keyword_value):
-                        error_by_index[idx] = "Keyword must be letters or digits only"
+                    if not re.fullmatch(r"[A-Za-z0-9_./+#&@()-]+", keyword_value):
+                        error_by_index[idx] = "Keyword has unsupported characters"
                         errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
                     # A purely numeric keyword must NOT be a valid barcode
