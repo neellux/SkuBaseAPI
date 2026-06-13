@@ -2294,7 +2294,7 @@ class ProductService:
 
     @staticmethod
     async def add_keyword(sku: str, keyword: str) -> Dict[str, Any]:
-        clean_keyword = re.sub(r"[^0-9]", "", keyword)
+        clean_keyword = re.sub(r"\s", "", keyword)
         try:
             conn = await ProductService._get_connection()
 
@@ -2364,7 +2364,7 @@ class ProductService:
 
     @staticmethod
     async def delete_keyword(sku: str, keyword: str) -> Dict[str, Any]:
-        clean_keyword = re.sub(r"[^0-9]", "", keyword)
+        clean_keyword = re.sub(r"\s", "", keyword)
         try:
             conn = await ProductService._get_connection()
 
@@ -2479,23 +2479,27 @@ class ProductService:
                 r = await conn.execute_query_dict("SELECT sku FROM child_products WHERE sku = ANY($1)", [file_skus])
                 existing_skus = {row["sku"] for row in r}
 
-            file_values = df["value"].dropna().astype(str).apply(lambda v: re.sub(r"[^0-9]", "", str(v).strip())).unique().tolist()
-            file_values = [v for v in file_values if v]
+            # UPCs are numeric (digit-strip handles dashes); keywords are alphanumeric
+            # (strip whitespace only so letters survive).
+            file_upc_values = df["value"].dropna().astype(str).apply(lambda v: re.sub(r"[^0-9]", "", str(v).strip())).unique().tolist()
+            file_upc_values = [v for v in file_upc_values if v]
+            file_keyword_values = df["value"].dropna().astype(str).apply(lambda v: re.sub(r"\s", "", str(v))).unique().tolist()
+            file_keyword_values = [v for v in file_keyword_values if v]
 
             upc_to_sku = {}
             upc_is_primary = {}
-            if file_values:
+            if file_upc_values:
                 r = await conn.execute_query_dict(
-                    "SELECT upc, child_sku, is_primary_upc FROM child_upcs WHERE upc = ANY($1)", [file_values]
+                    "SELECT upc, child_sku, is_primary_upc FROM child_upcs WHERE upc = ANY($1)", [file_upc_values]
                 )
                 upc_to_sku = {row["upc"]: row["child_sku"] for row in r}
                 upc_is_primary = {row["upc"]: row["is_primary_upc"] for row in r}
 
             keyword_to_sku = {}
-            if file_values:
+            if file_keyword_values:
                 r = await conn.execute_query_dict(
                     "SELECT keyword, sku FROM (SELECT unnest(keywords) as keyword, sku FROM child_products WHERE keywords && $1::text[]) sub",
-                    [file_values],
+                    [file_keyword_values],
                 )
                 keyword_to_sku = {row["keyword"]: row["sku"] for row in r}
 
@@ -2535,23 +2539,28 @@ class ProductService:
                     errors.append({"row": row_num, "sku": sku, "value": value, "field": "Type/Action", "message": error_by_index[idx]})
                     continue
 
+                # clean_value: digits-only for UPC logic; keyword_value: whitespace-stripped
+                # (keeps letters) for keyword logic. item_value is what we persist/dedupe.
                 clean_value = re.sub(r"[^0-9]", "", value)
-                if not clean_value:
+                keyword_value = re.sub(r"\s", "", value)
+                item_value = clean_value if action_normalized in ("Primary", "Secondary") else keyword_value
+
+                if action_normalized in ("Primary", "Secondary") and not clean_value:
                     error_by_index[idx] = "UPC must contain only digits"
                     errors.append({"row": row_num, "sku": sku, "value": value, "field": "UPC", "message": error_by_index[idx]})
                     continue
 
                 if sku not in existing_skus:
                     error_by_index[idx] = f"SKU '{sku}' not found in database"
-                    errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "Product", "message": error_by_index[idx]})
+                    errors.append({"row": row_num, "sku": sku, "value": item_value, "field": "Product", "message": error_by_index[idx]})
                     continue
 
                 # Intra-CSV duplicate check
-                if clean_value in seen_values:
+                if item_value in seen_values:
                     error_by_index[idx] = f"Duplicate value in import file"
-                    errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                    errors.append({"row": row_num, "sku": sku, "value": item_value, "field": "UPC", "message": error_by_index[idx]})
                     continue
-                seen_values.add(clean_value)
+                seen_values.add(item_value)
 
                 classification = None
                 source_sku = None
@@ -2602,40 +2611,50 @@ class ProductService:
                             error_by_index[idx] = "Cannot delete primary UPC"
                             errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
                             continue
+                        item_value = clean_value
                         classification = "delete_upc"
-                    elif len(clean_value) < 6:
-                        error_by_index[idx] = f"Value must be at least 6 digits (got {len(clean_value)})"
-                        errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                    elif len(keyword_value) < 6:
+                        error_by_index[idx] = f"Keyword must be at least 6 characters (got {len(keyword_value)})"
+                        errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
+                        continue
+                    elif not re.fullmatch(r"[A-Za-z0-9]+", keyword_value):
+                        error_by_index[idx] = "Keyword must be letters or digits only"
+                        errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
                     else:
                         # Keyword delete — must actually exist on the target SKU
-                        kw_owner = keyword_to_sku.get(clean_value)
+                        kw_owner = keyword_to_sku.get(keyword_value)
                         if kw_owner is None:
-                            error_by_index[idx] = f"Keyword '{clean_value}' not found on any SKU"
-                            errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                            error_by_index[idx] = f"Keyword '{keyword_value}' not found on any SKU"
+                            errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                             continue
                         if kw_owner != sku:
                             error_by_index[idx] = f"Cannot delete, keyword belongs to a different SKU ({kw_owner})"
-                            errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                            errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                             continue
                         classification = "delete_keyword"
 
                 elif action_normalized == "Keyword":
-                    if len(clean_value) < 6:
-                        error_by_index[idx] = f"Keyword must be at least 6 digits (got {len(clean_value)})"
-                        errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                    if len(keyword_value) < 6:
+                        error_by_index[idx] = f"Keyword must be at least 6 characters (got {len(keyword_value)})"
+                        errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
-                    if len(clean_value) in (8, 12, 13) and ProductService._is_valid_barcode(clean_value):
+                    if not re.fullmatch(r"[A-Za-z0-9]+", keyword_value):
+                        error_by_index[idx] = "Keyword must be letters or digits only"
+                        errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
+                        continue
+                    # A purely numeric keyword must NOT be a valid barcode
+                    if keyword_value.isdigit() and len(keyword_value) in (8, 12, 13) and ProductService._is_valid_barcode(keyword_value):
                         error_by_index[idx] = "Keyword cannot be a valid barcode (has valid checksum)"
-                        errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                        errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
-                    if clean_value in upc_to_sku:
-                        error_by_index[idx] = f"Keyword conflicts with existing UPC for SKU: {upc_to_sku[clean_value]}"
-                        errors.append({"row": row_num, "sku": sku, "value": clean_value, "field": "UPC", "message": error_by_index[idx]})
+                    if keyword_value in upc_to_sku:
+                        error_by_index[idx] = f"Keyword conflicts with existing UPC for SKU: {upc_to_sku[keyword_value]}"
+                        errors.append({"row": row_num, "sku": sku, "value": keyword_value, "field": "UPC", "message": error_by_index[idx]})
                         continue
 
-                    if clean_value in keyword_to_sku:
-                        owner = keyword_to_sku[clean_value]
+                    if keyword_value in keyword_to_sku:
+                        owner = keyword_to_sku[keyword_value]
                         if owner == sku:
                             classification = "noop"
                         else:
@@ -2644,7 +2663,7 @@ class ProductService:
                     else:
                         classification = "add_keyword"
 
-                item = {"row": row_num, "sku": sku, "value": clean_value, "action": action_normalized, "classification": classification}
+                item = {"row": row_num, "sku": sku, "value": item_value, "action": action_normalized, "classification": classification}
                 if source_sku:
                     item["source_sku"] = source_sku
                 items.append(item)
@@ -3067,7 +3086,7 @@ class ProductService:
     async def _bulk_process_keyword(conn, item: Dict) -> Dict:
         try:
             sku, keyword = item["sku"], item["value"]
-            clean_keyword = re.sub(r"[^0-9]", "", keyword)
+            clean_keyword = re.sub(r"\s", "", keyword)
 
             # Check if already exists
             check = await conn.execute_query_dict(
