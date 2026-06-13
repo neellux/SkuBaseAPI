@@ -983,7 +983,7 @@ class DeleteUPCResponse(BaseModel):
 class AddKeywordRequest(BaseModel):
 
     sku: str = Field(..., min_length=1, description="Child SKU")
-    keyword: str = Field(..., pattern=r"^[A-Za-z0-9]{6,}$", description="Alphanumeric keyword (6+ characters)")
+    keyword: str = Field(..., pattern=r"^[A-Za-z0-9_./+#&@()-]{6,}$", description="Keyword (6+ chars; letters, digits, or symbols _./+#&@()-)")
 
 
 class AddKeywordResponse(BaseModel):

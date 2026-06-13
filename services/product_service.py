@@ -1271,6 +1271,9 @@ class ProductService:
 
             async def _run_children() -> List[Dict[str, Any]]:
                 is_numeric = search_term.isdigit()
+                # Keywords are alphanumeric, so any letters-and-digits term is a
+                # keyword candidate (a numeric term is also a UPC candidate).
+                is_keyword_candidate = search_term.isalnum()
 
                 # Build params and branches together. Only reference parameters
                 # that are actually used — PostgreSQL can't infer types for
@@ -1283,17 +1286,20 @@ class ProductService:
 
                 p_lower = _p(search_lower)
                 p_lower_prefix = _p(search_lower_prefix)
-                p_term = _p(search_term) if is_numeric else None
-                p_prefix = _p(search_prefix) if is_numeric else None
+                p_term = _p(search_term) if is_keyword_candidate else None
+                p_prefix = _p(search_prefix) if is_keyword_candidate else None
                 p_contains = _p(search_lower_contains) if search_lower_contains is not None else None
                 p_limit = _p(limit)
 
                 child_branches: List[str] = []
                 if is_numeric:
-                    child_branches += [
-                        f"(SELECT cu.child_sku AS sku, 0 AS rank FROM child_upcs cu WHERE cu.upc = {p_term} LIMIT {p_limit})",
-                        f"(SELECT cp.sku, 0 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND {p_term} = ANY(cp.keywords) LIMIT {p_limit})",
-                    ]
+                    child_branches.append(
+                        f"(SELECT cu.child_sku AS sku, 0 AS rank FROM child_upcs cu WHERE cu.upc = {p_term} LIMIT {p_limit})"
+                    )
+                if is_keyword_candidate:
+                    child_branches.append(
+                        f"(SELECT cp.sku, 0 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND {p_term} = ANY(cp.keywords) LIMIT {p_limit})"
+                    )
                 child_branches += [
                     f"(SELECT cp.sku, 1 AS rank FROM child_products cp WHERE cp.is_active = TRUE AND LOWER(cp.sku) = {p_lower} LIMIT {p_limit})",
                     f"(SELECT cp.sku, 2 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.mpn) = {p_lower} LIMIT {p_limit})",
@@ -1302,10 +1308,13 @@ class ProductService:
                     f"(SELECT cp.sku, 3 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND LOWER(pp.title) LIKE {p_lower_prefix} LIMIT {p_limit})",
                 ]
                 if is_numeric:
-                    child_branches += [
-                        f"(SELECT cu.child_sku AS sku, 3 AS rank FROM child_upcs cu WHERE cu.upc LIKE {p_prefix} LIMIT {p_limit})",
-                        f"(SELECT cp.sku, 3 AS rank FROM child_products cp, unnest(cp.keywords) AS k WHERE cp.is_active = TRUE AND k LIKE {p_prefix} LIMIT {p_limit})",
-                    ]
+                    child_branches.append(
+                        f"(SELECT cu.child_sku AS sku, 3 AS rank FROM child_upcs cu WHERE cu.upc LIKE {p_prefix} LIMIT {p_limit})"
+                    )
+                if is_keyword_candidate:
+                    child_branches.append(
+                        f"(SELECT cp.sku, 3 AS rank FROM child_products cp, unnest(cp.keywords) AS k WHERE cp.is_active = TRUE AND k LIKE {p_prefix} LIMIT {p_limit})"
+                    )
                 if p_contains is not None:
                     child_branches.append(
                         f"(SELECT cp.sku, 4 AS rank FROM parent_products pp JOIN child_products cp ON cp.parent_sku = pp.sku AND cp.is_active = TRUE WHERE pp.is_active = TRUE AND pp.title ILIKE {p_contains} LIMIT {p_limit})"
