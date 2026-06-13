@@ -687,6 +687,13 @@ class SellercloudInternalService:
                 error_msg = validation.get("ErrorMessage") or (
                     validation.get("Notification") or {}
                 ).get("Message", "")
+                # Already on THIS product: that's the desired end state, so treat as
+                # an idempotent success rather than a failure.
+                if "already used for this product" in error_msg.lower():
+                    logger.info(
+                        f"Alias '{value}' already present on {sku} in SellerCloud; treating as success"
+                    )
+                    return None
                 if _is_transient_message(error_msg):
                     raise Exception(f"validate_alias transient failure: {error_msg}")
                 raise SellercloudPermanentError(
@@ -707,7 +714,10 @@ class SellercloudInternalService:
                 raise Exception(f"update_product_upc failed: {result}")
             return result
 
-        await self._retry_sc(f"validate_alias({sku},{value})", _do_validate)
+        validation = await self._retry_sc(f"validate_alias({sku},{value})", _do_validate)
+        if validation is None:
+            # Alias already present on this product — nothing to save (idempotent).
+            return
         await self._retry_sc(f"save_alias(add {sku},{value})", _do_save)
         if is_primary:
             await self._retry_sc(f"update_product_upc({sku},{value})", _do_basicinfo)
