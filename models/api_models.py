@@ -626,6 +626,11 @@ class ImportListingDetail(BaseModel):
     status: str
     platform_status: Optional[str] = None
     error_display: Optional[str] = None
+    sku_errors: Optional[Dict[str, str]] = Field(
+        None,
+        description="Per-child-SKU error map ({sku: error}); lets the UI group "
+        "identical errors across sizes instead of repeating them.",
+    )
     updated_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = Field(
         None, description="Set when a failed submission was manually reviewed"

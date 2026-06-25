@@ -281,6 +281,7 @@ def _build_import_detail(
                 status=sub.status,
                 platform_status=sub.platform_status,
                 error_display=sub.error_display,
+                sku_errors=(sub.platform_meta or {}).get("sku_errors") or None,
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )
