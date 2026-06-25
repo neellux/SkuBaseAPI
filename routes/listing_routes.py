@@ -422,6 +422,21 @@ async def submit_listing(
             await sellercloud_service.add_color_alias(color, brand_color)
 
     non_sc_platforms = [p for p in platforms if p != "sellercloud"]
+
+    # Platforms other than SellerCloud build one row per child/size, so they
+    # require at least one child. Fail fast here with a clear error instead of
+    # letting build_csv_rows raise mid-submission, which would otherwise land
+    # as a traceback on a failed submission row (a wasted "real attempt").
+    if non_sc_platforms and not child_size_overrides:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "type": "no_children",
+                "platforms": non_sc_platforms,
+                "message": "Sizes need to be mapped before submission",
+            },
+        )
+
     if non_sc_platforms:
         form_data = listing.data or {}
         sizing_scheme = form_data.get("SIZING_SCHEME")
