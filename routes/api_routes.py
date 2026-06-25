@@ -5,6 +5,7 @@ from fastapi.responses import Response
 from tortoise import Tortoise
 from models.api_models import BatchResponse, CreateBatchRequest
 from services.batch_service import BatchService
+from services.product_service import ProductService
 from utils.load_app_data import add_user_data
 from exceptions.batch_exceptions import BatchCreationError
 
@@ -66,6 +67,7 @@ async def export_public(
             SELECT
                 cp.parent_sku,
                 cp.sku,
+                cp.size,
                 cu.upc AS primary_upc
             FROM child_products cp
             LEFT JOIN child_upcs cu
@@ -74,6 +76,7 @@ async def export_public(
             ORDER BY cp.parent_sku, cp.sku
         """
         results = await conn.execute_query_dict(query)
+        await ProductService.apply_size_sort(results)
         df = pd.DataFrame(results, columns=["parent_sku", "sku", "primary_upc"])
         df.columns = ["Parent SKU", "SKU", "Primary UPC"]
 

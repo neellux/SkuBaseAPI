@@ -399,6 +399,7 @@ async def export_products(
                 SELECT
                     cp.parent_sku,
                     cp.sku,
+                    cp.size,
                     cu.upc AS primary_upc
                 FROM child_products cp
                 LEFT JOIN child_upcs cu
@@ -407,6 +408,7 @@ async def export_products(
                 ORDER BY cp.parent_sku, cp.sku
             """
             results = await conn.execute_query_dict(query)
+            await ProductService.apply_size_sort(results)
             df = pd.DataFrame(results, columns=["parent_sku", "sku", "primary_upc"])
             df.columns = ["Parent SKU", "SKU", "Primary UPC"]
             filename = "parent_skus_export.csv"
@@ -423,6 +425,8 @@ async def export_products(
             query = """
                 SELECT
                     cp.sku,
+                    cp.parent_sku,
+                    cp.size,
                     cu.upc,
                     CASE WHEN cu.is_primary_upc THEN 'primary' ELSE 'secondary' END as type,
                     CASE WHEN cu.is_primary_upc THEN 0 ELSE 1 END as type_order
@@ -434,6 +438,8 @@ async def export_products(
 
                 SELECT
                     cp.sku,
+                    cp.parent_sku,
+                    cp.size,
                     k as upc,
                     'keyword' as type,
                     2 as type_order
@@ -444,8 +450,10 @@ async def export_products(
                 ORDER BY sku, type_order, upc
             """
             results = await conn.execute_query_dict(query)
-            df = pd.DataFrame(results, columns=["sku", "upc", "type", "type_order"])
-            df = df.drop(columns=["type_order"])
+            await ProductService.apply_size_sort(
+                results, key_tail=lambda r: (r["type_order"], r.get("upc") or "")
+            )
+            df = pd.DataFrame(results, columns=["sku", "upc", "type"])
             df.columns = ["SKU", "UPC", "Type"]
             filename = "products_export.csv"
 

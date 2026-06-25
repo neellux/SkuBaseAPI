@@ -30,6 +30,59 @@ class ProductService:
         return connections.get("product_db")
 
     @staticmethod
+    def _size_rank(parent_sku, size, parent_scheme, size_order):
+        """Canonical rank for a size within its parent.
+
+        Returns float('inf') when the parent has no sizing_scheme, the scheme is
+        not in the map, the size is not in the scheme, or the scheme row's order
+        is NULL. inf-ranked rows fall back to alphabetical-by-size via the tiebreak
+        in apply_size_sort, and never crash the sort.
+        """
+        scheme = parent_scheme.get(parent_sku)            # None if parent_sku missing/None
+        rank = size_order.get((scheme, size))             # None if not found
+        return float("inf") if rank is None else rank     # guard against NULL "order" too
+
+    @staticmethod
+    async def apply_size_sort(rows, key_tail=lambda r: ()):
+        """Best-effort: sort export rows in place by canonical size within each parent.
+
+        Each row must carry 'parent_sku' and 'size'. Rows are ordered by
+        (parent_sku, canonical size order, size, *key_tail). On ANY failure to load
+        the sizing maps (DB error, missing tables, etc.) the rows are returned
+        untouched in their existing (SQL) order, so the export still succeeds.
+        """
+        try:
+            product_conn = connections.get("product_db")
+            default_conn = connections.get("default")
+
+            parent_rows = await product_conn.execute_query_dict(
+                "SELECT sku, sizing_scheme FROM parent_products"
+            )
+            parent_scheme = {r["sku"]: r["sizing_scheme"] for r in parent_rows}
+
+            scheme_rows = await default_conn.execute_query_dict(
+                'SELECT sizing_scheme, size, "order" FROM listingoptions_sizing_schemes'
+            )
+            size_order = {(r["sizing_scheme"], r["size"]): r["order"] for r in scheme_rows}
+        except Exception:
+            logger.warning(
+                "size sort maps unavailable; keeping default export order", exc_info=True
+            )
+            return rows
+
+        rows.sort(
+            key=lambda r: (
+                (r.get("parent_sku") or ""),
+                ProductService._size_rank(
+                    r.get("parent_sku"), r.get("size"), parent_scheme, size_order
+                ),
+                (r.get("size") or ""),
+                *key_tail(r),
+            )
+        )
+        return rows
+
+    @staticmethod
     async def _execute_transfer_job(
         child_sku: str, target_child_sku: str, **kwargs
     ) -> Dict[str, Any]:
