@@ -7,6 +7,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import ORJSONResponse
 from middleware.AuthMiddleware import AuthMiddleware
 from middleware.CORSMiddleware import CORSMiddleware
+from middleware.ExceptionHandlerMiddleware import ExceptionHandlerMiddleware
 from routes.api_routes import router as api_router
 from routes.image_routes import router as image_router
 from routes.listing_routes import router as listing_router
@@ -58,6 +59,11 @@ api_app = FastAPI(
 )
 
 app.add_middleware(AuthMiddleware, excluded_paths=["/api", "/docs", "/openapi.json"])
+# Registered after AuthMiddleware so it sits INSIDE CORSMiddleware in the final
+# stack: an unhandled exception is turned into a 500 here and the response then
+# passes back out through CORSMiddleware, gaining the Access-Control-Allow-Origin
+# header so the browser does not block it as a "network error".
+app.add_middleware(ExceptionHandlerMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -188,7 +194,11 @@ async def get_app_users():
     return users
 
 
+# Backstop only. ExceptionHandlerMiddleware handles exceptions from the route
+# handlers and auth layer (and attaches CORS headers). This catches the rare
+# case of an exception raised in the outer middleware (CORS/GZip); such a
+# response cannot carry CORS headers, but it keeps the server from hanging.
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     logger.error(f"Global exception: {str(exc)}")
-    return ORJSONResponse(status_code=500, content={"error": "Internal server error"})
+    return ORJSONResponse(status_code=500, content={"detail": "Internal server error"})
