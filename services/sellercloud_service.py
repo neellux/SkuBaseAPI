@@ -1267,20 +1267,27 @@ class SellerCloudService:
                 child_id = child["id"]
                 size_map[child_id] = child_size_overrides.get(child_id, child["size"])
 
+            # Update every variant child SKU. The parent SKU itself is only
+            # updated for single-SKU products, and only when the listing
+            # actually mapped a size for it (present in child_size_overrides);
+            # otherwise skip it. Multi-variant matrix parents are inactive and
+            # never returned by get_product_children anyway.
             all_product_ids = []
             for child in children_data.get("children", []):
                 child_id = child.get("id")
-                if child_id and child_id != parent_product_id:
-                    all_product_ids.append(child_id)
+                if not child_id:
+                    continue
+                if child_id == parent_product_id and child_id not in child_size_overrides:
+                    continue
+                all_product_ids.append(child_id)
 
             if not all_product_ids:
                 raise Exception(
-                    f"No child products found for parent {parent_product_id}. "
-                    f"Listing updates are only applied to child products, not the parent."
+                    f"No products found for {parent_product_id} in SellerCloud."
                 )
 
             logger.info(
-                f"Updating {len(all_product_ids)} child products (parent {parent_product_id} will not be updated)"
+                f"Updating {len(all_product_ids)} SellerCloud product(s) for {parent_product_id}"
             )
 
             list_price = form_data.get("ListPrice", "")
