@@ -1,8 +1,10 @@
 import logging
+import secrets
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
 from tortoise import Tortoise
+from config import API_KEY
 from models.api_models import BatchResponse, CreateBatchRequest
 from services.batch_service import BatchService
 from services.product_service import ProductService
@@ -12,6 +14,15 @@ from exceptions.batch_exceptions import BatchCreationError
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+async def require_api_key(x_api_key: str = Header(None, alias="X-API-KEY")):
+    """Validate the X-API-KEY header against the configured API key.
+
+    Fails closed: if no API key is configured, every request is rejected.
+    """
+    if not API_KEY or not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 @router.post("/create_batch", response_model=BatchResponse, include_in_schema=False)
@@ -45,7 +56,7 @@ async def create_batch_public(request_data: CreateBatchRequest):
         raise HTTPException(status_code=500, detail=f"Failed to create batch: {str(e)}")
 
 
-@router.get("/export", include_in_schema=False)
+@router.get("/export", include_in_schema=False, dependencies=[Depends(require_api_key)])
 async def export_public(
     type: str = Query("parent_skus", description="Export type: 'parent_skus'"),
 ):
