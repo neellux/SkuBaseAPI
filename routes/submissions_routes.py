@@ -25,6 +25,7 @@ from services import spo_service as spo_service_module
 from services.spo_poller import spo_poller
 from services.spo_service import spo_service
 from services.template_service import TemplateService
+from tortoise import connections
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/submissions", tags=["submissions"])
@@ -71,6 +72,21 @@ async def _get_platform_settings_for(platform_id: str) -> dict[str, Any]:
             ),
         )
     return platform_settings
+
+
+async def _pending_counts_by_platform() -> dict[str, int]:
+    """Pending submission count per platform_id, for the dashboard tab badges.
+
+    Pending is unaffected by reviewed_at (that only flips failed->success), so a
+    plain status='pending' count is correct. One grouped query keeps this cheap.
+    """
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(
+        "SELECT platform_id, count(*) AS n FROM listing_submissions "
+        "WHERE status = $1 GROUP BY platform_id",
+        [SubmissionStatus.PENDING],
+    )
+    return {row["platform_id"]: row["n"] for row in rows}
 
 
 async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
@@ -202,6 +218,7 @@ async def get_dashboard(
             total_imports=total_imports,
             page=page,
             page_size=page_size,
+            platform_pending_counts=await _pending_counts_by_platform(),
         )
     except HTTPException:
         raise

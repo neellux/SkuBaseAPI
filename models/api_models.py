@@ -616,6 +616,10 @@ class SubmissionsDashboardResponse(BaseModel):
     total_imports: int = Field(0, description="Total imports for this platform")
     page: int = Field(1, description="Current page (1-indexed)")
     page_size: int = Field(50, description="Imports per page")
+    platform_pending_counts: Dict[str, int] = Field(
+        default_factory=dict,
+        description="Pending submission count per platform_id, for tab badges",
+    )
 
 
 class ImportListingDetail(BaseModel):
