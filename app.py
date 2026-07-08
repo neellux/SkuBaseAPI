@@ -33,6 +33,7 @@ from services.daily_image_import_poller import daily_image_import_poller
 from services.sellercloud_sync_poller import sellercloud_sync_poller
 from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.spo_poller import spo_poller
+from services.grailed_poller import grailed_poller
 from services.submission_poller import submission_poller
 from tortoise.contrib.fastapi import register_tortoise
 from utils.load_app_data import app_users, load_app_data
@@ -133,6 +134,7 @@ async def startup_event():
 
     await submission_poller.start()
     await spo_poller.start()
+    await grailed_poller.start()
     await sellercloud_sync_poller.start()
     await alias_bulk_import_poller.start()
     await photo_upload_poller.start()
@@ -151,6 +153,7 @@ async def shutdown_event():
     await photo_upload_poller.stop()
     await alias_bulk_import_poller.stop()
     await sellercloud_sync_poller.stop()
+    await grailed_poller.stop()
     await spo_poller.stop()
     await submission_poller.stop()
 

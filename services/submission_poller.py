@@ -11,7 +11,6 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services.base_poller import BasePoller
-from services.grailed_service import grailed_service
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
 from tortoise.transactions import in_transaction
@@ -124,14 +123,9 @@ class SubmissionPoller(BasePoller):
                 )
                 submission.status = SubmissionStatus.SUCCESS
                 await submission.save()
-            elif submission.platform_id == "grailed":
-                await grailed_service.submit_listing(
-                    listing=listing,
-                    form_data=form_data,
-                    field_definitions=field_definitions,
-                    submission=submission,
-                )
-            elif submission.platform_id == "spo":
+            elif submission.platform_id in ("grailed", "spo"):
+                # Both are manual_fallback batch platforms handled by their own
+                # pollers (grailed_poller / spo_poller); nothing to do per-listing.
                 pass
             else:
                 logger.warning(

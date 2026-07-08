@@ -37,6 +37,11 @@ router = APIRouter(prefix="/tables", tags=["tables"])
 # excluded_platforms column), as opposed to leaving it blank (a skip).
 EXCLUDED_SENTINEL = "__EXCLUDED__"
 
+# Platforms integrated in our listing/submission flow. A blank ("skip") mapping
+# is only allowed for these; every other platform must have a value or be
+# explicitly Excluded. Hardcoded for now — will move to DB/settings later.
+LISTING_PLATFORM_IDS = {"spo", "grailed"}
+
 
 @router.post("/create", response_model=SuccessResponse)
 async def create_table(request: CreateTableRequest):
@@ -304,9 +309,11 @@ async def get_table_schema(
             if not first_platform_field_name_for_grid:
                 first_platform_field_name_for_grid = field_name
 
-            # Platform mappings are intentionally optional: a blank field is a
-            # valid "skip" (no mapping), and exclusion is expressed separately
-            # via the Exclude checkbox. They are no longer required to save.
+            # Blank is only allowed for listing-integrated platforms; all others
+            # are required (the user must enter a value or tick Exclude, which
+            # supplies a value that satisfies the requirement).
+            if platform_id not in LISTING_PLATFORM_IDS:
+                required_fields.append(field_name)
 
         for col in sorted_columns:
             if col["name"] == db_schema.primary_business_column:

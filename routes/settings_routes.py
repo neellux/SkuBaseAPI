@@ -154,13 +154,22 @@ SPO_DEFAULT_SETTINGS = {
     "require_color_mapping": False,
 }
 
+GRAILED_DEFAULT_SETTINGS = {
+    "manual_fallback": True,
+    "min_batch_size": 100,
+}
+
 
 def _hydrate_platform_settings(platform_settings: dict) -> dict:
     merged = dict(platform_settings or {})
-    spo = dict(merged.get("spo") or {})
-    for key, default_value in SPO_DEFAULT_SETTINGS.items():
-        spo.setdefault(key, default_value)
-    merged["spo"] = spo
+    for platform_id, defaults in (
+        ("spo", SPO_DEFAULT_SETTINGS),
+        ("grailed", GRAILED_DEFAULT_SETTINGS),
+    ):
+        platform = dict(merged.get(platform_id) or {})
+        for key, default_value in defaults.items():
+            platform.setdefault(key, default_value)
+        merged[platform_id] = platform
     return merged
 
 

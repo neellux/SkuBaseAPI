@@ -282,6 +282,30 @@ class GrailedService:
             return {}
         return settings.platform_settings.get(self.PLATFORM_ID, {})
 
+    async def submit_batch(self, products: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """POST a batch of product rows to the Grailed AppScript ``addListings``
+        endpoint and return the parsed response.
+
+        The rows may span multiple listings; this method does not touch any
+        submission records (the caller owns status/attribution).
+        """
+        if not self.api_endpoint:
+            raise ValueError(
+                "Grailed API endpoint not configured in config.toml [grailed] section"
+            )
+
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.post(
+                self.api_endpoint,
+                follow_redirects=True,
+                json={
+                    "key": self.api_key,
+                    "action": "addListings",
+                    "data": products,
+                },
+            )
+        return response.json()
+
     async def submit_listing(
         self,
         listing: Listing,
@@ -295,23 +319,7 @@ class GrailedService:
             if not products:
                 raise ValueError("No children found to submit to Grailed")
 
-            if not self.api_endpoint:
-                raise ValueError(
-                    "Grailed API endpoint not configured in config.toml [grailed] section"
-                )
-
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                response = await client.post(
-                    self.api_endpoint,
-                    follow_redirects=True,
-                    json={
-                        "key": self.api_key,
-                        "action": "addListings",
-                        "data": products,
-                    },
-                )
-            print(response.content)
-            response_data = response.json()
+            response_data = await self.submit_batch(products)
 
             if response_data.get("success"):
                 submission.status = "success"
@@ -484,7 +492,6 @@ class GrailedService:
                 if not grailed_size:
                     raise Exception("Internal Server Error")
                 grailed_size = grailed_size.split(" ")[-1] if grailed_size else ""
-                print("grailed size", grailed_size)
                 if form_data.get("GENDER") == "Womens":
                     product["exact_size"] = grailed_size
                     product["size"] = ""

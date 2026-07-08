@@ -22,6 +22,7 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services import spo_service as spo_service_module
+from services.grailed_poller import grailed_poller
 from services.spo_poller import spo_poller
 from services.spo_service import spo_service
 from services.template_service import TemplateService
@@ -268,17 +269,21 @@ async def get_dashboard(
 async def create_batch(platform: str = Query(..., description="Platform identifier, e.g. 'spo'")):
     await _get_platform_settings_for(platform)
 
-    if platform != "spo":
+    if platform == "spo":
+        flush = spo_poller.manual_flush
+    elif platform == "grailed":
+        flush = grailed_poller.manual_flush
+    else:
         raise HTTPException(
             status_code=404,
             detail=f"Manual batch creation is not implemented for platform '{platform}'",
         )
 
     try:
-        result = await spo_poller.manual_flush()
+        result = await flush()
     except Exception:
-        logger.exception("Manual SPO flush failed")
-        raise HTTPException(status_code=500, detail="Manual SPO flush failed")
+        logger.exception(f"Manual {platform} flush failed")
+        raise HTTPException(status_code=500, detail=f"Manual {platform} flush failed")
 
     return CreateBatchResponse(
         platform=platform,
