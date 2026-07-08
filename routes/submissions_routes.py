@@ -119,7 +119,24 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
     pending = processing = failed = success = 0
     grouped: dict[int, list[ListingSubmission]] = defaultdict(list)
 
+    # The top-line counts are deduped to the LATEST attempt per parent listing so
+    # a parent that failed then was retried to success (or failed N times) counts
+    # once, by its current state - not once per historical attempt row. Orphaned
+    # rows (listing since deleted) have no parent to act on and are excluded from
+    # the counts. The per-import grouping below still uses every row.
+    latest_per_listing: dict[Any, ListingSubmission] = {}
     for sub in submissions:
+        if sub.listing_id is not None:
+            current = latest_per_listing.get(sub.listing_id)
+            if current is None or sub.attempt_number > current.attempt_number:
+                latest_per_listing[sub.listing_id] = sub
+
+        meta = sub.platform_meta or {}
+        import_id = meta.get("product_import_id")
+        if isinstance(import_id, int):
+            grouped[import_id].append(sub)
+
+    for sub in latest_per_listing.values():
         eff = _effective_status(sub)
         if eff == SubmissionStatus.PENDING:
             pending += 1
@@ -129,11 +146,6 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
             failed += 1
         elif eff == SubmissionStatus.SUCCESS:
             success += 1
-
-        meta = sub.platform_meta or {}
-        import_id = meta.get("product_import_id")
-        if isinstance(import_id, int):
-            grouped[import_id].append(sub)
 
     imports: list[ImportSummary] = []
     for import_id, group in grouped.items():

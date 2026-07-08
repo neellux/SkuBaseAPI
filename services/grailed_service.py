@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import traceback
@@ -275,6 +276,18 @@ class GrailedService:
         grailed_config = config.get("grailed", {})
         self.api_endpoint = grailed_config.get("api_endpoint", "")
         self.api_key = grailed_config.get("api_key", "")
+        self.request_timeout = float(grailed_config.get("request_timeout_seconds", 300.0))
+        self.max_retries = max(1, int(grailed_config.get("max_retries", 3)))
+        self.retry_backoff_seconds = float(grailed_config.get("retry_backoff_seconds", 5.0))
+
+    @staticmethod
+    def _is_transient_error(error: Any) -> bool:
+        """Server-side conditions worth retrying (the AppScript signals a locked
+        sheet distinctly). Every other success=false error is final."""
+        if not error:
+            return False
+        text = str(error).lower()
+        return any(k in text for k in ("unavailable", "locked", "timeout", "timed out"))
 
     async def get_platform_settings(self) -> Dict[str, Any]:
         settings = await AppSettings.first()
@@ -288,23 +301,55 @@ class GrailedService:
 
         The rows may span multiple listings; this method does not touch any
         submission records (the caller owns status/attribution).
+
+        Retries when the AppScript gives no usable response - a transport error,
+        timeout, non-2xx, non-JSON body, or a transient "sheet locked/unavailable"
+        result - up to ``max_retries`` with linear backoff. This is safe against
+        double-listing because ``addListings`` dedups by SKU against the sheet, so
+        a re-sent row that actually landed the first time becomes an update, not a
+        duplicate. Raises after retries are exhausted; a valid response with a
+        non-transient ``success=false`` is returned as-is (final, not retried).
         """
         if not self.api_endpoint:
             raise ValueError(
                 "Grailed API endpoint not configured in config.toml [grailed] section"
             )
 
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.post(
-                self.api_endpoint,
-                follow_redirects=True,
-                json={
-                    "key": self.api_key,
-                    "action": "addListings",
-                    "data": products,
-                },
-            )
-        return response.json()
+        payload = {"key": self.api_key, "action": "addListings", "data": products}
+        last_error: str | None = None
+
+        for attempt in range(1, self.max_retries + 1):
+            data: Dict[str, Any] | None = None
+            try:
+                async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+                    response = await client.post(
+                        self.api_endpoint, follow_redirects=True, json=payload
+                    )
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                # No usable response (timeout, connection reset, 5xx, HTML/empty
+                # body). Retry.
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    f"Grailed submit_batch attempt {attempt}/{self.max_retries} "
+                    f"got no valid response: {last_error}"
+                )
+            else:
+                if data.get("success") or not self._is_transient_error(data.get("error")):
+                    return data
+                last_error = str(data.get("error"))
+                logger.warning(
+                    f"Grailed submit_batch attempt {attempt}/{self.max_retries} "
+                    f"transient error: {last_error}"
+                )
+
+            if attempt < self.max_retries:
+                await asyncio.sleep(self.retry_backoff_seconds * attempt)
+
+        raise RuntimeError(
+            f"Grailed AppScript unreachable after {self.max_retries} attempts: {last_error}"
+        )
 
     async def submit_listing(
         self,

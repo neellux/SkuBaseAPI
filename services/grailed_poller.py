@@ -180,11 +180,17 @@ class GrailedPoller(BasePoller):
         try:
             response_data = await grailed_service.submit_batch(all_products)
         except Exception:
-            logger.exception(f"{self.name}: Grailed batch POST failed")
+            # submit_batch already retried the AppScript in-call; reaching here
+            # means no definitive response. The outcome is unknown, but addListings
+            # dedups by SKU, so we requeue (not fail) rather than lose the batch:
+            # the next poll cycle retries, and a request that actually landed
+            # becomes an update, not a duplicate.
+            logger.exception(
+                f"{self.name}: Grailed AppScript unreachable, requeueing {len(active_ids)} submissions"
+            )
             await ListingSubmission.filter(id__in=active_ids).update(
-                status=SubmissionStatus.FAILED,
-                error=traceback.format_exc(),
-                error_display="Failed to submit batch to Grailed",
+                status=SubmissionStatus.PENDING,
+                error_display="Grailed AppScript unreachable, will retry",
             )
             return 0
 
@@ -230,6 +236,7 @@ class GrailedPoller(BasePoller):
 
             sub_refs = [ref_by_sku[sku] for sku in sub_skus if sku in ref_by_sku]
             sub.status = SubmissionStatus.SUCCESS
+            sub.error_display = None  # clear any "will retry" note from a prior cycle
             if sub_refs:
                 sub.external_id = sub_refs
             await sub.save()
