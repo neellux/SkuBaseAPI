@@ -293,6 +293,8 @@ async def get_submission_status(
 @router.get("/mapping_status")
 async def get_mapping_status(
     listing_id: str = Query(..., description="Listing ID"),
+    product_type: str = Query(None, description="Override product_type (unsaved form value)"),
+    color: str = Query(None, description="Override standard_color (unsaved form value)"),
 ):
     listing = await ListingService.get_listing_by_id(listing_id)
     if not listing:
@@ -305,9 +307,13 @@ async def get_mapping_status(
         settings.platform_settings if settings and settings.platform_settings else {}
     )
 
+    # Prefer the live form values when provided so the status reflects the
+    # current selection immediately, before the debounced auto-save lands.
     form_data = listing.data or {}
-    product_type = form_data.get("product_type")
-    color = form_data.get("standard_color")
+    if product_type is None:
+        product_type = form_data.get("product_type")
+    if color is None:
+        color = form_data.get("standard_color")
 
     status = await listing_options_service.get_mapping_status(
         product_type, color, non_sc_platforms, platform_settings

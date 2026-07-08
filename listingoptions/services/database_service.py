@@ -34,6 +34,9 @@ def validate_sql_identifier(name: str) -> str:
 
 _TYPE_PREFIX_REGEX = r"^(Men''s |Women''s |Boy''s |Girl''s |Unisex )"
 
+# Transport sentinel for an explicit "exclude this record from this platform".
+EXCLUDED_SENTINEL = "__EXCLUDED__"
+
 
 def _is_type_name_column(table_name: str, column_name: str) -> bool:
     return table_name == "types" and column_name == "type"
@@ -321,6 +324,22 @@ class DatabaseService:
             raise ValueError(f"Table {table_name} not found.")
         except Exception as e:
             logger.error(f"Error reordering columns for table {table_name}: {str(e)}")
+            raise
+
+    @staticmethod
+    async def update_table_settings(table_name: str, allow_exclude: Optional[bool] = None) -> bool:
+        try:
+            schema_entry = await Schema.get(table=table_name)
+            if allow_exclude is not None:
+                schema_entry.allow_exclude = bool(allow_exclude)
+            await schema_entry.save()
+            DatabaseService._schema_cache[table_name] = schema_entry
+            logger.info(f"Updated settings for table {table_name}")
+            return True
+        except DoesNotExist:
+            raise ValueError(f"Table {table_name} not found.")
+        except Exception as e:
+            logger.error(f"Error updating settings for table {table_name}: {str(e)}")
             raise
 
     @staticmethod
@@ -615,17 +634,77 @@ class DatabaseService:
             params = [record_id, primary_business_column]
             result = await Tortoise.get_connection("default").execute_query_dict(sql, params)
 
+            mappings: Dict[str, Any] = {}
             if result and result[0]["platform_mappings"]:
-                mappings = result[0]["platform_mappings"]
-                if isinstance(mappings, str):
-                    return orjson.loads(mappings)
-                return mappings
-            return {}
+                raw = result[0]["platform_mappings"]
+                mappings = orjson.loads(raw) if isinstance(raw, str) else raw
+
+            # Merge the record's explicit exclusions back in as the transport
+            # sentinel so the editor re-checks the Exclude box. Stored on the
+            # record (excluded_platforms), not in the mapping table.
+            excluded = await DatabaseService.get_record_excluded_platforms(table_name, record_id)
+            for platform_id in excluded:
+                mappings[
+                    f"platform_mapping_for_{platform_id}_of_{primary_business_column}"
+                ] = EXCLUDED_SENTINEL
+
+            return mappings
         except Exception as e:
             logger.error(
                 f"Error getting platform mappings for record {record_id} from table {table_name}: {str(traceback.format_exc())}"
             )
             raise
+
+    @staticmethod
+    async def get_record_excluded_platforms(table_name: str, record_id: str) -> List[str]:
+        """Excluded platform_ids stored on a record. Empty for tables without the column."""
+        main_table = DatabaseService._table(table_name)
+        try:
+            rows = await Tortoise.get_connection("default").execute_query_dict(
+                f'SELECT excluded_platforms FROM "{main_table}" WHERE id = $1', [record_id]
+            )
+        except Exception:
+            # Table has no excluded_platforms column (exclude not enabled): treat as none.
+            return []
+        if not rows:
+            return []
+        raw = rows[0].get("excluded_platforms")
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            raw = orjson.loads(raw)
+        return [str(p) for p in raw] if isinstance(raw, list) else []
+
+    @staticmethod
+    async def clear_excluded_platform_for_internal_values(
+        table_name: str, internal_values: List[str], platform_id: str
+    ) -> None:
+        """Drop platform_id from excluded_platforms for the named records.
+
+        Keeps the mapped-vs-excluded invariant: creating a real mapping for a
+        value (e.g. via click-to-map) clears any prior exclusion for it. No-op on
+        tables without the column.
+        """
+        if not internal_values:
+            return
+        schema = await DatabaseService.get_table_schema(table_name)
+        if not schema or not schema.primary_business_column:
+            return
+        col = validate_sql_identifier(schema.primary_business_column)
+        main_table = DatabaseService._table(table_name)
+        sql = f"""
+            UPDATE "{main_table}"
+            SET excluded_platforms = COALESCE(excluded_platforms, '[]'::jsonb) - $1,
+                updated_at = NOW()
+            WHERE LOWER("{col}") = ANY($2)
+        """
+        try:
+            await Tortoise.get_connection("default").execute_query(
+                sql, [platform_id, [str(v).lower() for v in internal_values]]
+            )
+        except Exception:
+            # Table has no excluded_platforms column (exclude not enabled): nothing to clear.
+            pass
 
     @staticmethod
     async def insert_record(table_name: str, data: Dict[str, Any]) -> str:

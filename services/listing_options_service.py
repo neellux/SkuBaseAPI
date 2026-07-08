@@ -220,6 +220,39 @@ class ListingOptionsService:
             logger.error(f"Error fetching {platform} color for {color}: {e}")
             raise
 
+    async def get_excluded_platforms(self, table_name: str, value_column: str, value: str | None) -> set:
+        """platform_ids the given brand/type/color value is explicitly excluded from.
+
+        Reads the record's excluded_platforms column. Returns an empty set for
+        tables that don't have the column (e.g. colors, where exclude is off).
+        """
+        if not value:
+            return set()
+        conn = connections.get("default")
+        query = f"""
+            SELECT t.excluded_platforms
+            FROM listingoptions_{table_name} t
+            WHERE LOWER(t.{value_column}) = LOWER($1)
+              OR EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements_text(t.aliases) AS alias
+                  WHERE LOWER(alias) = LOWER($1)
+              )
+            LIMIT 1
+        """
+        try:
+            rows = await conn.execute_query_dict(query, [value])
+        except Exception:
+            return set()
+        if not rows:
+            return set()
+        raw = rows[0].get("excluded_platforms")
+        if not raw:
+            return set()
+        if isinstance(raw, str):
+            raw = orjson.loads(raw)
+        return {str(p) for p in raw} if isinstance(raw, list) else set()
+
     async def check_unmapped_type_or_color(
         self,
         product_type: str | None,
@@ -228,6 +261,8 @@ class ListingOptionsService:
         platform_settings: dict,
     ) -> list:
         result = []
+        type_excluded = await self.get_excluded_platforms("types", "type", product_type)
+        color_excluded = await self.get_excluded_platforms("colors", "color", color)
         for platform_id in platforms:
             if platform_id == "sellercloud":
                 continue
@@ -238,14 +273,16 @@ class ListingOptionsService:
                 continue
 
             missing = []
-            if require_type:
+            # An explicit exclusion is treated as satisfied: the user has said this
+            # type/color is intentionally not mapped here, so it must not block.
+            if require_type and platform_id not in type_excluded:
                 if not product_type:
                     missing.append("type")
                 else:
                     mapped = await self.get_platform_type(product_type, platform_id)
                     if not mapped:
                         missing.append("type")
-            if require_color:
+            if require_color and platform_id not in color_excluded:
                 if not color:
                     missing.append("color")
                 else:
@@ -282,13 +319,19 @@ class ListingOptionsService:
         color_status: dict = {}
         type_required: dict = {}
         color_required: dict = {}
+        type_excluded: dict = {}
+        color_excluded: dict = {}
         platform_settings = platform_settings or {}
+        type_excluded_set = await self.get_excluded_platforms("types", "type", product_type)
+        color_excluded_set = await self.get_excluded_platforms("colors", "color", color)
         for platform_id in platforms:
             if platform_id == "sellercloud":
                 continue
             settings = platform_settings.get(platform_id, {}) or {}
             type_required[platform_id] = bool(settings.get("require_type_mapping"))
             color_required[platform_id] = bool(settings.get("require_color_mapping"))
+            type_excluded[platform_id] = platform_id in type_excluded_set
+            color_excluded[platform_id] = platform_id in color_excluded_set
             type_status[platform_id] = bool(
                 product_type
                 and await self.get_platform_type(product_type, platform_id)
@@ -301,6 +344,8 @@ class ListingOptionsService:
             "color": color_status,
             "type_required": type_required,
             "color_required": color_required,
+            "type_excluded": type_excluded,
+            "color_excluded": color_excluded,
         }
 
     async def check_unmapped_sizes(

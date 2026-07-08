@@ -162,6 +162,12 @@ async def sync_default_internal_values(
             append_only=payload.append_only,
             create=payload.create,
         )
+        # Mapping a value clears any prior exclusion for it (mapped XOR excluded).
+        await DatabaseService.clear_excluded_platform_for_internal_values(
+            table_name=table_name,
+            internal_values=payload.internal_values,
+            platform_id=payload.platform_id,
+        )
         return SuccessResponse(message="Platform mapping updated successfully")
     except HTTPException:
         raise

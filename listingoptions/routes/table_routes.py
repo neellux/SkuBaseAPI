@@ -32,6 +32,11 @@ from tortoise import Tortoise
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/tables", tags=["tables"])
 
+# Transport sentinel: a platform mapping field set to this value means the user
+# explicitly excluded this brand/type from that platform (stored on the record's
+# excluded_platforms column), as opposed to leaving it blank (a skip).
+EXCLUDED_SENTINEL = "__EXCLUDED__"
+
 
 @router.post("/create", response_model=SuccessResponse)
 async def create_table(request: CreateTableRequest):
@@ -90,6 +95,21 @@ async def reorder_columns(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+@router.put("/update_settings", response_model=SuccessResponse)
+async def update_settings(
+    table_name: str = Query(..., description="Name of the table"),
+    allow_exclude: bool = Body(..., embed=True, description="Whether the Exclude control is shown"),
+):
+    try:
+        await DatabaseService.update_table_settings(table_name, allow_exclude=allow_exclude)
+        return SuccessResponse(message=f"Settings for table {table_name} updated successfully")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error updating settings: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
 @router.get("/list", response_model=List[TableSchema])
 async def list_tables():
     try:
@@ -102,6 +122,7 @@ async def list_tables():
                 column_schema=table.column_schema or [],
                 list_schema=table.list_schema or [],
                 list_type=table.list_type,
+                allow_exclude=bool(getattr(table, "allow_exclude", False)),
                 created_at=table.created_at,
                 updated_at=table.updated_at,
             )
@@ -283,7 +304,9 @@ async def get_table_schema(
             if not first_platform_field_name_for_grid:
                 first_platform_field_name_for_grid = field_name
 
-            required_fields.append(field_name)
+            # Platform mappings are intentionally optional: a blank field is a
+            # valid "skip" (no mapping), and exclusion is expressed separately
+            # via the Exclude checkbox. They are no longer required to save.
 
         for col in sorted_columns:
             if col["name"] == db_schema.primary_business_column:
@@ -397,6 +420,7 @@ async def get_table_schema(
             column_schema=sorted_columns,
             list_schema=db_schema.list_schema or [],
             list_type=db_schema.list_type,
+            allow_exclude=bool(getattr(db_schema, "allow_exclude", False)),
             json_schema=final_json_schema,
             ui_schema=final_ui_schema,
             created_at=db_schema.created_at,
@@ -467,27 +491,27 @@ async def create_record(
         expected_primary_business_column_in_key = table_schema.primary_business_column
 
         parsed_platform_mappings: Dict[str, str] = {}
+        excluded_platform_ids: set = set()
         main_record_data: Dict[str, Any] = {}
 
         for key, value in record.data.items():
             prefix = "platform_mapping_for_"
             suffix = f"_of_{expected_primary_business_column_in_key}"
-            if key.startswith(prefix) and key.endswith(suffix) and value is not None:
-                try:
-                    str_value = str(value).strip()
-                    if not str_value:
-                        main_record_data[key] = value
-                        continue
-
-                    parsed_platform_id = key[len(prefix) : -len(suffix)]
-                    if parsed_platform_id:
-                        parsed_platform_mappings[parsed_platform_id] = str_value
-                    else:
-                        main_record_data[key] = value
-                except Exception:
-                    main_record_data[key] = value
+            if key.startswith(prefix) and key.endswith(suffix):
+                parsed_platform_id = key[len(prefix) : -len(suffix)]
+                if not parsed_platform_id:
+                    continue
+                if value == EXCLUDED_SENTINEL:
+                    excluded_platform_ids.add(parsed_platform_id)
+                elif value is not None and str(value).strip():
+                    parsed_platform_mappings[parsed_platform_id] = str(value).strip()
+                # blank / None: a deliberate skip, neither a mapping nor an exclusion.
             else:
                 main_record_data[key] = value
+
+        # Persist exclusions on the record itself (hidden text_list column on tables
+        # that allow exclude). insert_record drops it for tables without the column.
+        main_record_data["excluded_platforms"] = sorted(excluded_platform_ids)
 
         all_platforms = await DatabaseService.get_all_platforms()
         all_platform_ids = {p.id for p in all_platforms}
@@ -690,26 +714,28 @@ async def update_record(
 
         expected_primary_business_column_in_key = table_schema.primary_business_column
         parsed_platform_mappings: Dict[str, str] = {}
+        excluded_platform_ids: set = set()
         main_record_data: Dict[str, Any] = {}
 
         for key, value in record.data.items():
             prefix = "platform_mapping_for_"
             suffix = f"_of_{expected_primary_business_column_in_key}"
-            if key.startswith(prefix) and key.endswith(suffix) and value is not None:
-                try:
-                    str_value = str(value).strip()
-                    if not str_value:
-                        continue
-
-                    parsed_platform_id = key[len(prefix) : -len(suffix)]
-                    if parsed_platform_id:
-                        parsed_platform_mappings[parsed_platform_id] = str_value
-                    else:
-                        main_record_data[key] = value
-                except Exception:
-                    main_record_data[key] = value
+            if key.startswith(prefix) and key.endswith(suffix):
+                parsed_platform_id = key[len(prefix) : -len(suffix)]
+                if not parsed_platform_id:
+                    continue
+                if value == EXCLUDED_SENTINEL:
+                    excluded_platform_ids.add(parsed_platform_id)
+                elif value is not None and str(value).strip():
+                    parsed_platform_mappings[parsed_platform_id] = str(value).strip()
+                # blank / None: a deliberate skip, neither a mapping nor an exclusion.
             else:
                 main_record_data[key] = value
+
+        # Full-replace the record's exclusions from the submitted form. Excluded
+        # platforms are intentionally left out of parsed_platform_mappings so the
+        # "fill missing with None" pass below unlinks any existing real mapping.
+        main_record_data["excluded_platforms"] = sorted(excluded_platform_ids)
 
         all_platforms = await DatabaseService.get_all_platforms()
         all_platform_ids = {p.id for p in all_platforms}

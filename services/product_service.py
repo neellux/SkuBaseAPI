@@ -16,11 +16,61 @@ from services.sellercloud_service import sellercloud_service
 
 logger = logging.getLogger(__name__)
 
+
+def format_mpn(mpn: str) -> str:
+    """Format the mpn for sku creation / comparison."""
+    # Replace non-word characters with underscores
+    mpn = re.sub(r"\W", "_", mpn)
+    # Remove leading or trailing underscores
+    mpn = re.sub(r"^_+|_+$", "", mpn)
+    # Replace multiple underscores with a single one
+    mpn = re.sub(r"_+", "_", mpn)
+    # Convert to uppercase
+    return mpn.upper()
+
+
 JOB_HANDLERS = {
     "TRANSFER_INVENTORY_SC": "_execute_transfer_job",
     "TRANSFER_UPCS_KEYWORDS_SC": "_execute_transfer_upcs_keywords_job",
     "DISABLE_PRODUCT_SC": "_execute_disable_job",
 }
+
+
+def _size_failures_from_errors(errors: Any) -> List[Dict[str, str]]:
+    """Flatten add_skus `errors` into per-size `{size, upc?, error}` items with
+    specific, human-readable messages (e.g. "UPC already in use — Already
+    assigned to SKU: X"), matching the `failures` shape used elsewhere.
+
+    add_skus errors come in two shapes: UPC-validation wrappers that carry a
+    `failed_skus` list, and per-sku errors that carry a `sku` directly.
+    """
+
+    def _size_of(sku: str) -> str:
+        sku = sku or ""
+        return sku.split("/")[-1] if "/" in sku else sku
+
+    out: List[Dict[str, str]] = []
+    for entry in errors or []:
+        if not isinstance(entry, dict):
+            out.append({"size": "", "error": str(entry)})
+            continue
+        failed = entry.get("failed_skus")
+        if failed:
+            for fs in failed:
+                msg = fs.get("error") or "Invalid UPC"
+                if fs.get("detail"):
+                    msg = f"{msg} — {fs['detail']}"
+                item = {"size": _size_of(fs.get("sku")), "error": msg}
+                if fs.get("upc"):
+                    item["upc"] = str(fs["upc"])
+                out.append(item)
+        elif entry.get("sku"):
+            out.append(
+                {"size": _size_of(entry.get("sku")), "error": entry.get("error", "Failed")}
+            )
+        else:
+            out.append({"size": "", "error": entry.get("error", "Failed")})
+    return out
 
 
 class ProductService:
@@ -465,11 +515,330 @@ class ProductService:
             }
 
     @staticmethod
+    async def bulk_add_sizes_to_parent(
+        parent_sku: str, sizes: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Add several sizes to an existing parent in one call.
+
+        Reuses the single-size add_size_to_parent path per row. A manual UPC is
+        passed through; blank/omitted UPCs are auto-assigned by the add_skus DB
+        function (advisory-locked, no client pre-fetch). SellerCloud creation is
+        inherently per-child, so a per-size failure is reported without aborting
+        the rest.
+        """
+        children: List[str] = []
+        failures: List[Dict[str, str]] = []
+
+        for sz in sizes:
+            size = str(sz.get("size", "")).strip()
+            if not size:
+                failures.append({"size": "", "error": "Size is required"})
+                continue
+            try:
+                result = await ProductService.add_size_to_parent(
+                    parent_sku=parent_sku,
+                    size=size,
+                    upc=sz.get("upc"),
+                    cost_price=float(sz.get("unit_price")),
+                )
+                if result.get("success"):
+                    children.append(result.get("new_child_sku") or f"{parent_sku}/{size}")
+                else:
+                    failures.append(
+                        {"size": size, "error": result.get("error", "Failed to add size")}
+                    )
+            except Exception as e:
+                logger.error(f"bulk_add_sizes: size '{size}' failed: {traceback.format_exc()}")
+                failures.append({"size": size, "error": str(e)})
+
+        return {
+            "success": len(children) > 0,
+            "parent_sku": parent_sku,
+            "children": children,
+            "failures": failures or None,
+        }
+
+    @staticmethod
+    async def check_brand_mpn(brand: str, mpn: str) -> Dict[str, Any]:
+        """Check whether an active parent already exists for this brand + mpn.
+
+        The mpn is normalized with format_mpn so that values like
+        '1201A906-0012' and '1201A906_0012' compare equal.
+        """
+        try:
+            conn = await ProductService._get_connection()
+            normalized = format_mpn(mpn or "")
+            rows = await conn.execute_query_dict(
+                "SELECT sku FROM parent_products "
+                "WHERE brand = $1 AND mpn = $2 AND is_active = TRUE LIMIT 1",
+                [brand, normalized],
+            )
+            if rows:
+                return {"success": True, "exists": True, "sku": rows[0]["sku"]}
+            return {"success": True, "exists": False, "sku": None}
+        except Exception:
+            logger.error(f"Error checking brand+mpn: {traceback.format_exc()}")
+            return {"success": False, "error": "Failed to check brand and MPN"}
+
+    @staticmethod
+    async def create_sku_with_sizes(
+        company_code: int,
+        brand: str,
+        brand_code: str,
+        mpn: str,
+        title: str,
+        product_type: str,
+        type_code: str,
+        sizing_scheme: str,
+        style_name: str,
+        brand_color: str,
+        color: str,
+        sizes: List[Dict[str, Any]],
+        retail_price: float = None,
+        country_of_origin: str = None,
+        season: str = None,
+    ) -> Dict[str, Any]:
+        """Create a brand new product (parent + child sizes).
+
+        Generates the parent SKU as {brand_code}-{type_code}-{serial}, creates a
+        full product per size on SellerCloud (unit price -> SiteCost, UPC from the
+        shared get_next_upc allocator), then writes the parent + children to the
+        local DB via add_skus. Attribute push to SellerCloud children (brand,
+        color, etc.) is done by the route via update_children_basic_info.
+        """
+        try:
+            conn = await ProductService._get_connection()
+
+            brand_code = (brand_code or "").strip().upper()
+            type_code = (type_code or "").strip().upper()
+            mpn_fmt = format_mpn(mpn or "")
+
+            if not brand_code or not type_code:
+                return {"success": False, "error": "brand_code and type_code are required"}
+            if not sizes:
+                return {"success": False, "error": "At least one size is required"}
+
+            # Guard: brand + mpn must be unique.
+            existing = await conn.execute_query_dict(
+                "SELECT sku FROM parent_products "
+                "WHERE brand = $1 AND mpn = $2 AND is_active = TRUE LIMIT 1",
+                [brand, mpn_fmt],
+            )
+            if existing:
+                return {
+                    "success": False,
+                    "error": f"A product already exists for {brand} + {mpn_fmt}: {existing[0]['sku']}",
+                }
+
+            # Next serial for this brand_code + type_code.
+            serial_row = await conn.execute_query_dict(
+                "SELECT COALESCE(MAX(serial_number), 0) + 1 AS next "
+                "FROM parent_products WHERE brand_code = $1 AND type_code = $2",
+                [brand_code, type_code],
+            )
+            serial = serial_row[0]["next"]
+            if serial > 9999:
+                return {
+                    "success": False,
+                    "error": f"Serial range exhausted for {brand_code}-{type_code}",
+                }
+            parent_sku = f"{brand_code}-{type_code}-{serial:04d}"
+
+            # 1) Write parent + children locally via add_skus FIRST. Omit the UPC
+            #    for auto rows so add_skus assigns one (advisory-locked) and pass a
+            #    manual UPC when the user entered one. add_skus is atomic and
+            #    returns assignments[sku].upc.
+            sku_data = {}
+            for sz in sizes:
+                size = str(sz["size"]).strip()
+                info = {
+                    "title": title,
+                    "brand": brand,
+                    "brand_code": brand_code,
+                    "type_code": type_code,
+                    "serial_number": serial,
+                    "product_type": product_type,
+                    "style_name": style_name,
+                    "sizing_scheme": sizing_scheme,
+                    "brand_color": brand_color,
+                    "color": color,
+                    "mpn": mpn_fmt,
+                }
+                manual_upc = re.sub(r"[^0-9]", "", str(sz.get("upc") or ""))
+                if manual_upc:
+                    info["upc"] = manual_upc
+                sku_data[f"{parent_sku}/{size}"] = info
+
+            db_result = await conn.execute_query_dict(
+                "SELECT add_skus($1::jsonb, $2) as result",
+                [orjson.dumps(sku_data).decode(), company_code],
+            )
+            result_data = db_result[0]["result"] if db_result else None
+            if isinstance(result_data, str):
+                result_data = orjson.loads(result_data)
+            if not result_data or not result_data.get("success"):
+                errors = (result_data or {}).get("errors", [])
+                logger.error(f"add_skus failed for {parent_sku}: {errors}")
+                return {
+                    "success": False,
+                    "parent_sku": parent_sku,
+                    "error": "Some sizes could not be added",
+                    "failures": _size_failures_from_errors(errors),
+                }
+            assignments = result_data.get("assignments", {})
+
+            # 2) Create each child on SellerCloud with the UPC add_skus assigned,
+            #    retrying up to 3x. Local rows persist; per-size failures are
+            #    aggregated (the caller lists them for re-sync).
+            async def _retry_sc(coro_func, task_name):
+                last_error = None
+                for attempt in range(1, 4):
+                    try:
+                        return await coro_func()
+                    except Exception as e:
+                        last_error = e
+                        logger.warning(f"{task_name} attempt {attempt}/3 failed: {e}")
+                        if attempt < 3:
+                            await asyncio.sleep(1 * (2 ** (attempt - 1)))
+                raise last_error
+
+            # SKU-level custom columns (same for every size). SIZE is added
+            # per-child below.
+            base_columns = []
+            if country_of_origin:
+                base_columns.append(
+                    {"ColumnName": "COUNTRY_OF_ORIGIN", "Value": country_of_origin}
+                )
+            if season:
+                base_columns.append({"ColumnName": "FASHION_SEASON", "Value": season})
+
+            # All children already exist locally (add_skus succeeded), so the
+            # product is created regardless of SellerCloud outcome.
+            all_children: List[str] = []
+            failures: List[Dict[str, str]] = []
+            for sz in sizes:
+                size = str(sz["size"]).strip()
+                unit_price = float(sz["unit_price"])
+                child_sku = f"{parent_sku}/{size}"
+                all_children.append(child_sku)
+                upc = (assignments.get(child_sku) or {}).get("upc")
+                try:
+                    await _retry_sc(
+                        lambda c=child_sku, s=size, p=unit_price, u=upc: sellercloud_service.create_product(
+                            product_sku=c,
+                            product_name=f"{title} SIZE {s}",
+                            company_id=company_code,
+                            site_cost=p,
+                            product_type_name=product_type,
+                            brand_name=brand,
+                            upc=u,
+                        ),
+                        f"create_product {child_sku}",
+                    )
+                except Exception:
+                    logger.error(
+                        f"Failed to create {child_sku} on SellerCloud after retries: {traceback.format_exc()}"
+                    )
+                    failures.append({"size": size, "error": "Failed to create on SellerCloud"})
+                    continue
+
+                # Custom columns: SIZE + SKU-level COUNTRY_OF_ORIGIN / FASHION_SEASON
+                # (non-fatal, retried).
+                columns = [{"ColumnName": "SIZE", "Value": size}] + base_columns
+                try:
+                    await _retry_sc(
+                        lambda c=child_sku, cols=columns: sellercloud_service._make_request(
+                            "PUT",
+                            "/Products/CustomColumns",
+                            data={"ProductID": c, "CustomColumns": cols},
+                        ),
+                        f"custom_columns {child_sku}",
+                    )
+                except Exception as e:
+                    logger.warning(f"Non-fatal: failed custom columns for {child_sku}: {e}")
+
+                # Retail price -> SellerCloud ListPrice (non-fatal, retried).
+                if retail_price is not None:
+                    try:
+                        await _retry_sc(
+                            lambda c=child_sku: sellercloud_service._make_request(
+                                "PUT",
+                                "/Catalog/AdvancedInfo",
+                                data={
+                                    "ProductID": c,
+                                    "Fields": [
+                                        {"Name": "ListPrice", "Value": retail_price}
+                                    ],
+                                },
+                            ),
+                            f"list_price {child_sku}",
+                        )
+                    except Exception as e:
+                        logger.warning(f"Non-fatal: failed ListPrice for {child_sku}: {e}")
+
+            logger.info(
+                f"Created new product {parent_sku}: {len(all_children) - len(failures)} on "
+                f"SellerCloud, {len(failures)} failed"
+            )
+            return {
+                "success": True,
+                "parent_sku": parent_sku,
+                "children": all_children,
+                "failures": failures or None,
+            }
+
+        except Exception:
+            logger.error(f"Error creating SKU: {traceback.format_exc()}")
+            return {"success": False, "error": "Internal server error"}
+
+    @staticmethod
+    async def get_cost_price(parent_sku: str) -> Dict[str, Any]:
+        """Return the cost price (SellerCloud SiteCost) used to prepopulate the
+        Add Size dialog.
+
+        Mirrors add_size_to_parent / add_placeholder_size_to_parent by reading
+        the parent's primary active child as the template and returning its
+        SiteCost. Returns cost_price=None (still success) when there is no active
+        child to read a cost from.
+        """
+        try:
+            conn = await ProductService._get_connection()
+            template_result = await conn.execute_query_dict(
+                "SELECT sku FROM child_products "
+                "WHERE parent_sku = $1 AND is_active = TRUE "
+                "ORDER BY is_primary DESC LIMIT 1",
+                [parent_sku],
+            )
+            if not template_result:
+                return {"success": True, "cost_price": None}
+
+            template_child_sku = template_result[0]["sku"]
+            template_data = await sellercloud_service.get_product_by_id(
+                template_child_sku, only_required_fields=False
+            )
+            if not template_data:
+                return {"success": True, "cost_price": None}
+
+            site_cost = template_data.get("SiteCost")
+            try:
+                cost_price = (
+                    float(site_cost) if site_cost not in (None, "") else None
+                )
+            except (TypeError, ValueError):
+                cost_price = None
+            return {"success": True, "cost_price": cost_price}
+        except Exception:
+            logger.error(
+                f"Error fetching cost price for {parent_sku}: {traceback.format_exc()}"
+            )
+            return {"success": False, "error": "Failed to fetch cost price"}
+
+    @staticmethod
     async def add_size_to_parent(
         parent_sku: str,
         size: str,
-        upc: str,
-        cost_price: float,
+        upc: Optional[str] = None,
+        cost_price: float = None,
     ) -> Dict[str, Any]:
 
         async def _retry_async(coro_func, *args, max_retries=3, delay=1, task_name="task"):
@@ -513,16 +882,6 @@ class ProductService:
                     "error": f"Child SKU '{new_child_sku}' already exists ({status})",
                 }
 
-            existing_upc = await conn.execute_query_dict(
-                "SELECT child_sku FROM child_upcs WHERE upc = $1",
-                [upc],
-            )
-            if existing_upc:
-                return {
-                    "success": False,
-                    "error": f"UPC '{upc}' is already assigned to '{existing_upc[0]['child_sku']}'",
-                }
-
             template_result = await conn.execute_query_dict(
                 "SELECT sku FROM child_products "
                 "WHERE parent_sku = $1 AND is_active = TRUE "
@@ -551,22 +910,90 @@ class ProductService:
             product_type_name = template_data.get("ProductType", "")
             brand_name = template_data.get("BrandName", parent.get("brand", ""))
 
+            # 1) Write the child locally via add_skus FIRST: it copies the
+            #    parent's attributes, assigns the UPC (omit for auto; pass a manual
+            #    UPC when provided), validates it, and returns the assigned UPC.
+            sku_data = {new_child_sku: {"title": parent["title"]}}
+            for field in (
+                "mpn",
+                "brand",
+                "brand_code",
+                "type_code",
+                "product_type",
+                "style_name",
+                "sizing_scheme",
+                "brand_color",
+                "color",
+            ):
+                if parent.get(field):
+                    sku_data[new_child_sku][field] = parent[field]
+            if parent.get("serial_number") is not None:
+                sku_data[new_child_sku]["serial_number"] = parent["serial_number"]
+            manual_upc = re.sub(r"[^0-9]", "", str(upc or ""))
+            if manual_upc:
+                sku_data[new_child_sku]["upc"] = manual_upc
+
             try:
-                await sellercloud_service.create_product(
-                    product_sku=new_child_sku,
-                    product_name=product_name,
-                    company_id=parent["company_code"],
-                    site_cost=cost_price,
-                    product_type_name=product_type_name,
-                    brand_name=brand_name,
-                    upc=upc,
+                db_result = await conn.execute_query_dict(
+                    "SELECT add_skus($1::jsonb, $2) as result",
+                    [orjson.dumps(sku_data).decode(), parent["company_code"]],
+                )
+                result_data = db_result[0]["result"] if db_result else None
+                if isinstance(result_data, str):
+                    result_data = orjson.loads(result_data)
+                if not result_data or not result_data.get("success"):
+                    errors = (result_data or {}).get("errors", [])
+                    logger.error(f"add_skus failed for {new_child_sku}: {errors}")
+                    size_failures = _size_failures_from_errors(errors)
+                    return {
+                        "success": False,
+                        "new_child_sku": new_child_sku,
+                        "error": (
+                            size_failures[0]["error"]
+                            if size_failures
+                            else "Failed to add size"
+                        ),
+                    }
+            except Exception:
+                logger.error(f"Failed to add {new_child_sku} to local DB: {traceback.format_exc()}")
+                return {
+                    "success": False,
+                    "new_child_sku": new_child_sku,
+                    "error": "Internal server error",
+                }
+
+            assigned_upc = (
+                result_data.get("assignments", {}).get(new_child_sku) or {}
+            ).get("upc")
+
+            # 2) Create on SellerCloud with the UPC add_skus assigned, retrying up
+            #    to 3x. The local row persists; a failure is reported for re-sync.
+            try:
+                await _retry_async(
+                    lambda: sellercloud_service.create_product(
+                        product_sku=new_child_sku,
+                        product_name=product_name,
+                        company_id=parent["company_code"],
+                        site_cost=cost_price,
+                        product_type_name=product_type_name,
+                        brand_name=brand_name,
+                        upc=assigned_upc,
+                    ),
+                    max_retries=3,
+                    delay=1,
+                    task_name="create_product",
                 )
                 logger.info(f"Created product {new_child_sku} on SellerCloud")
-            except Exception as e:
+            except Exception:
                 logger.error(
-                    f"Failed to create product {new_child_sku} on SellerCloud: {traceback.format_exc()}"
+                    f"Failed to create product {new_child_sku} on SellerCloud after retries: {traceback.format_exc()}"
                 )
-                return {"success": False, "error": "Failed to create product on SellerCloud"}
+                return {
+                    "success": False,
+                    "local_created": True,
+                    "new_child_sku": new_child_sku,
+                    "error": "Failed to create product on SellerCloud",
+                }
 
             async def update_advanced_info():
                 fields = [{"Name": "ProductName", "Value": product_name}]
@@ -613,56 +1040,6 @@ class ProductService:
                     logger.warning(
                         f"Non-fatal: {task_names[i]} failed for {new_child_sku}: {result}"
                     )
-
-            sku_data = {
-                new_child_sku: {
-                    "title": parent["title"],
-                    "upc": upc,
-                }
-            }
-            for field in (
-                "mpn",
-                "brand",
-                "brand_code",
-                "type_code",
-                "product_type",
-                "style_name",
-                "sizing_scheme",
-                "brand_color",
-                "color",
-            ):
-                if parent.get(field):
-                    sku_data[new_child_sku][field] = parent[field]
-            if parent.get("serial_number") is not None:
-                sku_data[new_child_sku]["serial_number"] = parent["serial_number"]
-
-            try:
-                db_result = await conn.execute_query_dict(
-                    "SELECT add_skus($1::jsonb, $2) as result",
-                    [orjson.dumps(sku_data).decode(), parent["company_code"]],
-                )
-
-                if db_result and db_result[0].get("result"):
-                    result_data = db_result[0]["result"]
-                    if isinstance(result_data, str):
-                        result_data = orjson.loads(result_data)
-                    if not result_data.get("success"):
-                        errors = result_data.get("errors", [])
-                        logger.error(f"add_skus failed for {new_child_sku}: {errors}")
-                        return {
-                            "success": False,
-                            "sellercloud_created": True,
-                            "new_child_sku": new_child_sku,
-                            "error": "Failed to add size",
-                        }
-            except Exception as e:
-                logger.error(f"Failed to add {new_child_sku} to local DB: {traceback.format_exc()}")
-                return {
-                    "success": False,
-                    "sellercloud_created": True,
-                    "new_child_sku": new_child_sku,
-                    "error": "Internal server error",
-                }
 
             return {
                 "success": True,
@@ -722,23 +1099,6 @@ class ProductService:
                     "error": f"Child SKU '{new_child_sku}' already exists ({status})",
                 }
 
-            upc_result = await conn.execute_query_dict(
-                "SELECT COALESCE(MAX(CAST(LEFT(upc, 12) AS BIGINT)), 777770000000) as max_base FROM child_upcs WHERE upc LIKE '77777%'"
-            )
-            next_base = upc_result[0]["max_base"] + 1
-            base_str = str(next_base).zfill(12)
-
-            digits = [int(d) for d in base_str]
-            checksum = sum(digits[i] * (1 if i % 2 == 0 else 3) for i in range(12))
-            check_digit = (10 - checksum % 10) % 10
-            next_upc = base_str + str(check_digit)
-
-            collision = await conn.execute_query_dict(
-                "SELECT 1 FROM child_upcs WHERE upc = $1", [next_upc]
-            )
-            if collision:
-                return {"success": False, "error": "UPC collision — please retry"}
-
             template_result = await conn.execute_query_dict(
                 "SELECT sku FROM child_products "
                 "WHERE parent_sku = $1 AND is_active = TRUE "
@@ -768,24 +1128,89 @@ class ProductService:
             brand_name = template_data.get("BrandName", parent.get("brand", ""))
             site_cost = template_data.get("SiteCost", 0.0)
 
+            # 1) add_skus first: copies parent attributes, auto-assigns the UPC,
+            #    returns it.
+            sku_data = {new_child_sku: {"title": parent["title"]}}
+            for field in (
+                "mpn",
+                "brand",
+                "brand_code",
+                "type_code",
+                "product_type",
+                "style_name",
+                "sizing_scheme",
+                "brand_color",
+                "color",
+            ):
+                if parent.get(field):
+                    sku_data[new_child_sku][field] = parent[field]
+            if parent.get("serial_number") is not None:
+                sku_data[new_child_sku]["serial_number"] = parent["serial_number"]
+
             try:
-                await sellercloud_service.create_product(
-                    product_sku=new_child_sku,
-                    product_name=product_name,
-                    company_id=parent["company_code"],
-                    site_cost=site_cost,
-                    product_type_name=product_type_name,
-                    brand_name=brand_name,
-                    upc=next_upc,
+                db_result = await conn.execute_query_dict(
+                    "SELECT add_skus($1::jsonb, $2) as result",
+                    [orjson.dumps(sku_data).decode(), parent["company_code"]],
+                )
+                result_data = db_result[0]["result"] if db_result else None
+                if isinstance(result_data, str):
+                    result_data = orjson.loads(result_data)
+                if not result_data or not result_data.get("success"):
+                    errors = (result_data or {}).get("errors", [])
+                    logger.error(f"add_skus failed for placeholder {new_child_sku}: {errors}")
+                    size_failures = _size_failures_from_errors(errors)
+                    return {
+                        "success": False,
+                        "new_child_sku": new_child_sku,
+                        "error": (
+                            size_failures[0]["error"]
+                            if size_failures
+                            else "Failed to add size"
+                        ),
+                    }
+            except Exception:
+                logger.error(
+                    f"Failed to add placeholder {new_child_sku} to local DB: {traceback.format_exc()}"
+                )
+                return {
+                    "success": False,
+                    "new_child_sku": new_child_sku,
+                    "error": "Internal server error",
+                }
+
+            next_upc = (
+                result_data.get("assignments", {}).get(new_child_sku) or {}
+            ).get("upc")
+
+            # 2) Create on SellerCloud with the assigned UPC, retrying up to 3x.
+            try:
+                await _retry_async(
+                    lambda: sellercloud_service.create_product(
+                        product_sku=new_child_sku,
+                        product_name=product_name,
+                        company_id=parent["company_code"],
+                        site_cost=site_cost,
+                        product_type_name=product_type_name,
+                        brand_name=brand_name,
+                        upc=next_upc,
+                    ),
+                    max_retries=3,
+                    delay=1,
+                    task_name="create_product",
                 )
                 logger.info(
                     f"Created placeholder product {new_child_sku} on SellerCloud with UPC {next_upc}"
                 )
-            except Exception as e:
+            except Exception:
                 logger.error(
-                    f"Failed to create placeholder {new_child_sku} on SellerCloud: {traceback.format_exc()}"
+                    f"Failed to create placeholder {new_child_sku} on SellerCloud after retries: {traceback.format_exc()}"
                 )
-                return {"success": False, "error": "Failed to create product on SellerCloud"}
+                return {
+                    "success": False,
+                    "local_created": True,
+                    "new_child_sku": new_child_sku,
+                    "error": "Failed to create product on SellerCloud",
+                }
 
             async def update_advanced_info():
                 fields = [{"Name": "ProductName", "Value": product_name}]
@@ -832,58 +1257,6 @@ class ProductService:
                     logger.warning(
                         f"Non-fatal: {task_names[i]} failed for {new_child_sku}: {result}"
                     )
-
-            sku_data = {
-                new_child_sku: {
-                    "title": parent["title"],
-                    "upc": next_upc,
-                }
-            }
-            for field in (
-                "mpn",
-                "brand",
-                "brand_code",
-                "type_code",
-                "product_type",
-                "style_name",
-                "sizing_scheme",
-                "brand_color",
-                "color",
-            ):
-                if parent.get(field):
-                    sku_data[new_child_sku][field] = parent[field]
-            if parent.get("serial_number") is not None:
-                sku_data[new_child_sku]["serial_number"] = parent["serial_number"]
-
-            try:
-                db_result = await conn.execute_query_dict(
-                    "SELECT add_skus($1::jsonb, $2) as result",
-                    [orjson.dumps(sku_data).decode(), parent["company_code"]],
-                )
-
-                if db_result and db_result[0].get("result"):
-                    result_data = db_result[0]["result"]
-                    if isinstance(result_data, str):
-                        result_data = orjson.loads(result_data)
-                    if not result_data.get("success"):
-                        errors = result_data.get("errors", [])
-                        logger.error(f"add_skus failed for placeholder {new_child_sku}: {errors}")
-                        return {
-                            "success": False,
-                            "sellercloud_created": True,
-                            "new_child_sku": new_child_sku,
-                            "error": "Failed to add size",
-                        }
-            except Exception as e:
-                logger.error(
-                    f"Failed to add placeholder {new_child_sku} to local DB: {traceback.format_exc()}"
-                )
-                return {
-                    "success": False,
-                    "sellercloud_created": True,
-                    "new_child_sku": new_child_sku,
-                    "error": "Internal server error",
-                }
 
             logger.info(f"Created placeholder child {new_child_sku} with UPC {next_upc}")
             return {

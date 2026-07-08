@@ -592,6 +592,12 @@ class ImportSummary(BaseModel):
     import_id: int = Field(..., description="Platform-side import id (e.g. SPO product_import_id)")
     platform_id: str = Field(..., description="Platform identifier this import belongs to")
     submission_count: int = Field(..., description="Number of ListingSubmissions in this import")
+    sku_count: int = Field(
+        0, description="Total SKU/product rows across this import's listings"
+    )
+    file_name: Optional[str] = Field(
+        None, description="Uploaded SPO product file name (spo_products_*.xlsx)"
+    )
     status_counts: Dict[str, int] = Field(
         default_factory=dict, description="Count of submissions per status"
     )
@@ -716,6 +722,131 @@ class AddSizeResponse(BaseModel):
     new_child_sku: Optional[str] = None
     parent_sku: Optional[str] = None
     size: Optional[str] = None
+    error: Optional[str] = None
+
+
+class NextUpcResponse(BaseModel):
+
+    success: bool
+    upc: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CostPriceResponse(BaseModel):
+
+    success: bool
+    cost_price: Optional[float] = None
+    error: Optional[str] = None
+
+
+class CheckBrandMpnResponse(BaseModel):
+
+    success: bool
+    exists: bool = False
+    sku: Optional[str] = None
+    error: Optional[str] = None
+
+
+class CountriesResponse(BaseModel):
+
+    success: bool
+    countries: List[str] = []
+    error: Optional[str] = None
+
+
+class CreateSkuSize(BaseModel):
+
+    size: str = Field(..., min_length=1, description="Size value")
+    unit_price: float = Field(..., gt=0, description="Unit cost (SiteCost)")
+    upc: Optional[str] = Field(
+        None, description="Manual UPC (12-13 digits); blank/omitted means auto-generate"
+    )
+
+    @validator("upc")
+    def validate_upc(cls, v):
+        if v is None:
+            return v
+        digits = re.sub(r"[^0-9]", "", v)
+        if digits == "":
+            return None
+        if not re.fullmatch(r"\d{12,13}", digits):
+            raise ValueError("UPC must be 12 or 13 digits")
+        # GS1 mod-10 check digit (payload weighted 3,1,... from the right).
+        total = sum(
+            int(ch) * (3 if (len(digits) - 1 - i) % 2 == 1 else 1)
+            for i, ch in enumerate(digits[:-1])
+        )
+        if (10 - (total % 10)) % 10 != int(digits[-1]):
+            raise ValueError("Invalid UPC check digit")
+        return digits
+
+
+class CreateSkuRequest(BaseModel):
+
+    company_code: int = Field(..., description="Company code")
+    brand: str = Field(..., min_length=1, description="Brand name")
+    brand_code: str = Field(..., min_length=1, max_length=10, description="Brand code")
+    mpn: str = Field(..., min_length=1, description="Manufacturer Part Number")
+    title: str = Field(..., min_length=1, description="Product title")
+    product_type: str = Field(..., min_length=1, description="Product type")
+    type_code: str = Field(..., min_length=1, max_length=10, description="Type code")
+    sizing_scheme: str = Field(..., min_length=1, description="Sizing scheme")
+    style_name: str = Field(..., min_length=1, description="Style name")
+    brand_color: str = Field(..., min_length=1, description="Brand color")
+    color: str = Field(..., min_length=1, description="Standard color")
+    retail_price: float = Field(..., gt=0, description="Retail price (SellerCloud ListPrice)")
+    country_of_origin: str = Field(
+        ..., min_length=1, description="Country of origin (SC COUNTRY_OF_ORIGIN column)"
+    )
+    season: Optional[str] = Field(
+        None, description="Season (SC FASHION_SEASON column); upper-cased, max 10 chars"
+    )
+    sizes: List[CreateSkuSize] = Field(..., min_items=1, description="Sizes with unit price")
+
+    @validator("season")
+    def validate_season(cls, v):
+        if v is None:
+            return None
+        v = v.strip().upper()
+        return v[:10] or None
+
+
+class CreateSkuResponse(BaseModel):
+
+    success: bool
+    parent_sku: Optional[str] = None
+    children: Optional[List[str]] = None
+    failures: Optional[List[Dict[str, str]]] = None
+    sellercloud_warning: Optional[str] = None
+    error: Optional[str] = None
+
+
+class BulkAddSizesRequest(BaseModel):
+
+    parent_sku: str = Field(..., description="Parent product SKU (must not contain '/')")
+    sizes: List[CreateSkuSize] = Field(
+        ..., min_items=1, description="Sizes with unit price and optional UPC (blank = auto)"
+    )
+
+    @validator("parent_sku")
+    def validate_parent_sku(cls, v):
+        if "/" in v:
+            raise ValueError("Parent SKU must not contain '/'")
+        return v
+
+
+class BulkAddSizeFailure(BaseModel):
+
+    size: str
+    error: str
+
+
+class BulkAddSizesResponse(BaseModel):
+
+    success: bool
+    parent_sku: Optional[str] = None
+    children: Optional[List[str]] = None
+    failures: Optional[List[BulkAddSizeFailure]] = None
     error: Optional[str] = None
 
 

@@ -247,6 +247,7 @@ class TableSchema(BaseModel):
     column_schema: List[ColumnDefinition]
     list_schema: List[ListSchemaDefinition]
     list_type: str
+    allow_exclude: bool = False
     json_schema: Optional[Dict[str, Any]] = Field(None, description="JSON schema for RJSF")
     ui_schema: Optional[Dict[str, Any]] = Field(None, description="UI schema for RJSF")
     created_at: datetime
@@ -357,6 +358,7 @@ class TableSchemaResponse(BaseModel):
     column_schema: List[ColumnDefinition]
     list_schema: List[ListSchemaDefinition]
     list_type: str
+    allow_exclude: bool = False
     json_schema: Optional[Dict[str, Any]] = Field(None, description="JSON schema for RJSF")
     ui_schema: Optional[Dict[str, Any]] = Field(None, description="UI schema for RJSF")
     created_at: datetime

@@ -535,7 +535,7 @@ class SellerCloudService:
         upc: str,
     ) -> Dict[str, Any]:
         payload = {
-            "CompanyId": 182,
+            "CompanyId": company_id,
             "ProductName": product_name,
             "ProductSKU": product_sku,
             "ProductTypeName": product_type_name,

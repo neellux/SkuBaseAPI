@@ -47,6 +47,7 @@ class Schema(Model):
     display_name = fields.CharField(max_length=255, null=True)
     primary_business_column = fields.CharField(max_length=255, null=True)
     list_type = fields.CharField(max_length=50, default="default")
+    allow_exclude = fields.BooleanField(default=False)
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 

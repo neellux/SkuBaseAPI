@@ -222,6 +222,9 @@ class SpoPoller(BasePoller):
                     # When this batch was actually uploaded to SPO; the
                     # submissions dashboard shows it as the import's created time.
                     "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    # The exact file name sent to SPO, so the dashboard can be
+                    # matched against the SPO-side import list.
+                    "file_name": os.path.basename(xlsx_path),
                 },
                 platform_status="products_processing",
             )

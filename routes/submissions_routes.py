@@ -89,8 +89,31 @@ async def _pending_counts_by_platform() -> dict[str, int]:
     return {row["platform_id"]: row["n"] for row in rows}
 
 
+async def _sku_counts_by_import(platform_id: str) -> dict[int, int]:
+    """Total SKU/product rows per import for a platform.
+
+    A listing's SKUs are the keys of data.child_size_overrides; the import's SKU
+    total is the sum across its listings, which equals the row count written to
+    the SPO product file. One grouped SQL query keeps this off the Python path.
+    """
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(
+        "SELECT (ls.platform_meta->>'product_import_id')::int AS import_id, "
+        "COALESCE(SUM(k.n), 0) AS n "
+        "FROM listing_submissions ls JOIN listings l ON l.id = ls.listing_id "
+        "CROSS JOIN LATERAL (SELECT count(*) AS n FROM jsonb_object_keys("
+        "  CASE WHEN jsonb_typeof(l.data->'child_size_overrides') = 'object' "
+        "       THEN l.data->'child_size_overrides' ELSE '{}'::jsonb END)) k "
+        "WHERE ls.platform_id = $1 AND ls.platform_meta ? 'product_import_id' "
+        "GROUP BY 1",
+        [platform_id],
+    )
+    return {row["import_id"]: row["n"] for row in rows}
+
+
 async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
     submissions = await ListingSubmission.filter(platform_id=platform_id).all()
+    sku_counts = await _sku_counts_by_import(platform_id)
 
     pending = processing = failed = success = 0
     grouped: dict[int, list[ListingSubmission]] = defaultdict(list)
@@ -121,25 +144,39 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         # Imports that predate that field fall back to the oldest submission's
         # created_at, which can be days earlier than the real upload.
         uploaded_ats = []
+        stored_file_name = None
         for s in group:
-            raw = (s.platform_meta or {}).get("uploaded_at")
+            meta = s.platform_meta or {}
+            raw = meta.get("uploaded_at")
             if raw:
                 try:
                     uploaded_ats.append(datetime.fromisoformat(raw))
                 except (TypeError, ValueError):
                     pass
+            if not stored_file_name and meta.get("file_name"):
+                stored_file_name = meta["file_name"]
+
+        created_at = (
+            min(uploaded_ats)
+            if uploaded_ats
+            else min((s.created_at for s in group), default=None)
+        )
+
+        # Prefer the persisted file name; older imports predate that field, so
+        # reconstruct the same spo_products_<timestamp>.xlsx name from created_at.
+        file_name = stored_file_name
+        if not file_name and created_at is not None:
+            file_name = f"spo_products_{created_at.strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         imports.append(
             ImportSummary(
                 import_id=import_id,
                 platform_id=platform_id,
                 submission_count=len(group),
+                sku_count=sku_counts.get(import_id, 0),
+                file_name=file_name,
                 status_counts=dict(status_counts),
-                created_at=(
-                    min(uploaded_ats)
-                    if uploaded_ats
-                    else min((s.created_at for s in group), default=None)
-                ),
+                created_at=created_at,
                 updated_at=max((s.updated_at for s in group), default=None),
             )
         )

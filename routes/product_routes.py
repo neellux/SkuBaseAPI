@@ -10,6 +10,13 @@ from models.api_models import (
     AddProductResponse,
     AddSizeRequest,
     AddSizeResponse,
+    CostPriceResponse,
+    CheckBrandMpnResponse,
+    CountriesResponse,
+    CreateSkuRequest,
+    CreateSkuResponse,
+    BulkAddSizesRequest,
+    BulkAddSizesResponse,
     ReassignAddSizeRequest,
     ReassignAddSizeResponse,
     UpdateParentProductRequest,
@@ -38,11 +45,17 @@ from models.api_models import (
 )
 from services.product_service import ProductService
 from services.sellercloud_service import sellercloud_service
+from services.grailed_service import COUNTRY_CODE_MAP
 from services import alias_bulk_import_job_service
 from config import config
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products", tags=["products"])
+
+
+@router.get("/countries", response_model=CountriesResponse)
+async def get_countries():
+    return CountriesResponse(success=True, countries=sorted(COUNTRY_CODE_MAP.keys()))
 
 
 @router.post("", response_model=AddProductResponse)
@@ -84,6 +97,15 @@ async def add_size_to_parent(request: AddSizeRequest):
         )
 
         if not result.get("success"):
+            if result.get("error_code") == "upc_conflict":
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "upc_conflict",
+                        "conflicting_sku": result.get("conflicting_sku"),
+                        "message": result.get("error"),
+                    },
+                )
             status_code = 500 if result.get("sellercloud_created") else 400
             raise HTTPException(
                 status_code=status_code, detail=result.get("error", "Failed to add size")
@@ -95,6 +117,137 @@ async def add_size_to_parent(request: AddSizeRequest):
         raise
     except Exception as e:
         logger.error(f"Error adding size: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/bulk_add_sizes", response_model=BulkAddSizesResponse)
+async def bulk_add_sizes(request: BulkAddSizesRequest):
+    try:
+        result = await ProductService.bulk_add_sizes_to_parent(
+            parent_sku=request.parent_sku,
+            sizes=[s.dict() for s in request.sizes],
+        )
+        # Per-size failures (e.g. UPC already in use) are returned in the body so
+        # the dialog can show them inline; only raise for the no-detail case.
+        if not result.get("success") and not result.get("failures"):
+            raise HTTPException(
+                status_code=400, detail=result.get("error", "Failed to add sizes")
+            )
+        return BulkAddSizesResponse(**result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error bulk-adding sizes: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/cost_price", response_model=CostPriceResponse)
+async def get_cost_price(parent_sku: str = Query(..., description="Parent product SKU")):
+    try:
+        result = await ProductService.get_cost_price(parent_sku)
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=400, detail=result.get("error", "Failed to fetch cost price")
+            )
+        return CostPriceResponse(**result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching cost price: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/check_brand_mpn", response_model=CheckBrandMpnResponse)
+async def check_brand_mpn(
+    brand: str = Query(..., description="Brand name"),
+    mpn: str = Query(..., description="Manufacturer Part Number"),
+):
+    try:
+        result = await ProductService.check_brand_mpn(brand, mpn)
+        if not result.get("success"):
+            raise HTTPException(
+                status_code=400,
+                detail=result.get("error", "Failed to check brand and MPN"),
+            )
+        return CheckBrandMpnResponse(**result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error checking brand+mpn: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/create_sku", response_model=CreateSkuResponse)
+async def create_sku(request: CreateSkuRequest):
+    try:
+        result = await ProductService.create_sku_with_sizes(
+            company_code=request.company_code,
+            brand=request.brand,
+            brand_code=request.brand_code,
+            mpn=request.mpn,
+            title=request.title,
+            product_type=request.product_type,
+            type_code=request.type_code,
+            sizing_scheme=request.sizing_scheme,
+            style_name=request.style_name,
+            brand_color=request.brand_color,
+            color=request.color,
+            retail_price=request.retail_price,
+            country_of_origin=request.country_of_origin,
+            season=request.season,
+            sizes=[s.dict() for s in request.sizes],
+        )
+
+        if not result.get("success"):
+            # Validation failures (e.g. UPC already in use) are returned in the
+            # body so the dialog can show them per-size on Step 3. Only raise for
+            # the no-detail / internal case.
+            if result.get("failures"):
+                return CreateSkuResponse(**result)
+            raise HTTPException(
+                status_code=400, detail=result.get("error", "Failed to create SKU")
+            )
+
+        # Push the parent attributes to the new SellerCloud children, mirroring
+        # update_product_info. Best-effort: a failure here is a warning, not an error.
+        parent_sku = result["parent_sku"]
+        changes = {
+            "title": request.title,
+            "product_type": request.product_type,
+            "sizing_scheme": request.sizing_scheme,
+            "style_name": request.style_name,
+            "brand_color": request.brand_color,
+            "color": request.color,
+            "mpn": request.mpn,
+            "brand": request.brand,
+        }
+        try:
+            template = await Template.get_or_none(id="default")
+            field_defs = template.field_definitions if template else []
+            sync_result = await sellercloud_service.update_children_basic_info(
+                parent_sku=parent_sku,
+                changes=changes,
+                field_definitions=field_defs,
+            )
+            if not sync_result.get("success"):
+                failed = sync_result.get("failed", [])
+                result["sellercloud_warning"] = (
+                    f"Created; SellerCloud attribute sync failed for "
+                    f"{len(failed)} child product(s)."
+                )
+        except Exception as e:
+            logger.error(f"SellerCloud sync failed for {parent_sku}: {e}", exc_info=True)
+            result["sellercloud_warning"] = "Created; SellerCloud attribute sync failed."
+
+        return CreateSkuResponse(**result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating SKU: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -238,8 +391,14 @@ async def reassign_child_parent(request: ReassignChildRequest):
 async def get_product_types():
     try:
         conn = Tortoise.get_connection("default")
-        result = await conn.execute_query_dict("SELECT type FROM listingoptions_types")
-        return {"product_types": [r["type"] for r in result]}
+        result = await conn.execute_query_dict(
+            "SELECT type, sku_acronym FROM listingoptions_types ORDER BY type"
+        )
+        return {
+            "product_types": [
+                {"type": r["type"], "sku_acronym": r["sku_acronym"]} for r in result
+            ]
+        }
     except Exception as e:
         logger.error(f"Error fetching product types: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -260,8 +419,14 @@ async def get_colors():
 async def get_brands():
     try:
         conn = Tortoise.get_connection("default")
-        result = await conn.execute_query_dict("SELECT brand FROM listingoptions_brands")
-        return {"brands": [r["brand"] for r in result]}
+        result = await conn.execute_query_dict(
+            "SELECT brand, sku_code FROM listingoptions_brands ORDER BY brand"
+        )
+        return {
+            "brands": [
+                {"brand": r["brand"], "sku_code": r["sku_code"]} for r in result
+            ]
+        }
     except Exception as e:
         logger.error(f"Error fetching brands: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
