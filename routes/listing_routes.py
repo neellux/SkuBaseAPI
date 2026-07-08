@@ -260,8 +260,27 @@ async def get_submission_status(
 
     submissions = await ListingSubmission.filter(listing=listing_model).all()
 
+    # Platforms this listing's type/color/brand is excluded from are not part of
+    # the listing at all, so they must not count toward its status (e.g. a
+    # platform that failed and was later excluded must not keep the listing
+    # "failed"). Drop their rows here so every consumer of this endpoint - the
+    # overall-status rollup, the batch badges, the retry label - ignores them.
+    form_data = listing_model.data or {}
+    excluded_platforms: set = set()
+    for table, column, value in (
+        ("types", "type", form_data.get("product_type")),
+        ("colors", "color", form_data.get("standard_color")),
+        ("brands", "brand", form_data.get("brand_name")),
+    ):
+        if value:
+            excluded_platforms |= await listing_options_service.get_excluded_platforms(
+                table, column, value
+            )
+
     platforms = {}
     for sub in submissions:
+        if sub.platform_id in excluded_platforms:
+            continue
         if (
             sub.platform_id not in platforms
             or sub.attempt_number > platforms[sub.platform_id].attempt_number
@@ -295,6 +314,7 @@ async def get_mapping_status(
     listing_id: str = Query(..., description="Listing ID"),
     product_type: str = Query(None, description="Override product_type (unsaved form value)"),
     color: str = Query(None, description="Override standard_color (unsaved form value)"),
+    brand: str = Query(None, description="Override brand (unsaved form value)"),
 ):
     listing = await ListingService.get_listing_by_id(listing_id)
     if not listing:
@@ -314,9 +334,11 @@ async def get_mapping_status(
         product_type = form_data.get("product_type")
     if color is None:
         color = form_data.get("standard_color")
+    if brand is None:
+        brand = form_data.get("brand_name")
 
     status = await listing_options_service.get_mapping_status(
-        product_type, color, non_sc_platforms, platform_settings
+        product_type, color, non_sc_platforms, platform_settings, brand=brand
     )
     return {
         "product_type": product_type,
@@ -443,12 +465,45 @@ async def submit_listing(
             },
         )
 
+    # Mapping gates run in a fixed order so the front end resolves them one
+    # category at a time (each resubmit surfaces the next): types -> sizes ->
+    # colors. A type explicitly excluded from a platform means the item is not
+    # listed there at all, so that platform is dropped from the size and color
+    # gates too.
     if non_sc_platforms:
         form_data = listing.data or {}
+        product_type = form_data.get("product_type")
+        color = form_data.get("standard_color")
+
+        type_excluded = await listing_options_service.get_excluded_platforms(
+            "types", "type", product_type
+        )
+
+        missing_type_or_color = await listing_options_service.check_unmapped_type_or_color(
+            product_type, color, non_sc_platforms, platform_settings
+        )
+
+        # 1. Types
+        missing_types = [
+            {**e, "missing": ["type"]}
+            for e in missing_type_or_color
+            if "type" in (e.get("missing") or [])
+        ]
+        if missing_types:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "type": "unmapped_types",
+                    "product_type": product_type,
+                    "platforms_with_missing": missing_types,
+                },
+            )
+
+        # 2. Sizes (skip platforms whose type is excluded here)
         sizing_scheme = form_data.get("SIZING_SCHEME")
         child_sizes = list(set(v for v in child_size_overrides.values() if v and v.strip()))
-        if sizing_scheme and child_sizes:
-            product_type = form_data.get("product_type")
+        size_platforms = [p for p in non_sc_platforms if p not in type_excluded]
+        if sizing_scheme and child_sizes and size_platforms:
             sizing_type = None
             if product_type:
                 conn = Tortoise.get_connection("default")
@@ -460,7 +515,7 @@ async def submit_listing(
                     sizing_type = type_result[0]["sizing_types"]
 
             unmapped = await listing_options_service.check_unmapped_sizes(
-                sizing_scheme, child_sizes, non_sc_platforms, sizing_type
+                sizing_scheme, child_sizes, size_platforms, sizing_type
             )
             if unmapped:
                 raise HTTPException(
@@ -472,21 +527,19 @@ async def submit_listing(
                     },
                 )
 
-    if non_sc_platforms:
-        form_data = listing.data or {}
-        product_type = form_data.get("product_type")
-        color = form_data.get("standard_color")
-        missing_type_or_color = await listing_options_service.check_unmapped_type_or_color(
-            product_type, color, non_sc_platforms, platform_settings
-        )
-        if missing_type_or_color:
+        # 3. Colors (skip platforms whose type is excluded here)
+        missing_colors = [
+            {**e, "missing": ["color"]}
+            for e in missing_type_or_color
+            if "color" in (e.get("missing") or []) and e.get("platform_id") not in type_excluded
+        ]
+        if missing_colors:
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "type": "unmapped_types_or_colors",
-                    "product_type": product_type,
+                    "type": "unmapped_colors",
                     "color": color,
-                    "platforms_with_missing": missing_type_or_color,
+                    "platforms_with_missing": missing_colors,
                 },
             )
 

@@ -121,6 +121,17 @@ async def sync_default_internal_values(
     table_name: str = Query(..., description="Name of the table"),
 ):
     try:
+        # Exclude mode: record a global exclusion for the internal values instead
+        # of syncing a mapping. platform_value is ignored; mapping and excluding
+        # are mutually exclusive (mapping a value clears its exclusion below).
+        if payload.exclude:
+            await DatabaseService.add_excluded_platform_for_internal_values(
+                table_name=table_name,
+                internal_values=payload.internal_values,
+                platform_id=payload.platform_id,
+            )
+            return SuccessResponse(message="Exclusion saved successfully")
+
         # Create mode: fail fast if the platform value already exists, before
         # the conflict check, so the user is told to edit the existing entry
         # instead of being walked through a remap confirmation first.

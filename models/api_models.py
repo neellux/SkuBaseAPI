@@ -598,9 +598,9 @@ class ImportSummary(BaseModel):
     file_name: Optional[str] = Field(
         None, description="Uploaded SPO product file name (spo_products_*.xlsx)"
     )
-    batch_uuid: Optional[str] = Field(
+    batch_number: Optional[int] = Field(
         None,
-        description="Grailed batch UUID; the UI shows its last 6 chars as the batch number",
+        description="Grailed sequential batch number (1, 2, 3, ...); UI shows it zero-padded to 6 digits",
     )
     status_counts: Dict[str, int] = Field(
         default_factory=dict, description="Count of submissions per status"
@@ -649,6 +649,11 @@ class ImportListingDetail(BaseModel):
         default_factory=list,
         description="Child SKUs submitted for this listing (data.child_size_overrides keys)",
     )
+    updated_skus: List[str] = Field(
+        default_factory=list,
+        description="SKUs that were already on the sheet and refreshed in place "
+        "(grailed updated_references), rather than added as new rows",
+    )
     updated_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = Field(
         None, description="Set when a failed submission was manually reviewed"
@@ -658,8 +663,8 @@ class ImportListingDetail(BaseModel):
 class ImportDetailResponse(BaseModel):
     import_id: int
     platform_id: str
-    batch_uuid: Optional[str] = Field(
-        None, description="Grailed batch UUID (last 6 chars shown as the batch number)"
+    batch_number: Optional[int] = Field(
+        None, description="Grailed sequential batch number (shown zero-padded to 6 digits)"
     )
     submissions: List[ImportListingDetail] = Field(default_factory=list)
     status_counts: Dict[str, int] = Field(default_factory=dict)

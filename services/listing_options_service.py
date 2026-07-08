@@ -314,6 +314,7 @@ class ListingOptionsService:
         color: str | None,
         platforms: list,
         platform_settings: dict | None = None,
+        brand: str | None = None,
     ) -> dict:
         type_status: dict = {}
         color_status: dict = {}
@@ -321,9 +322,11 @@ class ListingOptionsService:
         color_required: dict = {}
         type_excluded: dict = {}
         color_excluded: dict = {}
+        brand_excluded: dict = {}
         platform_settings = platform_settings or {}
         type_excluded_set = await self.get_excluded_platforms("types", "type", product_type)
         color_excluded_set = await self.get_excluded_platforms("colors", "color", color)
+        brand_excluded_set = await self.get_excluded_platforms("brands", "brand", brand)
         for platform_id in platforms:
             if platform_id == "sellercloud":
                 continue
@@ -332,6 +335,7 @@ class ListingOptionsService:
             color_required[platform_id] = bool(settings.get("require_color_mapping"))
             type_excluded[platform_id] = platform_id in type_excluded_set
             color_excluded[platform_id] = platform_id in color_excluded_set
+            brand_excluded[platform_id] = platform_id in brand_excluded_set
             type_status[platform_id] = bool(
                 product_type
                 and await self.get_platform_type(product_type, platform_id)
@@ -346,6 +350,7 @@ class ListingOptionsService:
             "color_required": color_required,
             "type_excluded": type_excluded,
             "color_excluded": color_excluded,
+            "brand_excluded": brand_excluded,
         }
 
     async def check_unmapped_sizes(

@@ -158,7 +158,7 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         # created_at, which can be days earlier than the real upload.
         uploaded_ats = []
         stored_file_name = None
-        batch_uuid = None
+        batch_number = None
         for s in group:
             meta = s.platform_meta or {}
             raw = meta.get("uploaded_at")
@@ -169,8 +169,8 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                     pass
             if not stored_file_name and meta.get("file_name"):
                 stored_file_name = meta["file_name"]
-            if not batch_uuid and meta.get("batch_uuid"):
-                batch_uuid = meta["batch_uuid"]
+            if batch_number is None and meta.get("batch_number") is not None:
+                batch_number = meta["batch_number"]
 
         created_at = (
             min(uploaded_ats)
@@ -192,7 +192,7 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                 submission_count=len(group),
                 sku_count=sku_counts.get(import_id, 0),
                 file_name=file_name,
-                batch_uuid=batch_uuid,
+                batch_number=batch_number,
                 status_counts=dict(status_counts),
                 created_at=created_at,
                 updated_at=max((s.updated_at for s in group), default=None),
@@ -353,11 +353,11 @@ def _build_import_detail(
 ) -> ImportDetailResponse:
     status_counts: dict[str, int] = defaultdict(int)
     details: list[ImportListingDetail] = []
-    batch_uuid = None
+    batch_number = None
     for sub in submissions:
         status_counts[_effective_status(sub)] += 1
-        if not batch_uuid:
-            batch_uuid = (sub.platform_meta or {}).get("batch_uuid")
+        if batch_number is None:
+            batch_number = (sub.platform_meta or {}).get("batch_number")
         listing = sub.listing
         title = None
         product_id = None
@@ -380,6 +380,7 @@ def _build_import_detail(
                 error_display=sub.error_display,
                 sku_errors=(sub.platform_meta or {}).get("sku_errors") or None,
                 skus=skus,
+                updated_skus=(sub.platform_meta or {}).get("updated_references") or [],
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )
@@ -388,7 +389,7 @@ def _build_import_detail(
     return ImportDetailResponse(
         import_id=import_id,
         platform_id=platform,
-        batch_uuid=batch_uuid,
+        batch_number=batch_number,
         submissions=details,
         status_counts=dict(status_counts),
     )

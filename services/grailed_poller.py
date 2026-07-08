@@ -1,7 +1,6 @@
 import json
 import logging
 import traceback
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -14,6 +13,7 @@ from models.db_models import (
 from services.base_poller import BasePoller
 from services.grailed_service import grailed_service
 from services.template_service import TemplateService
+from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 
 logger = logging.getLogger(__name__)
@@ -178,19 +178,6 @@ class GrailedPoller(BasePoller):
         if not all_products or not active_ids:
             return 0
 
-        # A synthetic batch id groups this chunk's submissions into one "import"
-        # row on the Submissions Dashboard (grailed has no platform-side import id,
-        # so we reuse the same product_import_id field SPO uses). min(active_ids)
-        # is unique per chunk (id sets are disjoint) and stable - it stays the
-        # internal routing key. batch_uuid is the user-facing batch number (the
-        # dashboard shows its last 6 chars).
-        batch_id = min(active_ids)
-        batch_meta = {
-            "product_import_id": batch_id,
-            "batch_uuid": uuid.uuid4().hex,
-            "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        }
-
         try:
             response_data = await grailed_service.submit_batch(all_products)
         except Exception:
@@ -198,7 +185,7 @@ class GrailedPoller(BasePoller):
             # means no definitive response. The outcome is unknown, but addListings
             # dedups by SKU, so we requeue (not fail) rather than lose the batch:
             # the next poll cycle retries, and a request that actually landed
-            # becomes an update, not a duplicate.
+            # becomes an update, not a duplicate. No batch number is consumed.
             logger.exception(
                 f"{self.name}: Grailed AppScript unreachable, requeueing {len(active_ids)} submissions"
             )
@@ -207,6 +194,16 @@ class GrailedPoller(BasePoller):
                 error_display="Grailed AppScript unreachable, will retry",
             )
             return 0
+
+        # Definitive response -> assign this batch its number. product_import_id
+        # stays the internal routing key (min(active_ids), unique per chunk);
+        # batch_number is the user-facing sequential 1,2,3... the dashboard shows
+        # zero-padded (000001). Pulled only now so a requeued chunk leaves no gap.
+        batch_meta = {
+            "product_import_id": min(active_ids),
+            "batch_number": await self._next_batch_number(),
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
 
         if not response_data.get("success"):
             error_msg = response_data.get("error", "Unknown error from Grailed AppScript")
@@ -236,24 +233,41 @@ class GrailedPoller(BasePoller):
             if isinstance(failure, dict) and failure.get("sku"):
                 error_by_sku[failure["sku"]] = failure.get("error", "Unknown error")
 
+        # SKUs that were already on the sheet and got refreshed in place (no new
+        # row). AppScript returns these as [{"sku": ...}]; we persist them per
+        # submission so "added vs updated" is stored, not just derivable.
+        updated_sku_set: set[str] = set()
+        for entry in response_data.get("updated_references", []) or []:
+            if isinstance(entry, dict) and entry.get("sku"):
+                updated_sku_set.add(entry["sku"])
+            elif isinstance(entry, str):
+                updated_sku_set.add(entry)
+
         succeeded = 0
         for sub_id in active_ids:
             sub = subs_by_id[sub_id]
             sub_skus = [sku for sku, sid in sku_to_sub.items() if sid == sub_id]
+            sub_updated = [sku for sku in sub_skus if sku in updated_sku_set]
 
             failed_skus = {sku: error_by_sku[sku] for sku in sub_skus if sku in error_by_sku}
             if failed_skus:
                 sub.status = SubmissionStatus.FAILED
                 sub.error = json.dumps(failed_skus)
                 sub.error_display = ", ".join(f"{s}: {e}" for s, e in failed_skus.items())[:500]
-                sub.platform_meta = {**batch_meta, "sku_errors": failed_skus}
+                meta = {**batch_meta, "sku_errors": failed_skus}
+                if sub_updated:
+                    meta["updated_references"] = sub_updated
+                sub.platform_meta = meta
                 await sub.save()
                 continue
 
             sub_refs = [ref_by_sku[sku] for sku in sub_skus if sku in ref_by_sku]
             sub.status = SubmissionStatus.SUCCESS
             sub.error_display = None  # clear any "will retry" note from a prior cycle
-            sub.platform_meta = dict(batch_meta)
+            meta = dict(batch_meta)
+            if sub_updated:
+                meta["updated_references"] = sub_updated
+            sub.platform_meta = meta
             if sub_refs:
                 sub.external_id = sub_refs
             await sub.save()
@@ -265,6 +279,14 @@ class GrailedPoller(BasePoller):
             f"submissions_succeeded={succeeded}/{len(active_ids)}"
         )
         return succeeded
+
+    @staticmethod
+    async def _next_batch_number() -> int:
+        """Next sequential grailed batch number (1, 2, 3, ...) from a DB sequence,
+        so concurrent flushes never collide."""
+        conn = Tortoise.get_connection("default")
+        rows = await conn.execute_query_dict("SELECT nextval('grailed_batch_seq') AS n")
+        return int(rows[0]["n"])
 
     async def manual_flush(self) -> dict[str, Any]:
         return await self._batch_upload_pending(force=True)

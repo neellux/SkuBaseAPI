@@ -562,6 +562,14 @@ class DefaultListInternalValuesUpdate(BaseModel):
             "Use when creating a new entry; edit the existing entry to modify it."
         ),
     )
+    exclude: bool = Field(
+        default=False,
+        description=(
+            "If true, instead of syncing a mapping this records a global exclusion: "
+            "platform_id is added to excluded_platforms for each internal value "
+            "(platform_value is ignored). Mutually exclusive with mapping a value."
+        ),
+    )
 
 
 class ParentTypeResponse(BaseModel):
