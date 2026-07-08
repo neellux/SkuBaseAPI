@@ -1,6 +1,7 @@
 import json
 import logging
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -180,10 +181,13 @@ class GrailedPoller(BasePoller):
         # A synthetic batch id groups this chunk's submissions into one "import"
         # row on the Submissions Dashboard (grailed has no platform-side import id,
         # so we reuse the same product_import_id field SPO uses). min(active_ids)
-        # is unique per chunk (id sets are disjoint) and stable.
+        # is unique per chunk (id sets are disjoint) and stable - it stays the
+        # internal routing key. batch_uuid is the user-facing batch number (the
+        # dashboard shows its last 6 chars).
         batch_id = min(active_ids)
         batch_meta = {
             "product_import_id": batch_id,
+            "batch_uuid": uuid.uuid4().hex,
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
         }
 

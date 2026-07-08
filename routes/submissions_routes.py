@@ -158,6 +158,7 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         # created_at, which can be days earlier than the real upload.
         uploaded_ats = []
         stored_file_name = None
+        batch_uuid = None
         for s in group:
             meta = s.platform_meta or {}
             raw = meta.get("uploaded_at")
@@ -168,6 +169,8 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                     pass
             if not stored_file_name and meta.get("file_name"):
                 stored_file_name = meta["file_name"]
+            if not batch_uuid and meta.get("batch_uuid"):
+                batch_uuid = meta["batch_uuid"]
 
         created_at = (
             min(uploaded_ats)
@@ -175,10 +178,11 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
             else min((s.created_at for s in group), default=None)
         )
 
-        # Prefer the persisted file name; older imports predate that field, so
+        # Prefer the persisted file name; older SPO imports predate that field, so
         # reconstruct the same spo_products_<timestamp>.xlsx name from created_at.
+        # Only SPO has an uploaded file - grailed batches leave this null.
         file_name = stored_file_name
-        if not file_name and created_at is not None:
+        if not file_name and platform_id == "spo" and created_at is not None:
             file_name = f"spo_products_{created_at.strftime('%Y%m%d_%H%M%S')}.xlsx"
 
         imports.append(
@@ -188,6 +192,7 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                 submission_count=len(group),
                 sku_count=sku_counts.get(import_id, 0),
                 file_name=file_name,
+                batch_uuid=batch_uuid,
                 status_counts=dict(status_counts),
                 created_at=created_at,
                 updated_at=max((s.updated_at for s in group), default=None),
@@ -348,8 +353,11 @@ def _build_import_detail(
 ) -> ImportDetailResponse:
     status_counts: dict[str, int] = defaultdict(int)
     details: list[ImportListingDetail] = []
+    batch_uuid = None
     for sub in submissions:
         status_counts[_effective_status(sub)] += 1
+        if not batch_uuid:
+            batch_uuid = (sub.platform_meta or {}).get("batch_uuid")
         listing = sub.listing
         title = None
         product_id = None
@@ -380,6 +388,7 @@ def _build_import_detail(
     return ImportDetailResponse(
         import_id=import_id,
         platform_id=platform,
+        batch_uuid=batch_uuid,
         submissions=details,
         status_counts=dict(status_counts),
     )
