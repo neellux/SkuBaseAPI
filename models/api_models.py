@@ -641,6 +641,10 @@ class ImportListingDetail(BaseModel):
         description="Per-child-SKU error map ({sku: error}); lets the UI group "
         "identical errors across sizes instead of repeating them.",
     )
+    skus: List[str] = Field(
+        default_factory=list,
+        description="Child SKUs submitted for this listing (data.child_size_overrides keys)",
+    )
     updated_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = Field(
         None, description="Set when a failed submission was manually reviewed"

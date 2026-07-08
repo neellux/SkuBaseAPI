@@ -177,6 +177,16 @@ class GrailedPoller(BasePoller):
         if not all_products or not active_ids:
             return 0
 
+        # A synthetic batch id groups this chunk's submissions into one "import"
+        # row on the Submissions Dashboard (grailed has no platform-side import id,
+        # so we reuse the same product_import_id field SPO uses). min(active_ids)
+        # is unique per chunk (id sets are disjoint) and stable.
+        batch_id = min(active_ids)
+        batch_meta = {
+            "product_import_id": batch_id,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+
         try:
             response_data = await grailed_service.submit_batch(all_products)
         except Exception:
@@ -200,6 +210,7 @@ class GrailedPoller(BasePoller):
                 status=SubmissionStatus.FAILED,
                 error=error_msg,
                 error_display=str(error_msg)[:500],
+                platform_meta=batch_meta,
             )
             logger.error(f"{self.name}: Grailed AppScript returned error: {error_msg}")
             return 0
@@ -231,12 +242,14 @@ class GrailedPoller(BasePoller):
                 sub.status = SubmissionStatus.FAILED
                 sub.error = json.dumps(failed_skus)
                 sub.error_display = ", ".join(f"{s}: {e}" for s, e in failed_skus.items())[:500]
+                sub.platform_meta = {**batch_meta, "sku_errors": failed_skus}
                 await sub.save()
                 continue
 
             sub_refs = [ref_by_sku[sku] for sku in sub_skus if sku in ref_by_sku]
             sub.status = SubmissionStatus.SUCCESS
             sub.error_display = None  # clear any "will retry" note from a prior cycle
+            sub.platform_meta = dict(batch_meta)
             if sub_refs:
                 sub.external_id = sub_refs
             await sub.save()

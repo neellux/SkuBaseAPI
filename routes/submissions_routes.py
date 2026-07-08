@@ -282,25 +282,41 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
     await _get_platform_settings_for(platform)
 
     if platform == "spo":
-        flush = spo_poller.manual_flush
-    elif platform == "grailed":
-        flush = grailed_poller.manual_flush
-    else:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Manual batch creation is not implemented for platform '{platform}'",
+        # SPO uploads an XLSX and returns an import id quickly; the long-running
+        # import is polled afterwards, so this can stay synchronous.
+        try:
+            result = await spo_poller.manual_flush()
+        except Exception:
+            logger.exception("Manual spo flush failed")
+            raise HTTPException(status_code=500, detail="Manual spo flush failed")
+        return CreateBatchResponse(
+            platform=platform,
+            submission_count=result.get("submission_count", 0),
+            product_import_id=result.get("product_import_id"),
         )
 
-    try:
-        result = await flush()
-    except Exception:
-        logger.exception(f"Manual {platform} flush failed")
-        raise HTTPException(status_code=500, detail=f"Manual {platform} flush failed")
+    if platform == "grailed":
+        # Grailed's AppScript call is synchronous and can take a minute for a large
+        # batch, so run the flush in the background and return immediately. The rows
+        # flip to processing then success/failed; the dashboard polls for the result.
+        pending = await ListingSubmission.filter(
+            platform_id="grailed", status=SubmissionStatus.PENDING
+        ).count()
 
-    return CreateBatchResponse(
-        platform=platform,
-        submission_count=result.get("submission_count", 0),
-        product_import_id=result.get("product_import_id"),
+        async def _run_grailed_flush():
+            try:
+                await grailed_poller.manual_flush()
+            except Exception:
+                logger.exception("Background grailed flush failed")
+
+        asyncio.create_task(_run_grailed_flush())
+        return CreateBatchResponse(
+            platform=platform, submission_count=pending, product_import_id=None
+        )
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Manual batch creation is not implemented for platform '{platform}'",
     )
 
 
@@ -338,11 +354,13 @@ def _build_import_detail(
         title = None
         product_id = None
         listing_id = None
+        skus: list[str] = []
         if listing:
             product_id = listing.product_id
             listing_id = str(listing.id)
             data = listing.data or {}
             title = data.get("title") or data.get("name")
+            skus = list((data.get("child_size_overrides") or {}).keys())
         details.append(
             ImportListingDetail(
                 submission_id=sub.id,
@@ -353,6 +371,7 @@ def _build_import_detail(
                 platform_status=sub.platform_status,
                 error_display=sub.error_display,
                 sku_errors=(sub.platform_meta or {}).get("sku_errors") or None,
+                skus=skus,
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )
