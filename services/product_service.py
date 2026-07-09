@@ -2910,10 +2910,21 @@ class ProductService:
 
             # Batch lookups
             file_skus = df["sku"].dropna().astype(str).str.strip().unique().tolist()
-            existing_skus = set()
+            existing_skus: set = set()
+            inactive_skus: set = set()
+            secondary_to_primary: dict = {}
             if file_skus:
-                r = await conn.execute_query_dict("SELECT sku FROM child_products WHERE sku = ANY($1)", [file_skus])
+                r = await conn.execute_query_dict(
+                    "SELECT sku, is_active FROM child_products WHERE sku = ANY($1)", [file_skus]
+                )
                 existing_skus = {row["sku"] for row in r}
+                inactive_skus = {row["sku"] for row in r if not row["is_active"]}
+
+                s = await conn.execute_query_dict(
+                    "SELECT secondary_sku, current_primary_sku FROM secondary_skus WHERE secondary_sku = ANY($1)",
+                    [file_skus],
+                )
+                secondary_to_primary = {row["secondary_sku"]: row["current_primary_sku"] for row in s}
 
             # Values are matched as-is (trimmed only, never char-stripped). Each value
             # is looked up against both UPCs and keywords; non-matching ones just don't
@@ -2985,6 +2996,43 @@ class ProductService:
                 if sku not in existing_skus:
                     error_by_index[idx] = f"SKU '{sku}' not found in database"
                     errors.append({"row": row_num, "sku": sku, "value": item_value, "field": "Product", "message": error_by_index[idx]})
+                    continue
+
+                # Block all operations on inactive or reassigned (secondary)
+                # SKUs.  These children no longer own their own data — UPCs,
+                # keywords, and inventory belong to the current primary child.
+                if sku in inactive_skus:
+                    primary = secondary_to_primary.get(sku)
+                    if primary:
+                        error_by_index[idx] = (
+                            f"SKU '{sku}' is inactive — it was reassigned to '{primary}'."
+                        )
+                    else:
+                        error_by_index[idx] = f"SKU '{sku}' is inactive."
+                    errors.append(
+                        {
+                            "row": row_num,
+                            "sku": sku,
+                            "value": item_value,
+                            "field": "Product",
+                            "message": error_by_index[idx],
+                        }
+                    )
+                    continue
+                if sku in secondary_to_primary:
+                    primary = secondary_to_primary[sku]
+                    error_by_index[idx] = (
+                        f"SKU '{sku}' is a secondary — it was reassigned to '{primary}'."
+                    )
+                    errors.append(
+                        {
+                            "row": row_num,
+                            "sku": sku,
+                            "value": item_value,
+                            "field": "Product",
+                            "message": error_by_index[idx],
+                        }
+                    )
                     continue
 
                 # Intra-CSV duplicate check
