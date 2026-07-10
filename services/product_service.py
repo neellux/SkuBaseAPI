@@ -3005,10 +3005,14 @@ class ProductService:
                     primary = secondary_to_primary.get(sku)
                     if primary:
                         error_by_index[idx] = (
-                            f"SKU '{sku}' is inactive — it was reassigned to '{primary}'."
+                            f"{sku} was transferred to {primary}. "
+                            "UPCs can't be updated. Reimport using "
+                            f"{primary}."
                         )
                     else:
-                        error_by_index[idx] = f"SKU '{sku}' is inactive."
+                        error_by_index[idx] = (
+                            f"{sku} is inactive. UPCs can't be updated."
+                        )
                     errors.append(
                         {
                             "row": row_num,
@@ -3022,7 +3026,9 @@ class ProductService:
                 if sku in secondary_to_primary:
                     primary = secondary_to_primary[sku]
                     error_by_index[idx] = (
-                        f"SKU '{sku}' is a secondary — it was reassigned to '{primary}'."
+                        f"{sku} was transferred to {primary}. "
+                        "UPCs can't be updated. Reimport using "
+                        f"{primary}."
                     )
                     errors.append(
                         {

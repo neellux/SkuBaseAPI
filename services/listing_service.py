@@ -28,8 +28,6 @@ class ListingService:
         "GENDER",
     ]
 
-    DEFAULT_NORMAL_FIELDS = ["ID"]
-
     @staticmethod
     def _get_ai_tagging_fields(
         field_definitions: List[Dict[str, Any]],
@@ -386,6 +384,10 @@ class ListingService:
                         maxsplit=1,
                     )[0].strip()
 
+            # The description template's {ID} placeholder is the parent seller
+            # SKU, which request.product_id already holds for every caller.
+            prefilled_data["ID"] = request.product_id
+
             upload_status = "pending"
             if await ListingService._check_photos_uploaded(request.product_id):
                 upload_status = "uploaded"
@@ -434,7 +436,9 @@ class ListingService:
                 listing.assigned_to = request.assigned_to
 
             if request.data is not None:
-                listing.data = request.data
+                # ID is server-owned. A client payload that omits it must not
+                # be able to drop it, since the description template requires it.
+                listing.data = {**request.data, "ID": listing.product_id}
 
             if request.ai_response is not None:
                 listing.ai_response = request.ai_response
@@ -760,25 +764,6 @@ class ListingService:
                         logger.debug(
                             f"Prefilled hardcoded custom field '{field_name}' with value: {column_value}"
                         )
-
-            for field_name in ListingService.DEFAULT_NORMAL_FIELDS:
-                if field_name in prefilled_data:
-                    continue
-
-                if field_name in product_data:
-                    product_value = product_data[field_name]
-                    if product_value is not None and str(product_value).strip() != "":
-                        if field_name == "ID" and "/" in str(product_value):
-                            parent_id = str(product_value).split("/")[0]
-                            prefilled_data[field_name] = parent_id
-                            logger.debug(
-                                f"Prefilled hardcoded normal field '{field_name}' with parent ID: {parent_id}"
-                            )
-                        else:
-                            prefilled_data[field_name] = product_value
-                            logger.debug(
-                                f"Prefilled hardcoded normal field '{field_name}' with value: {product_value}"
-                            )
 
             logger.info(
                 f"Prefilled {len(prefilled_data)} fields for product {product_data.get('ID', 'unknown')}"
