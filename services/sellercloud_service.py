@@ -1239,7 +1239,40 @@ class SellerCloudService:
 
             gender = await self.get_gender_from_product_type(form_data["ProductType"])
             form_data["GENDER"] = gender
+            # GENDER is derived from ProductType, not user-entered, so it is
+            # absent from original_form_data. Inject it too, or a {GENDER}
+            # placeholder in the description template resolves as missing.
+            original_form_data["GENDER"] = gender
+            # {ID} in the template is the parent SKU, which product_id already
+            # holds. Overwrite rather than default: a stored empty string or a
+            # stale value would otherwise reach the template unrepaired.
+            original_form_data["ID"] = product_id
             logger.info(f"Added GENDER='{gender}' to form_data")
+
+            # ShippingWeight defaults from the types table but stays editable in
+            # the form, so only fill it when the listing carries no value. A
+            # deliberate override must survive submission.
+            if not str(form_data.get("ShippingWeight") or "").strip():
+                type_info = await listing_options_service.get_product_type_info(
+                    form_data["ProductType"]
+                )
+                item_weight_oz = type_info.get("item_weight_oz")
+                if item_weight_oz is None:
+                    # Nothing downstream validates weight: the payload loop drops
+                    # empty values, so falling through here would ship the product
+                    # with no weight at all and still report success.
+                    logger.error(
+                        f"Item weight not found for ProductType: {form_data['ProductType']}"
+                    )
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Item weight not found in Listing Options",
+                    )
+                form_data["ShippingWeight"] = int(item_weight_oz)
+                logger.info(
+                    f"Derived ShippingWeight={int(item_weight_oz)} from ProductType "
+                    f"'{form_data['ProductType']}' (listing had none)"
+                )
 
             logger.info("Populating product description template")
             populated_description = await self._populate_description_template(

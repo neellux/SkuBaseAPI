@@ -244,6 +244,50 @@ class ListingService:
         return options_map
 
     @staticmethod
+    async def _apply_product_type_derived(
+        data: Dict[str, Any],
+        *,
+        apply_weight_default: bool,
+        fallback_product_type: Optional[str] = None,
+    ) -> None:
+        """Refresh the fields derived from ProductType so the snapshot stays in sync.
+
+        GENDER is fully derived from the type (never user-entered), so it is
+        recomputed whenever the type resolves a gender; a stale GENDER here is
+        what makes a SellerCloud submit fail on a missing template field. The
+        ProductType alias is canonicalized. item_weight_oz seeds shipping_weight
+        only when apply_weight_default is set (listing creation) — on an edit the
+        user may have overridden the weight, and a re-save must not clobber it.
+
+        Mutates `data` in place; never raises (a lookup failure leaves the
+        existing values untouched).
+        """
+        product_type = data.get("ProductType") or fallback_product_type
+        if not product_type:
+            return
+        try:
+            info = await listing_options_service.get_product_type_info(product_type)
+        except Exception as e:
+            logger.warning(f"Failed to fetch product type info for {product_type}: {e}")
+            return
+
+        if info.get("is_alias_match"):
+            canonical_type = info.get("type")
+            if canonical_type:
+                data["ProductType"] = canonical_type
+                logger.info(
+                    f"Replaced ProductType alias '{product_type}' with canonical type '{canonical_type}'"
+                )
+
+        if info.get("gender") is not None:
+            data["GENDER"] = info["gender"]
+            logger.debug(f"Set GENDER to {info['gender']} from types table")
+
+        if apply_weight_default and info.get("item_weight_oz") is not None:
+            data["shipping_weight"] = int(info["item_weight_oz"])
+            logger.debug(f"Set ShippingWeight to {info['item_weight_oz']} from types table")
+
+    @staticmethod
     async def create_listing(
         request: CreateListingRequest,
         created_by: str,
@@ -280,40 +324,11 @@ class ListingService:
                         product_data, sellercloud_template, request.data
                     )
 
-                    product_type = prefilled_data.get("ProductType") or product_data.get(
-                        "ProductType"
+                    await ListingService._apply_product_type_derived(
+                        prefilled_data,
+                        apply_weight_default=True,
+                        fallback_product_type=product_data.get("ProductType"),
                     )
-                    if product_type:
-                        try:
-                            product_type_info = await listing_options_service.get_product_type_info(
-                                product_type
-                            )
-
-                            if product_type_info.get("is_alias_match"):
-                                canonical_type = product_type_info.get("type")
-                                if canonical_type:
-                                    prefilled_data["ProductType"] = canonical_type
-                                    logger.info(
-                                        f"Replaced ProductType alias '{product_type}' with canonical type '{canonical_type}'"
-                                    )
-
-                            if product_type_info.get("gender") is not None:
-                                prefilled_data["GENDER"] = product_type_info["gender"]
-                                logger.debug(
-                                    f"Set GENDER to {product_type_info['gender']} from types table"
-                                )
-
-                            if product_type_info.get("item_weight_oz") is not None:
-                                prefilled_data["shipping_weight"] = int(
-                                    product_type_info["item_weight_oz"]
-                                )
-                                logger.debug(
-                                    f"Set ShippingWeight to {product_type_info['item_weight_oz']} from types table"
-                                )
-                        except Exception as e:
-                            logger.warning(
-                                f"Failed to fetch product type info for {product_type}: {e}"
-                            )
 
                     color = prefilled_data.get("standard_color")
                     if color:
@@ -438,7 +453,14 @@ class ListingService:
             if request.data is not None:
                 # ID is server-owned. A client payload that omits it must not
                 # be able to drop it, since the description template requires it.
-                listing.data = {**request.data, "ID": listing.product_id}
+                new_data = {**request.data, "ID": listing.product_id}
+                # Recompute type-derived fields (GENDER, canonical ProductType)
+                # so editing the product type and saving keeps them in sync,
+                # rather than leaving a stale GENDER the submit path would reject.
+                await ListingService._apply_product_type_derived(
+                    new_data, apply_weight_default=False
+                )
+                listing.data = new_data
 
             if request.ai_response is not None:
                 listing.ai_response = request.ai_response
