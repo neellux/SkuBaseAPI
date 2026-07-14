@@ -543,7 +543,7 @@ class GrailedService:
                 else:
                     product["size"] = grailed_size
                     product["exact_size"] = ""
-                product["title"] = f"{form_data.get('style_name')} SIZE {size}"
+                product["title"] = f"{form_data.get('style_name')} Size {size}"
             product["description"] = self._format_description(
                 form_data,
                 stripped_description,
