@@ -436,6 +436,9 @@ class ChildProductData(BaseModel):
     id: str = Field(..., description="Full product ID including size variant")
     parent_id: str = Field(..., description="Parent product ID")
     size: str = Field(..., description="Size extracted from product ID")
+    is_active: bool = Field(
+        True, description="False for a disabled variant, shown read-only in the UI"
+    )
 
 
 class ChildrenResponse(BaseModel):

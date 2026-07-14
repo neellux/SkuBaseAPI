@@ -120,10 +120,14 @@ async def get_listing_children(
 
     override_sizing_scheme = listing.data.get("SIZING_SCHEME") if listing.data else None
 
+    # Inactive variants are returned (flagged is_active=False) so the UI can show
+    # them as disabled grey rows rather than silently omitting them. Read-only:
+    # they are excluded from validation and from the submit payload.
     children_data = await sellercloud_service.get_product_children(
         product_id_to_fetch,
         override_product_type=product_type,
         override_sizing_scheme=override_sizing_scheme,
+        include_inactive=True,
     )
     return children_data
 

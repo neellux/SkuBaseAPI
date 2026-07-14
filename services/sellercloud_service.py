@@ -800,7 +800,15 @@ class SellerCloudService:
         product_id: str,
         override_product_type: str = None,
         override_sizing_scheme: str = None,
+        include_inactive: bool = False,
     ) -> Dict[str, Any]:
+        # include_inactive is opt-in (only the /listings/children read route sets
+        # it) so that write paths - notably submit_listing_to_sellercloud, which
+        # turns this list into the set of SKUs it pushes updates to - keep the
+        # active-only behavior and can never write to a disabled SKU.
+        #
+        # activeStatus: 1 = active only, 0 = inactive only, -1 = all. With -1 each
+        # item carries ActiveStatus: "Active" | "InActive".
         parent_product_id = (
             "/".join(product_id.split("/")[:-1]) if "/" in product_id else product_id
         )
@@ -817,7 +825,7 @@ class SellerCloudService:
                         "model.Keyword": parent_product_id,
                         "model.pageSize": page_size,
                         "model.pageNumber": page_number,
-                        "model.activeStatus": 1,
+                        "model.activeStatus": -1 if include_inactive else 1,
                     },
                 )
 
@@ -848,6 +856,18 @@ class SellerCloudService:
                 logger.error(f"Error fetching children for {parent_product_id}: {e}")
                 raise
 
+        def _is_active(product: Dict[str, Any]) -> bool:
+            return product.get("ActiveStatus") == "Active"
+
+        # A multi-variant matrix parent is itself inactive and has no "/" in its
+        # ID, so once inactive rows are included it would otherwise show up as a
+        # bogus sizeless child. Drop it, but only when real variants exist - for a
+        # single-SKU product the bare parent row IS the product.
+        if include_inactive and any("/" in p["ID"] for p in all_children):
+            all_children = [
+                p for p in all_children if "/" in p["ID"] or _is_active(p)
+            ]
+
         if not all_children:
             return {
                 "children": [],
@@ -855,7 +875,12 @@ class SellerCloudService:
                 "sizing_scheme": None,
             }
 
-        first_product = all_children[0]
+        # Derive ProductType/SIZING_SCHEME from an active child where possible: an
+        # inactive child can carry a stale scheme (a disabled variant is often one
+        # that was re-sized under a different scheme).
+        first_product = next(
+            (p for p in all_children if _is_active(p)), all_children[0]
+        )
         sellercloud_product_type = first_product.get("ProductType")
 
         product_type = (
@@ -894,6 +919,7 @@ class SellerCloudService:
                     "id": product_id_str,
                     "parent_id": parent_product_id,
                     "size": size,
+                    "is_active": _is_active(product),
                 }
             )
 
@@ -1291,6 +1317,8 @@ class SellerCloudService:
             )
 
             logger.info(f"Fetching children for parent product {parent_product_id}")
+            # Deliberately active-only (include_inactive defaults to False): a
+            # disabled SKU must never enter all_product_ids below and get written to.
             children_data = await self.get_product_children(parent_product_id)
 
             child_size_overrides = original_form_data.get("child_size_overrides", {})
