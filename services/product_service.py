@@ -1805,7 +1805,7 @@ class ProductService:
                     JOIN child_products cp
                       ON cp.sku = s.current_primary_sku AND cp.is_active = TRUE
                     LEFT JOIN parent_products pp ON cp.parent_sku = pp.sku
-                    WHERE s.secondary_sku = $1
+                    WHERE LOWER(s.secondary_sku) = LOWER($1)
                     LIMIT 1
                     """,
                     [search_term],
@@ -1823,6 +1823,58 @@ class ProductService:
                     "parent_sku": c.get("parent_sku"),
                     "child_count": None,
                     "is_parent": False,
+                }
+
+            # Resolve a reassigned OLD PARENT (already known to be exact + fully
+            # emptied) to its single new parent. NOT part of the per-search batch:
+            # its `secondary_skus` scan isn't index-backed, so it runs lazily and
+            # only when the top hit is an exact, childless parent (see below) —
+            # normal searches never pay for it.
+            async def _resolve_reassigned_parent(
+                old_parent_sku: str,
+            ) -> Optional[Dict[str, Any]]:
+                targets = await conn.execute_query_dict(
+                    """
+                    SELECT DISTINCT cp.parent_sku AS new_parent_sku
+                    FROM secondary_skus s
+                    JOIN child_products cp ON cp.sku = s.current_primary_sku
+                                          AND cp.is_active = TRUE
+                    WHERE left(s.secondary_sku, length($1) + 1) = $1 || '/'
+                    LIMIT 2
+                    """,
+                    [old_parent_sku],
+                )
+                if (
+                    len(targets) != 1
+                    or not targets[0]["new_parent_sku"]
+                    or targets[0]["new_parent_sku"] == old_parent_sku
+                ):
+                    return None
+                new_parent_sku = targets[0]["new_parent_sku"]
+                rows = await conn.execute_query_dict(
+                    """
+                    SELECT pp.sku, pp.title, pp.mpn, pp.brand,
+                           (SELECT COUNT(*) FROM child_products cp
+                            WHERE cp.parent_sku = pp.sku AND cp.is_active = TRUE) AS child_count
+                    FROM parent_products pp
+                    WHERE pp.sku = $1 AND pp.is_active = TRUE
+                    LIMIT 1
+                    """,
+                    [new_parent_sku],
+                )
+                if not rows:
+                    return None
+                p = rows[0]
+                return {
+                    "sku": p["sku"],
+                    "title": p.get("title"),
+                    "mpn": p.get("mpn"),
+                    "brand": p.get("brand"),
+                    "size": None,
+                    "is_primary": None,
+                    "parent_sku": None,
+                    "child_count": p.get("child_count", 0),
+                    "is_parent": True,
                 }
 
             parent_task = _run_parents() if want_parents else None
@@ -1869,9 +1921,25 @@ class ProductService:
             # If the term is an exact secondary SKU and the main search didn't
             # already nail an exact match, swap in the live primary as the sole
             # exact match so the UI's auto-select redirects to the active SKU.
+            # Child secondary wins over parent reassignment (a SKU is either a
+            # child or a parent — defensive precedence).
             if not exact_match and secondary_result is not None:
                 results = [secondary_result]
                 exact_match = True
+            elif not exact_match and results:
+                # Only pay for the reassigned-parent lookup when the user typed an
+                # EXACT parent SKU (rank 0) that is now childless — the sole case
+                # that can redirect. Every other search skips it entirely.
+                top = results[0]
+                if (
+                    top.get("is_parent")
+                    and top.get("_rank") == 0
+                    and not top.get("child_count")
+                ):
+                    reassigned = await _resolve_reassigned_parent(top["sku"])
+                    if reassigned is not None:
+                        results = [reassigned]
+                        exact_match = True
 
             for r in results:
                 r.pop("_keywords", None)
@@ -1896,10 +1964,18 @@ class ProductService:
         try:
             conn = await ProductService._get_connection()
 
+            # (a) Reassigned CHILD redirect. Exact match first (unique index);
+            # fall back to a case-insensitive match so a wrong-cased secondary
+            # SKU still redirects to its live primary.
             redirect_result = await conn.execute_query_dict(
                 "SELECT current_primary_sku FROM secondary_skus WHERE secondary_sku = $1",
                 [sku],
             )
+            if not redirect_result:
+                redirect_result = await conn.execute_query_dict(
+                    "SELECT current_primary_sku FROM secondary_skus WHERE LOWER(secondary_sku) = LOWER($1) LIMIT 1",
+                    [sku],
+                )
             if redirect_result:
                 return {
                     "success": True,
@@ -1909,8 +1985,9 @@ class ProductService:
                     "error": None,
                 }
 
-            # Resolve the input SKU to (parent_sku, child_sku) in one query.
+            # (b) Resolve the input SKU to (parent_sku, child_sku) in one query.
             # `child_sku` is set only when the input matches an active child.
+            # Exact match — index-backed hot path.
             resolved = await conn.execute_query_dict(
                 """
                 SELECT
@@ -1928,6 +2005,32 @@ class ProductService:
             )
 
             if not resolved:
+                # (c) Case-insensitive fallback. If the SKU matches a product in
+                # a different casing, redirect to its canonical stored form so
+                # downstream child/parent matching in the UI stays correct.
+                canonical = await conn.execute_query_dict(
+                    """
+                    SELECT cp.sku AS child_sku, pp.sku AS parent_sku
+                    FROM (SELECT $1::text AS sku) i
+                    LEFT JOIN child_products  cp
+                           ON LOWER(cp.sku) = LOWER(i.sku) AND cp.is_active = TRUE
+                    LEFT JOIN parent_products pp
+                           ON LOWER(pp.sku) = LOWER(i.sku) AND pp.is_active = TRUE
+                    WHERE cp.sku IS NOT NULL OR pp.sku IS NOT NULL
+                    LIMIT 1
+                    """,
+                    [sku],
+                )
+                if canonical:
+                    canonical_sku = canonical[0]["child_sku"] or canonical[0]["parent_sku"]
+                    if canonical_sku and canonical_sku != sku:
+                        return {
+                            "success": True,
+                            "sku": sku,
+                            "is_parent": None,
+                            "redirect_to": canonical_sku,
+                            "error": None,
+                        }
                 return {
                     "success": False,
                     "sku": sku,
@@ -1948,6 +2051,42 @@ class ProductService:
                     "is_parent": None,
                     "error": "Parent product not found",
                 }
+
+            # (d) Reassigned PARENT redirect. When the input resolved to a parent
+            # that has been fully emptied (no active children remaining), and all
+            # of its former children now live under a single new parent, redirect
+            # there — mirroring the child-redirect behavior. A child SKU is
+            # `<parent>/<size>` and never changes on reassignment, so the old
+            # parent's former children are exactly the `secondary_skus` rows whose
+            # secondary_sku is prefixed `<parent>/`. Each resolves through the view
+            # (which walks reassignment chains A -> B -> C fully and is cycle-guarded)
+            # to its live primary; we take that primary's current parent. Deriving
+            # from the view (not parent_child_assignments) keeps this consistent
+            # with the child redirect and robust to assignment-ledger pruning.
+            if child_sku is None and not parent_payload.get("children"):
+                parent_redirect = await conn.execute_query_dict(
+                    """
+                    SELECT DISTINCT cp.parent_sku AS new_parent_sku
+                    FROM secondary_skus s
+                    JOIN child_products cp ON cp.sku = s.current_primary_sku
+                                          AND cp.is_active = TRUE
+                    WHERE left(s.secondary_sku, length($1) + 1) = $1 || '/'
+                    LIMIT 2
+                    """,
+                    [parent_sku],
+                )
+                if (
+                    len(parent_redirect) == 1
+                    and parent_redirect[0]["new_parent_sku"]
+                    and parent_redirect[0]["new_parent_sku"] != parent_sku
+                ):
+                    return {
+                        "success": True,
+                        "sku": sku,
+                        "is_parent": None,
+                        "redirect_to": parent_redirect[0]["new_parent_sku"],
+                        "error": None,
+                    }
 
             # Children list entries are full SelectedChild equivalents — when
             # the requested SKU was a child, just point `selected_child` at
