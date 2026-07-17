@@ -56,25 +56,13 @@ async def create_batch_public(request_data: CreateBatchRequest):
         raise HTTPException(status_code=500, detail=f"Failed to create batch: {str(e)}")
 
 
-@router.get("/export", include_in_schema=False, dependencies=[Depends(require_api_key)])
-async def export_public(
-    type: str = Query("parent_skus", description="Export type: 'parent_skus'"),
-):
-    """Export product tables as CSV (publicly accessible).
-
-    Currently supports type='parent_skus': each row is a parent SKU mapped to its
-    primary (active) child SKU and that child's primary UPC.
-    """
-    import io
-    import pandas as pd
-
-    if type != "parent_skus":
-        raise HTTPException(status_code=400, detail=f"Unsupported export type: {type}")
-
-    try:
-        conn = Tortoise.get_connection("product_db")
-
-        query = """
+# Registry of supported public CSV exports. Each SQL query must expose
+# parent_sku and size so ProductService.apply_size_sort can order rows by
+# canonical size within each parent. raw_columns is the key order pulled from
+# the result dicts; display_columns is the matching header row written to CSV.
+_EXPORTS = {
+    "parent_skus": {
+        "query": """
             SELECT
                 cp.parent_sku,
                 cp.sku,
@@ -85,11 +73,72 @@ async def export_public(
                 ON cu.child_sku = cp.sku AND cu.is_primary_upc = TRUE
             WHERE cp.is_primary = TRUE AND cp.is_active = TRUE
             ORDER BY cp.parent_sku, cp.sku
-        """
-        results = await conn.execute_query_dict(query)
+        """,
+        "raw_columns": ["parent_sku", "sku", "primary_upc"],
+        "display_columns": ["Parent SKU", "SKU", "Primary UPC"],
+        "filename": "parent_skus.csv",
+    },
+    # Every child SKU in the internal catalog (active and inactive, primary and
+    # secondary) joined to its parent's product info.
+    "product_info": {
+        "query": """
+            SELECT
+                cp.sku,
+                cp.parent_sku,
+                pp.title,
+                pp.style_name,
+                pp.brand,
+                pp.product_type,
+                pp.type_code,
+                cp.size,
+                pp.sizing_scheme,
+                cp.is_active
+            FROM child_products cp
+            JOIN parent_products pp ON pp.sku = cp.parent_sku
+            ORDER BY cp.parent_sku, cp.sku
+        """,
+        "raw_columns": [
+            "sku", "parent_sku", "title", "style_name", "brand",
+            "product_type", "type_code", "size", "sizing_scheme", "is_active",
+        ],
+        "display_columns": [
+            "SKU", "Parent SKU", "Title", "Style Name", "Brand",
+            "Type", "General Type", "Size", "Sizing Scheme", "Active",
+        ],
+        "filename": "luxinternal_products.csv",
+    },
+}
+
+
+@router.get("/export", include_in_schema=False, dependencies=[Depends(require_api_key)])
+async def export_public(
+    type: str = Query(
+        "parent_skus", description="Export type: 'parent_skus' or 'product_info'"
+    ),
+):
+    """Export product tables as CSV (publicly accessible).
+
+    Supported types:
+    - 'parent_skus': each row is a parent SKU mapped to its primary (active)
+      child SKU and that child's primary UPC.
+    - 'product_info': every child SKU in the internal catalog (active and
+      inactive) joined to its parent's product info, with columns SKU, Parent
+      SKU, Title, Style Name, Brand, Type, General Type, Size, Sizing Scheme.
+    """
+    import io
+    import pandas as pd
+
+    export = _EXPORTS.get(type)
+    if export is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported export type: {type}")
+
+    try:
+        conn = Tortoise.get_connection("product_db")
+
+        results = await conn.execute_query_dict(export["query"])
         await ProductService.apply_size_sort(results)
-        df = pd.DataFrame(results, columns=["parent_sku", "sku", "primary_upc"])
-        df.columns = ["Parent SKU", "SKU", "Primary UPC"]
+        df = pd.DataFrame(results, columns=export["raw_columns"])
+        df.columns = export["display_columns"]
 
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False)
@@ -97,11 +146,13 @@ async def export_public(
         return Response(
             content=csv_buffer.getvalue(),
             media_type="text/csv",
-            headers={"Content-Disposition": "attachment; filename=parent_skus.csv"},
+            headers={
+                "Content-Disposition": f'attachment; filename="{export["filename"]}"'
+            },
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error exporting parent SKUs: {str(e)}", exc_info=True)
+        logger.error(f"Error exporting '{type}': {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
