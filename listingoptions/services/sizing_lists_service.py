@@ -43,9 +43,11 @@ class SizingListService:
             raise ValueError(f"Platform with ID {entry_create.platform_id} not found.")
 
         try:
+            # Sizes rows always use the literal 'size' as primary_table_column;
+            # the sizing type lives in the sizing_type column.
             sql = f"""
-                INSERT INTO {TABLE} (primary_id, platform_id, platform_value, primary_table_column)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO {TABLE} (primary_id, platform_id, platform_value, primary_table_column, sizing_type)
+                VALUES ($1, $2, $3, 'size', $4)
                 RETURNING id
             """
             rows = await conn.execute_query_dict(
@@ -80,7 +82,7 @@ class SizingListService:
                    sl.primary_id AS sizing_scheme_entry_id,
                    sl.platform_id,
                    sl.platform_value,
-                   sl.primary_table_column AS sizing_type,
+                   COALESCE(sl.sizing_type, sl.primary_table_column) AS sizing_type,
                    sl.created_at,
                    sl.updated_at,
                    ss.sizing_scheme AS sizing_scheme_name,
@@ -115,6 +117,7 @@ class SizingListService:
     async def get_all_sizing_list_entries(
         pagination: PaginationParams,
         sizing_scheme_name_filter: Optional[str] = None,
+        sizing_scheme_name_exact_filter: Optional[str] = None,
         platform_id_filter: Optional[str] = None,
         size_value_filter: Optional[str] = None,
         platform_value_filter: Optional[str] = None,
@@ -126,7 +129,7 @@ class SizingListService:
             sl.primary_id AS sizing_scheme_entry_id,
             sl.platform_id,
             sl.platform_value,
-            sl.primary_table_column AS sizing_type,
+            COALESCE(sl.sizing_type, sl.primary_table_column) AS sizing_type,
             sl.created_at,
             sl.updated_at,
             ss.sizing_scheme AS sizing_scheme_name,
@@ -150,6 +153,10 @@ class SizingListService:
             where_conditions.append(f"ss.sizing_scheme ILIKE ${param_idx}")
             query_params.append(f"%{sizing_scheme_name_filter}%")
             param_idx += 1
+        if sizing_scheme_name_exact_filter:
+            where_conditions.append(f"ss.sizing_scheme = ${param_idx}")
+            query_params.append(sizing_scheme_name_exact_filter)
+            param_idx += 1
         if platform_id_filter:
             where_conditions.append(f"sl.platform_id = ${param_idx}")
             query_params.append(platform_id_filter)
@@ -163,7 +170,7 @@ class SizingListService:
             query_params.append(f"%{platform_value_filter}%")
             param_idx += 1
         if sizing_type_filter:
-            where_conditions.append(f"sl.primary_table_column = ${param_idx}")
+            where_conditions.append(f"sl.sizing_type = ${param_idx}")
             query_params.append(sizing_type_filter)
             param_idx += 1
 
@@ -232,7 +239,7 @@ class SizingListService:
         conn = Tortoise.get_connection("default")
 
         current = await conn.execute_query_dict(
-            f"SELECT id, primary_id, platform_id, primary_table_column FROM {TABLE} WHERE id = $1",
+            f"SELECT id, primary_id, platform_id, sizing_type FROM {TABLE} WHERE id = $1",
             [str(entry_id)],
         )
         if not current:
@@ -245,12 +252,12 @@ class SizingListService:
         new_sizing_type = (
             entry_update.sizing_type
             if entry_update.sizing_type is not None
-            else row["primary_table_column"]
+            else row["sizing_type"]
         )
 
         check_sql = f"""
             SELECT id FROM {TABLE}
-            WHERE primary_id = $1 AND platform_id = $2 AND primary_table_column = $3 AND id != $4
+            WHERE primary_id = $1 AND platform_id = $2 AND sizing_type = $3 AND id != $4
         """
         conflicts = await conn.execute_query_dict(
             check_sql,
@@ -275,7 +282,7 @@ class SizingListService:
             params.append(entry_update.platform_value)
             idx += 1
         if entry_update.sizing_type is not None:
-            set_parts.append(f"primary_table_column = ${idx}")
+            set_parts.append(f"sizing_type = ${idx}")
             params.append(entry_update.sizing_type)
             idx += 1
 

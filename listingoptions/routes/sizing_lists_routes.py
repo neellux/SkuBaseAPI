@@ -50,6 +50,9 @@ async def list_all_sizing_list_platform_entries(
     sizing_scheme_name_filter: Optional[str] = Query(
         None, description="Filter by sizing scheme name (case-insensitive contains)."
     ),
+    sizing_scheme_name_exact_filter: Optional[str] = Query(
+        None, description="Filter by exact sizing scheme name."
+    ),
     platform_id_filter: Optional[str] = Query(None, description="Filter by exact platform ID."),
     size_value_filter: Optional[str] = Query(
         None, description="Filter by size value (case-insensitive contains)."
@@ -63,6 +66,7 @@ async def list_all_sizing_list_platform_entries(
         return await SizingListService.get_all_sizing_list_entries(
             pagination=pagination,
             sizing_scheme_name_filter=sizing_scheme_name_filter,
+            sizing_scheme_name_exact_filter=sizing_scheme_name_exact_filter,
             platform_id_filter=platform_id_filter,
             size_value_filter=size_value_filter,
             platform_value_filter=platform_value_filter,

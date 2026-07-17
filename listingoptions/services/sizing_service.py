@@ -46,7 +46,7 @@ class SizingService:
     @staticmethod
     async def get_platform_default_sizes() -> Dict[str, List[str]]:
         try:
-            sql = f'SELECT platform_id, platform_value FROM "listingoptions_sizes_default_list" ORDER BY platform_id, platform_value;'
+            sql = f'SELECT DISTINCT platform_id, platform_value FROM "listingoptions_sizes_default_list" ORDER BY platform_id, platform_value;'
 
             result_list = await Tortoise.get_connection("default").execute_query_dict(sql)
 
