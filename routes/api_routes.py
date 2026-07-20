@@ -56,6 +56,29 @@ async def create_batch_public(request_data: CreateBatchRequest):
         raise HTTPException(status_code=500, detail=f"Failed to create batch: {str(e)}")
 
 
+async def _attach_class_names(rows):
+    """Set row['class_name'] on each row, resolved from lux_skubase by product_type.
+
+    parent_products.product_type equals listingoptions_types.type; the parent
+    class hierarchy (class_name) hangs off listingoptions_types.parent_id ->
+    listingoptions_types_parents. The map is small (a few hundred rows), so we
+    fetch it once and map in memory. Unknown/NULL product_type resolves to None.
+    """
+    if not rows:
+        return
+    conn = Tortoise.get_connection("default")
+    mapping = await conn.execute_query_dict(
+        """
+        SELECT t.type AS product_type, p.class_name
+        FROM listingoptions_types t
+        LEFT JOIN listingoptions_types_parents p ON p.id = t.parent_id
+        """
+    )
+    class_by_type = {r["product_type"]: r["class_name"] for r in mapping}
+    for row in rows:
+        row["class_name"] = class_by_type.get(row.get("product_type"))
+
+
 # Registry of supported public CSV exports. Each SQL query must expose
 # parent_sku and size so ProductService.apply_size_sort can order rows by
 # canonical size within each parent. raw_columns is the key order pulled from
@@ -89,7 +112,6 @@ _EXPORTS = {
                 pp.style_name,
                 pp.brand,
                 pp.product_type,
-                pp.type_code,
                 cp.size,
                 pp.sizing_scheme,
                 cp.is_active
@@ -99,13 +121,14 @@ _EXPORTS = {
         """,
         "raw_columns": [
             "sku", "parent_sku", "title", "style_name", "brand",
-            "product_type", "type_code", "size", "sizing_scheme", "is_active",
+            "product_type", "class_name", "size", "sizing_scheme", "is_active",
         ],
         "display_columns": [
             "SKU", "Parent SKU", "Title", "Style Name", "Brand",
             "Type", "General Type", "Size", "Sizing Scheme", "Active",
         ],
         "filename": "luxinternal_products.csv",
+        "enrich": _attach_class_names,
     },
 }
 
@@ -136,6 +159,9 @@ async def export_public(
         conn = Tortoise.get_connection("product_db")
 
         results = await conn.execute_query_dict(export["query"])
+        enrich = export.get("enrich")
+        if enrich is not None:
+            await enrich(results)
         await ProductService.apply_size_sort(results)
         df = pd.DataFrame(results, columns=export["raw_columns"])
         df.columns = export["display_columns"]
