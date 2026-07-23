@@ -14,6 +14,8 @@ from models.api_models import (
 )
 from models.db_models import AppSettings
 from services.listing_options_service import listing_options_service
+from services.template_render import extract_placeholders
+from services.template_service import TemplateService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -30,6 +32,7 @@ async def get_field_templates():
         return SettingsResponse(
             id=settings.id,
             field_templates=settings.field_templates or {},
+            strict_template_validation=bool(settings.strict_template_validation),
             created_at=settings.created_at,
             updated_at=settings.updated_at,
         )
@@ -38,64 +41,100 @@ async def get_field_templates():
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
+async def _valid_field_ids() -> set | None:
+    """Best-effort set of valid placeholder field ids; None if the field list can't be loaded."""
+    try:
+        fields = await TemplateService.get_template_fields("default")
+        return {f["id"] for f in fields if f.get("id")}
+    except Exception as e:  # never block a save because an upstream field list is unavailable
+        logger.warning(f"Could not load valid field list for template validation: {e}")
+        return None
+
+
 @router.put("/field_templates", response_model=SettingsResponse)
 async def update_field_templates(request: UpdateSettingsRequest):
     try:
         settings = await AppSettings.first()
 
         if not settings:
-            settings = await AppSettings.create(field_templates=request.field_templates or {})
-        else:
-            if request.field_templates is not None:
-                is_platform_format = request.field_templates and all(
-                    isinstance(v, dict) for v in request.field_templates.values()
-                )
+            settings = await AppSettings.create(
+                field_templates=request.field_templates or {},
+                strict_template_validation=bool(request.strict_template_validation),
+            )
+            return SettingsResponse(
+                id=settings.id,
+                field_templates=settings.field_templates or {},
+                strict_template_validation=bool(settings.strict_template_validation),
+                created_at=settings.created_at,
+                updated_at=settings.updated_at,
+            )
 
-                if is_platform_format:
-                    allowed_platforms = {"sellercloud", "grailed", "ebay"}
-                    allowed_fields = {"title", "description"}
-                    for platform_id, templates in request.field_templates.items():
-                        if platform_id not in allowed_platforms:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Invalid platform: {platform_id}. Allowed: {allowed_platforms}",
-                            )
-                        for field_name in templates.keys():
-                            if field_name not in allowed_fields:
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail=f"Invalid field template name: {field_name}",
-                                )
-                            if not isinstance(templates[field_name], str):
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail=f"Template for {platform_id}.{field_name} must be a string",
-                                )
-                else:
-                    allowed_fields = {"title", "description"}
-                    provided_fields = set(request.field_templates.keys())
-                    invalid_fields = provided_fields - allowed_fields
+        update_fields = []
 
-                    if invalid_fields:
+        if request.strict_template_validation is not None:
+            settings.strict_template_validation = request.strict_template_validation
+            update_fields.append("strict_template_validation")
+
+        if request.field_templates is not None:
+            enabled_platforms = set(
+                settings.platforms or ["sellercloud", "grailed", "spo"]
+            )
+            strict = bool(settings.strict_template_validation)
+            # The valid-field list requires an upstream (SellerCloud) call, so only load it when
+            # strict validation is on - keeps ordinary autosaves cheap.
+            valid_ids = await _valid_field_ids() if strict else None
+
+            for platform_id, templates in request.field_templates.items():
+                if not isinstance(templates, dict):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Templates for '{platform_id}' must be an object keyed by field name.",
+                    )
+                if platform_id not in enabled_platforms:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid platform: {platform_id}. Allowed: {sorted(enabled_platforms)}",
+                    )
+                for field_name, template_value in templates.items():
+                    if not isinstance(template_value, str):
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Invalid field template names: {invalid_fields}.",
+                            detail=f"Template for {platform_id}.{field_name} must be a string",
                         )
 
-                    for field_name, template_value in request.field_templates.items():
-                        if not isinstance(template_value, str):
+                    if strict and valid_ids is not None:
+                        if field_name not in valid_ids:
                             raise HTTPException(
                                 status_code=400,
-                                detail=f"Template for {field_name} must be a string",
+                                detail=f"Invalid field template name: {field_name}",
                             )
+                        if template_value:
+                            unknown = sorted(
+                                {
+                                    token
+                                    for token in extract_placeholders(template_value)
+                                    if token not in valid_ids
+                                }
+                            )
+                            if unknown:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=(
+                                        f"{platform_id}.{field_name} references unknown fields: "
+                                        f"{', '.join(unknown)}"
+                                    ),
+                                )
 
-                settings.field_templates = request.field_templates
+            settings.field_templates = request.field_templates
+            update_fields.append("field_templates")
 
-            await settings.save(update_fields=["field_templates"])
+        if update_fields:
+            await settings.save(update_fields=update_fields)
 
         return SettingsResponse(
             id=settings.id,
             field_templates=settings.field_templates or {},
+            strict_template_validation=bool(settings.strict_template_validation),
             created_at=settings.created_at,
             updated_at=settings.updated_at,
         )

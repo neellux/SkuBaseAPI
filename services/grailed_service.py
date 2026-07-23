@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from tortoise import Tortoise
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.listing_options_service import listing_options_service
+from services.template_render import build_field_value
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +459,13 @@ class GrailedService:
         stripped_description = row_data.pop("description", "")
         country_full = row_data.get("country_of_origin", "")
 
+        app_settings = await AppSettings.first()
+        field_templates = (app_settings.field_templates or {}) if app_settings else {}
+        field_def_by_name = {
+            fd.get("name"): fd for fd in field_definitions if fd.get("name")
+        }
+        normalized_description = re.sub(r"\n{2,}", "\n", stripped_description).strip()
+
         require_type_mapping = bool(settings.get("require_type_mapping"))
         require_color_mapping = bool(settings.get("require_color_mapping"))
 
@@ -532,6 +540,13 @@ class GrailedService:
         for child_sku, size in child_size_overrides.items():
             product = {**base_product}
             product["sku"] = child_sku
+            grailed_ctx = {
+                **form_data,
+                "size": size,
+                "description": normalized_description,
+                "country_of_origin": country_full,
+                "ID": listing.product_id,
+            }
             if size:
                 grailed_size = size_map.get(size, size)
                 if not grailed_size:
@@ -543,13 +558,19 @@ class GrailedService:
                 else:
                     product["size"] = grailed_size
                     product["exact_size"] = ""
-                product["title"] = f"{form_data.get('style_name')} Size {size}"
-            product["description"] = self._format_description(
-                form_data,
-                stripped_description,
-                country_full,
-                listing.product_id,
-                size=size,
+                product["title"] = build_field_value(
+                    field_templates,
+                    self.PLATFORM_ID,
+                    "title",
+                    field_def_by_name.get("title"),
+                    grailed_ctx,
+                )
+            product["description"] = build_field_value(
+                field_templates,
+                self.PLATFORM_ID,
+                "description",
+                field_def_by_name.get("description"),
+                grailed_ctx,
             )
             products.append(product)
 

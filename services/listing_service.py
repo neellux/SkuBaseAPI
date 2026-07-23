@@ -16,6 +16,7 @@ from models.db_models import AppSettings, Listing, Template
 from services.ai_service import AIService
 from services.listing_options_service import listing_options_service
 from services.sellercloud_service import sellercloud_service
+from services.template_render import render_template, resolve_field_template
 from services.template_service import TemplateService
 from tortoise import connections
 
@@ -52,69 +53,21 @@ class ListingService:
     async def _generate_product_name(data: Dict[str, Any]) -> str:
         DEFAULT_TEMPLATE = "{BrandName} {BRAND_COLOR/COLOR} {STYLE_NAME}"
 
+        template = DEFAULT_TEMPLATE
         try:
             settings = await AppSettings.first()
-            if settings and settings.field_templates:
-                template = settings.field_templates.get("ProductName")
-                if not template:
-                    template = DEFAULT_TEMPLATE
-            else:
-                template = DEFAULT_TEMPLATE
+            if settings:
+                resolved = resolve_field_template(
+                    settings.field_templates, "sellercloud", "title"
+                )
+                if resolved:
+                    template = resolved
         except Exception as e:
             logger.warning(f"Failed to fetch product name template, using default: {e}")
-            template = DEFAULT_TEMPLATE
 
         logger.debug(f"Using product name template: {template}")
 
-        placeholder_pattern = r"\{([^}]+)\}"
-        matches = re.finditer(placeholder_pattern, template)
-
-        populated_template = template
-        for match in matches:
-            placeholder_content = match.group(1)
-            placeholder_full = match.group(0)
-
-            if "/" in placeholder_content:
-                field_options = [opt.strip() for opt in placeholder_content.split("/")]
-
-                replacement_value = None
-                for field_name in field_options:
-                    field_value = data.get(field_name)
-                    if field_value is not None and str(field_value).strip() != "":
-                        replacement_value = str(field_value).strip()
-                        logger.debug(
-                            f"Fallback placeholder {placeholder_full}: using '{field_name}' = '{replacement_value}'"
-                        )
-                        break
-
-                if replacement_value:
-                    populated_template = populated_template.replace(
-                        placeholder_full, replacement_value
-                    )
-                else:
-                    populated_template = populated_template.replace(placeholder_full, "")
-                    logger.debug(
-                        f"No valid value found for fallback placeholder {placeholder_full}, removing"
-                    )
-            else:
-                field_name = placeholder_content.strip()
-                field_value = data.get(field_name)
-
-                if field_value is not None and str(field_value).strip() != "":
-                    replacement_value = str(field_value).strip()
-                    populated_template = populated_template.replace(
-                        placeholder_full, replacement_value
-                    )
-                    logger.debug(
-                        f"Placeholder {placeholder_full}: replaced with '{replacement_value}'"
-                    )
-                else:
-                    populated_template = populated_template.replace(placeholder_full, "")
-                    logger.debug(
-                        f"No valid value found for placeholder {placeholder_full}, removing"
-                    )
-
-        product_name = " ".join(populated_template.split())
+        product_name, _missing = render_template(template, data, collapse_whitespace=True)
 
         logger.debug(f"Generated ProductName: {product_name}")
         return product_name

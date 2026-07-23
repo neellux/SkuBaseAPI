@@ -62,6 +62,13 @@ class FieldDefinition(BaseModel):
     ai_tagging: bool = Field(
         default=False, description="Whether AI tagging is enabled for this field"
     )
+    use_raw_fallback: bool = Field(
+        default=True,
+        description=(
+            "When no per-platform template is configured for this field, fall back to the field's "
+            "raw mapped value (today's pass-through behaviour). When false, the field is omitted."
+        ),
+    )
     ui_size: Optional[int] = Field(
         default=12, description="MUI grid size for the field in the UI (1-12)"
     )
@@ -484,7 +491,12 @@ class ProductTypeInfoResponse(BaseModel):
 class UpdateSettingsRequest(BaseModel):
 
     field_templates: Optional[Dict[str, Any]] = Field(
-        None, description="Field templates mapping field names to template configs"
+        None,
+        description="Per-platform field templates: {platform_id: {field_name: template_string}}",
+    )
+    strict_template_validation: Optional[bool] = Field(
+        None,
+        description="When true, reject templates that reference placeholders not in the valid field list.",
     )
 
 
@@ -492,7 +504,12 @@ class SettingsResponse(BaseModel):
 
     id: int = Field(..., description="Settings ID")
     field_templates: Dict[str, Any] = Field(
-        default_factory=dict, description="Field templates mapping field names to template configs"
+        default_factory=dict,
+        description="Per-platform field templates: {platform_id: {field_name: template_string}}",
+    )
+    strict_template_validation: bool = Field(
+        default=False,
+        description="Whether save-time strict placeholder validation is enabled.",
     )
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")

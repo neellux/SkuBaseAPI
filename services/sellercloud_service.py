@@ -14,6 +14,7 @@ from config import config
 from fastapi import HTTPException
 from models.db_models import AppSettings
 from services.listing_options_service import listing_options_service
+from services.template_render import render_template, resolve_field_template
 from tortoise import Tortoise
 
 logger = logging.getLogger(__name__)
@@ -1131,24 +1132,13 @@ class SellerCloudService:
                 detail="Field templates not configured in settings",
             )
 
-        platform_templates = settings.field_templates.get(platform_id, {})
-        template = (
-            platform_templates.get("description")
-            if isinstance(platform_templates, dict)
-            else None
-        )
-
-        if not template:
-            template = settings.field_templates.get("description")
+        template = resolve_field_template(settings.field_templates, platform_id, "description")
 
         if not template:
             raise HTTPException(
                 status_code=400,
                 detail="LongDescription template not configured in settings",
             )
-
-        placeholder_pattern = r"\{([^}]+)\}"
-        matches = re.finditer(placeholder_pattern, template)
 
         field_name_map = {}
         for field_def in field_definitions:
@@ -1157,40 +1147,24 @@ class SellerCloudService:
             if field_id:
                 field_name_map[field_id] = field_title
 
-        missing_fields = []
+        def _material_transform(value: Any) -> str:
+            lines = [line.strip() for line in str(value).split("\n") if line.strip()]
+            processed_lines = [
+                re.sub(r"^Main:", "Shell:", line, flags=re.IGNORECASE) for line in lines
+            ]
+            return "".join(f"<div>{line}</div>" for line in processed_lines)
 
-        populated_template = template
-        for match in matches:
-            field_name = match.group(1)
-            original_value = form_data.get(field_name)
+        value_transforms = {
+            "GENDER": lambda v: GENDER_MAPPING[v] if v in GENDER_MAPPING else v,
+            "MATERIAL": _material_transform,
+        }
 
-            has_valid_value = original_value is not None and original_value != ""
-
-            if not has_valid_value:
-                friendly_name = field_name_map.get(field_name, field_name)
-                missing_fields.append(friendly_name)
-                continue
-
-            field_value = original_value
-
-            if field_name == "GENDER" and field_value in GENDER_MAPPING:
-                field_value = GENDER_MAPPING[field_value]
-
-            if field_name == "MATERIAL" and field_value:
-                lines = [
-                    line.strip()
-                    for line in str(field_value).split("\n")
-                    if line.strip()
-                ]
-                processed_lines = [
-                    re.sub(r"^Main:", "Shell:", line, flags=re.IGNORECASE)
-                    for line in lines
-                ]
-                field_value = "".join(f"<div>{line}</div>" for line in processed_lines)
-
-            populated_template = populated_template.replace(
-                f"{{{field_name}}}", str(field_value)
-            )
+        populated_template, missing_fields = render_template(
+            template,
+            form_data,
+            value_transforms=value_transforms,
+            field_labels=field_name_map,
+        )
 
         if missing_fields:
             raise HTTPException(

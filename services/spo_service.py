@@ -17,6 +17,7 @@ from tortoise import connections
 from config import config
 from models.db_models import AppSettings
 from services.listing_options_service import listing_options_service
+from services.template_render import build_field_value
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +140,22 @@ class SpoService:
                     }
                     break
 
+        app_settings = await AppSettings.first()
+        field_templates = (app_settings.field_templates or {}) if app_settings else {}
+        field_def_by_name = {
+            fd.get("name"): fd for fd in field_definitions if fd.get("name")
+        }
+
         row_data: dict[str, Any] = {}
         for local_name, mapping in spo_field_map.items():
             spo_field = mapping["field_id"]
-            value = form_data.get(local_name, "")
+            value = build_field_value(
+                field_templates,
+                self.PLATFORM_ID,
+                local_name,
+                field_def_by_name.get(local_name),
+                form_data,
+            )
             row_data[spo_field] = value
 
         logger.info(f"SPO field map: {list(spo_field_map.keys())}")

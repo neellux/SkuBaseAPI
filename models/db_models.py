@@ -400,6 +400,14 @@ class AppSettings(Model):
         description="List of enabled platform IDs for submission",
     )
 
+    strict_template_validation = fields.BooleanField(
+        default=False,
+        description=(
+            "When true, saving a field template rejects any {placeholder} that is not in the "
+            "valid field list (throws at save time)."
+        ),
+    )
+
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 
