@@ -393,8 +393,20 @@ class ProductService:
             "SELECT sku, parent_sku, size FROM child_products WHERE sku = $1 AND is_active = TRUE",
             [target_child_sku],
         )
+        target_pending = False
+        pending_size = ""
         if not target_result:
-            errors.append(f"Target child SKU '{target_child_sku}' not found or inactive")
+            # The destination child may not exist yet: the reassign flow creates
+            # the placeholder size on submit. Accept only the deterministic
+            # {parent}/{size} SKU that add_placeholder_size_to_parent would
+            # create, so the preview can still report the source inventory that
+            # is going to be transferred.
+            prefix = f"{new_parent_sku}/"
+            if target_child_sku.startswith(prefix) and target_child_sku[len(prefix) :]:
+                target_pending = True
+                pending_size = target_child_sku[len(prefix) :]
+            else:
+                errors.append(f"Target child SKU '{target_child_sku}' not found or inactive")
         elif target_result[0].get("parent_sku") != new_parent_sku:
             errors.append(
                 f"Target child '{target_child_sku}' does not belong to parent '{new_parent_sku}'"
@@ -422,7 +434,11 @@ class ProductService:
                 "size": child_result[0].get("size"),
             },
             "to_parent": {"sku": new_parent_sku, "title": parent_result[0].get("title")},
-            "to_child": {"sku": target_child_sku, "size": target_result[0].get("size")},
+            "to_child": {
+                "sku": target_child_sku,
+                "size": target_result[0].get("size") if target_result else pending_size,
+                "pending": target_pending,
+            },
             "inventory": inventory,
             "planned_jobs": jobs,
         }
