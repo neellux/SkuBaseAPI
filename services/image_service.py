@@ -30,7 +30,43 @@ MAX_CONCURRENT_RESIZE = 3
 
 PRODUCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,199}$")
 
+# The photography app keeps washtags on a product's "batch_creation" row and
+# never re-uploads them. Retouched product photos later land on a separate,
+# newer "upload" row that is created with washtag_count = 0 and no washtag_data.
+# So a product's images and its washtags can live on two different rows, and
+# each section has to be resolved on its own rather than by taking the newest
+# row wholesale.
+WASHTAG_OWNER_SOURCE = "batch_creation"
+
 _resize_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESIZE)
+
+
+def _as_list(value) -> List[Dict]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = json.loads(value)
+    return value or []
+
+
+def _resolve_rows(rows: List[Any]) -> tuple:
+    """Return (image_row, washtag_row) from a product's rows, newest first.
+
+    Each section falls to the newest row that actually carries data for it. When
+    no row has washtags yet, new washtags are written to the batch_creation row
+    when there is one, so a later photography-app washtag run updates that same
+    row instead of creating a second copy that would shadow ours.
+    """
+    if not rows:
+        return None, None
+
+    image_row = next((r for r in rows if _as_list(r["image_data"])), rows[0])
+    washtag_row = next((r for r in rows if _as_list(r["washtag_data"])), None)
+    if washtag_row is None:
+        washtag_row = next(
+            (r for r in rows if r["image_source"] == WASHTAG_OWNER_SOURCE), image_row
+        )
+    return image_row, washtag_row
 
 
 def validate_product_id(product_id: str) -> str:
@@ -66,37 +102,32 @@ class ImageService:
         validate_product_id(product_id)
         conn = self._get_conn()
 
-        record = await conn.execute_query_dict(
+        rows = await conn.execute_query_dict(
             """
-            SELECT id, product_id, product_images_count, image_data,
+            SELECT id, product_id, image_source, product_images_count, image_data,
                    washtag_count, washtag_data, product_type, updated_at
             FROM productimages
             WHERE product_id = $1
             ORDER BY created_at DESC
-            LIMIT 1
             """,
             [product_id],
         )
 
-        if not record:
+        if not rows:
             return {
                 "product_id": product_id,
                 "product_type": None,
                 "updated_at": None,
+                "washtag_updated_at": None,
                 "images": [],
                 "washtags": [],
                 "image_count": 0,
                 "washtag_count": 0,
             }
 
-        row = record[0]
-        image_data = row["image_data"] or []
-        washtag_data = row["washtag_data"] or []
-
-        if isinstance(image_data, str):
-            image_data = json.loads(image_data)
-        if isinstance(washtag_data, str):
-            washtag_data = json.loads(washtag_data)
+        image_row, washtag_row = _resolve_rows(rows)
+        image_data = _as_list(image_row["image_data"])
+        washtag_data = _as_list(washtag_row["washtag_data"])
 
         images = []
         for i, entry in enumerate(image_data, start=1):
@@ -124,12 +155,13 @@ class ImageService:
 
         return {
             "product_id": product_id,
-            "product_type": row.get("product_type"),
-            "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            "product_type": image_row.get("product_type") or washtag_row.get("product_type"),
+            "updated_at": image_row["updated_at"].isoformat() if image_row["updated_at"] else None,
+            "washtag_updated_at": washtag_row["updated_at"].isoformat() if washtag_row["updated_at"] else None,
             "images": images,
             "washtags": washtags,
-            "image_count": row["product_images_count"] or 0,
-            "washtag_count": row["washtag_count"] or 0,
+            "image_count": len(images),
+            "washtag_count": len(washtags),
         }
 
     # ── SAVE (batch: reorder + upload + delete) ──────────────────────
@@ -165,17 +197,21 @@ class ImageService:
                     }
 
                 try:
-                    row = await raw_conn.fetchrow(
+                    rows = await raw_conn.fetch(
                         """
-                        SELECT id, image_data, washtag_data, product_images_count,
-                               washtag_count, updated_at
+                        SELECT id, image_source, image_data, washtag_data,
+                               product_images_count, washtag_count, updated_at
                         FROM productimages
                         WHERE product_id = $1
                         ORDER BY created_at DESC
-                        LIMIT 1
                         """,
                         product_id,
                     )
+
+                    # Edit the row that actually owns this section, which for
+                    # washtags is usually not the newest row. See _resolve_rows.
+                    image_row, washtag_row = _resolve_rows(rows)
+                    row = image_row if image_type == "image" else washtag_row
 
                     if not row:
                         # First save for this product — create a manual-source row.
