@@ -447,7 +447,7 @@ async def submit_listing(
 
     if not skip_brand_color_update:
         form_data = listing.data or {}
-        color = form_data.get("stanadard_color")
+        color = form_data.get("standard_color")
         brand_color = form_data.get("brand_color")
         if color and brand_color and color.lower() != brand_color.lower():
             await sellercloud_service.validate_brand_color(color, brand_color)

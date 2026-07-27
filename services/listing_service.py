@@ -76,12 +76,16 @@ class ListingService:
     async def _check_photos_uploaded(product_id: str) -> bool:
         try:
             photo_conn = connections.get("photography_db")
+            # Ordered by created_at, not updated_at: editing a product's washtags
+            # writes to its older batch_creation row (see image_service), which
+            # would otherwise make that row look like the current one and report
+            # a product whose photos are uploaded as still pending.
             rows = await photo_conn.execute_query_dict(
                 """
                 SELECT image_source
                 FROM productimages
                 WHERE product_id = $1
-                ORDER BY updated_at DESC
+                ORDER BY created_at DESC
                 LIMIT 1
                 """,
                 [product_id],
@@ -283,24 +287,37 @@ class ListingService:
                         fallback_product_type=product_data.get("ProductType"),
                     )
 
+                    # standard_color is prefilled from SellerCloud's COLOR custom
+                    # column, which holds the brand's own name for the color
+                    # ("Apollo | Rock"), not a canonical one. SC's BRAND_COLOR
+                    # column is empty across the catalog, so that raw value is
+                    # the only thing carrying the brand color: capture it before
+                    # the lookup below rewrites standard_color.
                     color = prefilled_data.get("standard_color")
                     if color:
+                        # Unconditional, not just on an alias hit: when the brand
+                        # simply calls it "Black" the two end up equal, which is
+                        # truthful (there is no separate brand name) and leaves
+                        # the required brand_color field populated instead of
+                        # absent. Set outside the try so a lookup failure still
+                        # yields a brand color.
+                        if not prefilled_data.get("brand_color"):
+                            prefilled_data["brand_color"] = color
+
                         try:
                             color_info = await listing_options_service.get_color_info(color)
 
-                            if color_info.get("is_alias_match"):
-                                canonical_color = color_info.get("color")
-                                if canonical_color:
-                                    prefilled_data["standard_color"] = canonical_color
-                                    if not prefilled_data.get("brand_color"):
-                                        prefilled_data["brand_color"] = color
-                                        logger.info(
-                                            f"Replaced color alias '{color}' with canonical color '{canonical_color}', set brand_color to '{color}'"
-                                        )
-                                    else:
-                                        logger.info(
-                                            f"Replaced color alias '{color}' with canonical color '{canonical_color}', preserved existing brand_color '{prefilled_data.get('BRAND_COLOR')}'"
-                                        )
+                            # Assign whenever the lookup resolved rather than
+                            # gating on is_alias_match: an exact hit is a no-op,
+                            # and a case-only difference ("grey") gets normalised
+                            # instead of being treated as an alias.
+                            canonical_color = color_info.get("color")
+                            if canonical_color:
+                                prefilled_data["standard_color"] = canonical_color
+                                if canonical_color != color:
+                                    logger.info(
+                                        f"Resolved color '{color}' to canonical color '{canonical_color}', brand_color is '{prefilled_data.get('brand_color')}'"
+                                    )
                         except Exception as e:
                             logger.warning(f"Failed to fetch color info for {color}: {e}")
 
