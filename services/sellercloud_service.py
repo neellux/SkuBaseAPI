@@ -788,6 +788,11 @@ class SellerCloudService:
 
             row = result[0]
             aliases = row.get("aliases") or []
+            if isinstance(aliases, str):
+                try:
+                    aliases = orjson.loads(aliases)
+                except orjson.JSONDecodeError:
+                    aliases = []
 
             if brand_color.lower() in [a.lower() for a in aliases]:
                 logger.info(f"Alias '{brand_color}' already exists for color '{color}'")
