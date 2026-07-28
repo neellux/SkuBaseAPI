@@ -15,8 +15,12 @@ from models.api_models import (
     UpdateBatchRequest,
 )
 from services.listing_service import ListingService
+from services.product_resolver import (
+    SkuResolutionError,
+    resolve_parents,
+    resolve_parents_strict,
+)
 from services.template_service import TemplateService
-from utils.product_utils import get_parent_product_id
 from utils.load_app_data import app_users
 from config import config
 
@@ -54,6 +58,36 @@ class BatchService:
                 )
                 return await BatchService._to_response(existing, include_listings=True)
 
+        # Resolve every SKU to its registered parent up front, in one round trip, before
+        # the template pre-fetch and before the transaction opens. Parents are looked up
+        # in the products DB, never derived by chopping the SKU: a chop invents a parent
+        # that was never registered, which is how ESSX products (whose parent SKU itself
+        # contains "/") silently produced blank listings for months. Failing here means a
+        # bad batch is rejected in milliseconds instead of after a rollback.
+        try:
+            parents = await resolve_parents_strict(request.product_ids)
+        except SkuResolutionError as e:
+            logger.error(
+                "Batch creation rejected: %d of %d products are not registered in the "
+                "products database",
+                len(e.unresolved),
+                len(request.product_ids),
+                extra={"unresolved_skus": e.unresolved},
+            )
+            raise BatchCreationError(
+                f"{len(e.unresolved)} of {len(request.product_ids)} products not found: "
+                + ", ".join(e.unresolved[:5])
+                + (f" (+{len(e.unresolved) - 5} more)" if len(e.unresolved) > 5 else ""),
+                [
+                    {
+                        "product_id": sku,
+                        "error_type": "ProductNotFound",
+                        "error_message": f"Product {sku} not found",
+                    }
+                    for sku in e.unresolved
+                ],
+            ) from e
+
         logger.info("Pre-fetching default template for batch processing")
         sellercloud_template = await TemplateService.get_template_by_id("default")
 
@@ -86,7 +120,7 @@ class BatchService:
                 async def process_product(full_product_id: str):
                     async with semaphore:
                         try:
-                            parent_product_id = get_parent_product_id(full_product_id)
+                            parent_product_id = parents[full_product_id]
                             existing_listing = await ListingService.get_draft_listing_by_product_id(
                                 parent_product_id
                             )
@@ -240,15 +274,22 @@ class BatchService:
                 query = query.filter(created_at__lt=date_to_end)
 
             if search:
-                normalized_search = search.strip().upper()
-                parent_search_id = (
-                    "/".join(normalized_search.split("/")[:-1])
-                    if "/" in normalized_search
-                    else normalized_search
-                )
-                matching_batch_ids = Listing.filter(
-                    product_id__icontains=parent_search_id
-                ).values("batch_id")
+                raw_search = search.strip()
+                # listings.product_id holds the parent, so a fully typed child SKU has to
+                # be resolved before it can match - chopping it would invent a parent.
+                # Resolve on the raw term (not the upper-cased one) so an exact hit takes
+                # the exact-match path rather than the case-insensitive fallback. A miss
+                # is normal here (partial input, a typo), so fall back to the substring
+                # match and keep search forgiving.
+                resolved = await resolve_parents([raw_search])
+                if raw_search in resolved:
+                    matching_batch_ids = Listing.filter(
+                        product_id__iexact=resolved[raw_search]
+                    ).values("batch_id")
+                else:
+                    matching_batch_ids = Listing.filter(
+                        product_id__icontains=raw_search.upper()
+                    ).values("batch_id")
                 query = query.filter(id__in=Subquery(matching_batch_ids))
 
             total = await query.count()

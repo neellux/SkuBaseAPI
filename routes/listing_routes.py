@@ -27,12 +27,14 @@ from models.api_models import (
     UpdateBatchRequest,
     UpdateListingRequest,
 )
+from exceptions.batch_exceptions import BatchCreationError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import BatchService
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
 from services.product_info_service import ProductInfoService
+from services.product_resolver import SkuResolutionError, resolve_parent
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
 from tortoise import Tortoise
@@ -56,19 +58,28 @@ def _log_task_exception(task: asyncio.Task) -> None:
 async def get_product_confirmation_data(
     product_id: str = Query(..., description="Product ID from SellerCloud"),
 ):
-    product = await sellercloud_service.get_product_by_id(product_id)
+    try:
+        product = await sellercloud_service.get_product_for_listing(product_id)
+    except SkuResolutionError as e:
+        logger.warning(f"Cannot resolve a parent for {product_id}: {e}")
+        raise HTTPException(
+            status_code=404, detail=f"Product {product_id} not found"
+        ) from e
     if not product:
         raise HTTPException(status_code=404, detail=f"Product {product_id} not found")
+
+    parent_product_id = product["PARENT_ID"]
 
     (
         all_valid,
         missing_images,
         total_count,
-    ) = await sellercloud_service.validate_product_images_on_gcs(product["ID"])
+    ) = await sellercloud_service.validate_product_images_on_gcs(
+        product["ID"], parent_sku=parent_product_id
+    )
     if not all_valid:
         raise HTTPException(status_code=400, detail="Product images not found")
 
-    parent_product_id = product.get("PARENT_ID", product_id)
     draft_listing = await ListingService.get_draft_listing_by_product_id(parent_product_id)
     existing_listing_id = str(draft_listing.id) if draft_listing else None
 
@@ -84,12 +95,19 @@ async def create_listing(request_data: CreateListingRequest, request: Request):
     if request_data.assigned_to and request_data.assigned_to not in app_users:
         raise HTTPException(status_code=400, detail="Assigned user not found")
 
+    # The listing's parent/child contract, defined here: product_id is ALWAYS a live
+    # parent_products.sku, obtained by lookup and never by splitting a SKU; info_product_id
+    # keeps the exact SellerCloud catalog ID the caller pointed us at. For a product whose
+    # parent SKU itself contains "/" (ESSX) the caller usually supplies the parent, and the
+    # two end up equal - which is correct, and what chopping used to destroy.
     full_product_id = request_data.product_id
-    parent_product_id = (
-        "/".join(full_product_id.split("/")[:-1]) if "/" in full_product_id else full_product_id
-    )
-
-    request_data.product_id = parent_product_id
+    try:
+        request_data.product_id = await resolve_parent(full_product_id)
+    except SkuResolutionError as e:
+        logger.warning(f"Cannot resolve a parent for {full_product_id}: {e}")
+        raise HTTPException(
+            status_code=404, detail=f"Product {full_product_id} not found"
+        ) from e
     request_data.info_product_id = full_product_id
 
     listing = await ListingService.create_listing(request_data, created_by)
@@ -868,7 +886,7 @@ async def batch_product_confirmation(request: BatchConfirmationRequest):
 
     for product_id in request.product_ids:
         try:
-            product = await sellercloud_service.get_product_by_id(product_id)
+            product = await sellercloud_service.get_product_for_listing(product_id)
 
             if not product:
                 products.append(
@@ -881,9 +899,9 @@ async def batch_product_confirmation(request: BatchConfirmationRequest):
                 error_count += 1
                 continue
 
-            parent_product_id = (
-                "/".join(product_id.split("/")[:-1]) if "/" in product_id else product_id
-            )
+            # Resolved by lookup inside get_product_for_listing, so it is always present
+            # and is a real parent_products.sku - no chopping, and no fallback needed.
+            parent_product_id = product["PARENT_ID"]
             draft_listing = await ListingService.get_draft_listing_by_product_id(parent_product_id)
 
             if draft_listing:
@@ -901,7 +919,9 @@ async def batch_product_confirmation(request: BatchConfirmationRequest):
                     all_valid,
                     missing_images,
                     total_count,
-                ) = await sellercloud_service.validate_product_images_on_gcs(product["ID"])
+                ) = await sellercloud_service.validate_product_images_on_gcs(
+                    product["ID"], parent_sku=parent_product_id
+                )
                 if not all_valid:
                     products.append(
                         BatchProductConfirmationData(
@@ -919,6 +939,19 @@ async def batch_product_confirmation(request: BatchConfirmationRequest):
                         )
                     )
                     success_count += 1
+
+        except SkuResolutionError as e:
+            # Per-product tolerant by design: this endpoint exists so a human can see
+            # which products are bad and drop them before creating the batch.
+            logger.warning(f"Cannot resolve a parent for {product_id}: {e}")
+            products.append(
+                BatchProductConfirmationData(
+                    product_id=product_id,
+                    status="not_found",
+                    error=f"Product {product_id} not found",
+                )
+            )
+            error_count += 1
 
         except Exception as e:
             logger.error(f"Error processing product {product_id}: {str(e)}", exc_info=True)
@@ -948,7 +981,14 @@ async def create_batch(request_data: CreateBatchRequest, request: Request):
     if request_data.assigned_to and request_data.assigned_to not in app_users:
         raise HTTPException(status_code=400, detail="Assigned user not found")
 
-    batch = await BatchService.create_batch(request_data, created_by)
+    try:
+        batch = await BatchService.create_batch(request_data, created_by)
+    except BatchCreationError as e:
+        # sendRequest puts response.data.detail straight into a snackbar, so this path
+        # needs a plain string. The machine-readable per-product breakdown is what the
+        # /create_batch API route returns to the photography service.
+        logger.error(f"Batch creation failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e)) from e
     return batch
 
 

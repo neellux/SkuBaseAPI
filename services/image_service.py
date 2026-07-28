@@ -28,15 +28,33 @@ MAX_PRODUCT_IMAGES = 8
 MAX_WASHTAG_IMAGES = 3
 MAX_CONCURRENT_RESIZE = 3
 
-PRODUCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_]{0,199}$")
+# "/" is allowed because a parent SKU can legitimately contain one: ESSX parents are
+# ESSX/BRAND/SEASON/STYLE/COLOUR, the photography app writes them into
+# productimages.product_id as-is, and GCS already holds blobs under those prefixes.
+# The traversal defence is not this whitelist, it is the explicit checks in
+# validate_product_id below, which stay.
+PRODUCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_/]{0,199}$")
 
-# The photography app keeps washtags on a product's "batch_creation" row and
-# never re-uploads them. Retouched product photos later land on a separate,
-# newer "upload" row that is created with washtag_count = 0 and no washtag_data.
-# So a product's images and its washtags can live on two different rows, and
-# each section has to be resolved on its own rather than by taking the newest
-# row wholesale.
-WASHTAG_OWNER_SOURCE = "batch_creation"
+# The photography app keys its rows on (product_id, batch_id, image_source), so a
+# product accumulates rows rather than having one, and the two sections have
+# different owners: washtags are uploaded once, during batch creation, onto that
+# batch's "batch_creation" row, while the retouched product photos land later on a
+# separate "upload" row that is always created with washtag_count = 0 and no
+# washtag_data. A product's images and its washtags therefore live on two
+# different rows and each section is resolved on its own.
+#
+# Each section only considers the sources that publish it. That is what makes
+# ordering by updated_at safe: updated_at is per row, so writing washtags moves it
+# for the whole row, but a batch_creation row is never a candidate for images, so
+# that write cannot pull the image section onto a stale row. updated_at is
+# preferred over created_at because the photography app updates rows in place when
+# a batch is re-processed, and only updated_at reflects that rewrite.
+#
+# Resolution is deliberately not scoped to the latest batch. GCS blobs are keyed
+# by product_id alone, so each section shows whatever wrote that blob namespace
+# last, and for a product shot twice the two shoots can win different sections.
+IMAGE_SOURCES = ("upload", "manual")
+WASHTAG_SOURCE = "batch_creation"
 
 _resize_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESIZE)
 
@@ -50,29 +68,51 @@ def _as_list(value) -> List[Dict]:
 
 
 def _resolve_rows(rows: List[Any]) -> tuple:
-    """Return (image_row, washtag_row) from a product's rows, newest first.
+    """Return (image_row, washtag_row) from a product's rows, most recent first.
 
-    Each section falls to the newest row that actually carries data for it. When
-    no row has washtags yet, new washtags are written to the batch_creation row
-    when there is one, so a later photography-app washtag run updates that same
-    row instead of creating a second copy that would shadow ours.
+    Each section prefers the newest row whose source publishes that section and
+    that actually holds data, then degrades: any row holding data at all, so a
+    product whose only row is a batch_creation row still shows its images; and for
+    washtags, an empty batch_creation row before the image row, so a first-time
+    washtag upload lands on the row the photography app owns and a later washtag
+    run updates it instead of creating a second copy that would shadow ours.
     """
     if not rows:
         return None, None
 
-    image_row = next((r for r in rows if _as_list(r["image_data"])), rows[0])
-    washtag_row = next((r for r in rows if _as_list(r["washtag_data"])), None)
-    if washtag_row is None:
-        washtag_row = next(
-            (r for r in rows if r["image_source"] == WASHTAG_OWNER_SOURCE), image_row
-        )
+    image_row = (
+        next((r for r in rows
+              if r["image_source"] in IMAGE_SOURCES and _as_list(r["image_data"])), None)
+        or next((r for r in rows if _as_list(r["image_data"])), None)
+        or rows[0]
+    )
+    washtag_row = (
+        next((r for r in rows
+              if r["image_source"] == WASHTAG_SOURCE and _as_list(r["washtag_data"])), None)
+        or next((r for r in rows if _as_list(r["washtag_data"])), None)
+        or next((r for r in rows if r["image_source"] == WASHTAG_SOURCE), None)
+        or image_row
+    )
     return image_row, washtag_row
 
 
 def validate_product_id(product_id: str) -> str:
-    if not product_id or not PRODUCT_ID_PATTERN.match(product_id) or ".." in product_id:
+    """Validate a product id used as a GCS blob prefix and as an advisory lock key.
+
+    Callers must use the RETURNED value, not the one they passed in: two spellings of
+    the same product would otherwise take different locks while writing the same blobs.
+    """
+    if (
+        not product_id
+        or not PRODUCT_ID_PATTERN.match(product_id)
+        # Anywhere, not just as a whole segment: this is what keeps a "/" from being
+        # usable to climb out of the product's own blob namespace.
+        or ".." in product_id
+        or "//" in product_id
+        or product_id.endswith("/")
+    ):
         raise ValueError(f"Invalid product_id format: {product_id}")
-    return product_id.strip("/")
+    return product_id
 
 
 def _product_lock_key(product_id: str) -> int:
@@ -99,7 +139,7 @@ class ImageService:
     # ── GET ──────────────────────────────────────────────────────────
 
     async def get_product_images(self, product_id: str) -> Dict[str, Any]:
-        validate_product_id(product_id)
+        product_id = validate_product_id(product_id)
         conn = self._get_conn()
 
         rows = await conn.execute_query_dict(
@@ -108,7 +148,7 @@ class ImageService:
                    washtag_count, washtag_data, product_type, updated_at
             FROM productimages
             WHERE product_id = $1
-            ORDER BY created_at DESC
+            ORDER BY updated_at DESC
             """,
             [product_id],
         )
@@ -177,7 +217,7 @@ class ImageService:
         shot_types: Dict[str, str] = None,
         product_type: str = None,
     ) -> Dict[str, Any]:
-        validate_product_id(product_id)
+        product_id = validate_product_id(product_id)
         conn = self._get_conn()
         lock_key = _product_lock_key(product_id)
 
@@ -203,7 +243,7 @@ class ImageService:
                                product_images_count, washtag_count, updated_at
                         FROM productimages
                         WHERE product_id = $1
-                        ORDER BY created_at DESC
+                        ORDER BY updated_at DESC
                         """,
                         product_id,
                     )

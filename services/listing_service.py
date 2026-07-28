@@ -267,7 +267,7 @@ class ListingService:
                 )
                 prefilled_data = request.data
             else:
-                product_data = await sellercloud_service.get_product_by_id(
+                product_data = await sellercloud_service.get_product_for_listing(
                     request.product_id, only_required_fields=False
                 )
 

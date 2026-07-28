@@ -829,7 +829,7 @@ class ProductService:
                 return {"success": True, "cost_price": None}
 
             template_child_sku = template_result[0]["sku"]
-            template_data = await sellercloud_service.get_product_by_id(
+            template_data = await sellercloud_service.get_catalog_item(
                 template_child_sku, only_required_fields=False
             )
             if not template_data:
@@ -912,7 +912,7 @@ class ProductService:
 
             template_child_sku = template_result[0]["sku"]
 
-            template_data = await sellercloud_service.get_product_by_id(
+            template_data = await sellercloud_service.get_catalog_item(
                 template_child_sku, only_required_fields=False
             )
             if not template_data:
@@ -1129,7 +1129,7 @@ class ProductService:
 
             template_child_sku = template_result[0]["sku"]
 
-            template_data = await sellercloud_service.get_product_by_id(
+            template_data = await sellercloud_service.get_catalog_item(
                 template_child_sku, only_required_fields=False
             )
             if not template_data:

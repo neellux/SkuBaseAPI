@@ -5,6 +5,7 @@ import re
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import base64
 
@@ -14,6 +15,7 @@ from config import config
 from fastapi import HTTPException
 from models.db_models import AppSettings
 from services.listing_options_service import listing_options_service
+from services.product_resolver import child_skus_for, resolve_parent
 from services.template_render import render_template, resolve_field_template
 from tortoise import Tortoise
 
@@ -298,92 +300,131 @@ class SellerCloudService:
             logger.error(f"Request failed: {method} {url} - {e}")
             raise
 
-    async def get_product_by_id(
-        self, product_id: str, only_required_fields: bool = True
-    ) -> Optional[Dict[str, Any]]:
+    async def _search_catalog(
+        self, keyword: str, active_status: int = 1
+    ) -> List[Dict[str, Any]]:
+        """Every /Catalog item matching a keyword, paged out."""
         page_size = 50
         page_number = 1
-        parent_product_id = (
-            "/".join(product_id.split("/")[:-1]) if "/" in product_id else product_id
-        )
+        items: List[Dict[str, Any]] = []
 
         while True:
             try:
                 data = await self.get(
                     "/Catalog",
                     params={
-                        "model.Keyword": product_id,
+                        "model.Keyword": keyword,
                         "model.pageSize": page_size,
                         "model.pageNumber": page_number,
-                        "model.activeStatus": 1,
+                        "model.activeStatus": active_status,
                     },
                 )
-
-                products = data.get("Items", [])
-
-                for product in products:
-                    product["PARENT_ID"] = (
-                        "/".join(product["ID"].split("/")[:-1])
-                        if "/" in product["ID"]
-                        else product["ID"]
-                    )
-
-                product = next(
-                    (
-                        item
-                        for item in products
-                        if item.get("PARENT_ID") == parent_product_id
-                    ),
-                    None,
-                )
-
-                if product:
-                    if only_required_fields:
-                        required_fields = [
-                            "PARENT_ID",
-                            "ID",
-                            "ImageUrl",
-                            "ProductName",
-                            "ProductType",
-                            "ManufacturerSKU",
-                            "UPC",
-                        ]
-
-                        product = {
-                            required_field: product[required_field]
-                            for required_field in required_fields
-                        }
-                    product["PARENT_ID"] = (
-                        "/".join(product["ID"].split("/")[:-1])
-                        if "/" in product["ID"]
-                        else product["ID"]
-                    )
-                    return product
-
-                total_count = data.get("TotalResults", 0)
-                current_items = page_number * page_size
-
-                if current_items >= total_count or not products:
-                    break
-
-                page_number += 1
-
             except Exception as e:
                 logger.error(
-                    f"Error fetching product {product_id} on page {page_number}: {e}"
+                    f"Error searching catalog for {keyword} on page {page_number}: {e}"
                 )
                 raise
 
-        logger.warning(f"Product with ID {product_id} not found")
+            products = data.get("Items", [])
+            items.extend(products)
+
+            total_count = data.get("TotalResults", 0)
+            if page_number * page_size >= total_count or not products:
+                break
+
+            page_number += 1
+
+        return items
+
+    @staticmethod
+    def _required_fields_only(
+        product: Dict[str, Any], only_required_fields: bool
+    ) -> Dict[str, Any]:
+        if not only_required_fields:
+            return product
+
+        return {
+            field: product[field]
+            for field in (
+                "PARENT_ID",
+                "ID",
+                "ImageUrl",
+                "ProductName",
+                "ProductType",
+                "ManufacturerSKU",
+                "UPC",
+            )
+        }
+
+    async def get_catalog_item(
+        self, product_id: str, only_required_fields: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """The catalog row for EXACTLY this SellerCloud product ID.
+
+        Use this when you mean one specific SKU - reading a child's own ListPrice or
+        SiteCost, for instance. The old get_product_by_id answered this question by
+        chopping the ID and returning the first item sharing the derived parent, i.e. an
+        arbitrary sibling, so per-child reads were silently getting another size's data.
+        """
+        wanted = product_id.lower()
+
+        for item in await self._search_catalog(product_id):
+            if item.get("ID", "").lower() == wanted:
+                item["PARENT_ID"] = await resolve_parent(item["ID"])
+                return self._required_fields_only(item, only_required_fields)
+
+        logger.warning(f"Product with ID {product_id} not found in SellerCloud")
         return None
 
-    async def get_product_images(self, product_id: str) -> List[str]:
-        try:
-            parent_product_id = (
-                "/".join(product_id.split("/")[:-1])
-                if "/" in product_id
-                else product_id
+    async def get_product_for_listing(
+        self, sku: str, only_required_fields: bool = True
+    ) -> Optional[Dict[str, Any]]:
+        """A representative catalog row for the product family that `sku` belongs to.
+
+        Used to prefill a listing, where the caller wants the product's shared data and
+        does not care which variant supplies it. Accepts a parent or a child SKU.
+        """
+        parent_sku = await resolve_parent(sku)
+        family = {
+            child.lower()
+            for child in await child_skus_for(parent_sku, include_inactive=True)
+        }
+        family.add(parent_sku.lower())
+
+        # Membership against the registered child set, never a chopped ID. A keyword
+        # search for ".../BLACK" also returns ".../BLACK2"; chopping cannot tell those
+        # apart and the products DB can.
+        matches = [
+            item
+            for item in await self._search_catalog(parent_sku)
+            if item.get("ID", "").lower() in family
+        ]
+
+        if not matches:
+            logger.warning(
+                f"No active SellerCloud products found for parent {parent_sku} (from {sku})"
             )
+            return None
+
+        # Prefer the exact SKU asked for, else any variant. For a multi-variant product
+        # the SC matrix parent is inactive and already filtered out by activeStatus=1, so
+        # this lands on a child row, which is what create_listing expects to prefill from.
+        product = next(
+            (item for item in matches if item.get("ID", "").lower() == sku.lower()),
+            matches[0],
+        )
+        product["PARENT_ID"] = parent_sku
+        return self._required_fields_only(product, only_required_fields)
+
+    async def get_product_images(
+        self, product_id: str, parent_sku: Optional[str] = None
+    ) -> List[str]:
+        try:
+            # Images live under the parent's GCS prefix. Callers that already resolved
+            # the parent pass it in so this costs no extra lookup; slashes stay literal
+            # in the path, everything else is escaped, matching daily_image_import_poller.
+            resolved_parent = parent_sku or await resolve_parent(product_id)
+            parent_product_id = quote(resolved_parent, safe="/")
 
             semaphore = asyncio.Semaphore(5)
 
@@ -457,10 +498,10 @@ class SellerCloudService:
             return []
 
     async def validate_product_images_on_gcs(
-        self, product_id: str, max_workers: int = 3
+        self, product_id: str, max_workers: int = 3, parent_sku: Optional[str] = None
     ) -> tuple[bool, List[str], int]:
         try:
-            image_urls = await self.get_product_images(product_id)
+            image_urls = await self.get_product_images(product_id, parent_sku=parent_sku)
 
             if not image_urls:
                 logger.warning(f"No product images found for product {product_id}")
@@ -552,7 +593,7 @@ class SellerCloudService:
         target_product_id: str,
         overrides: Optional[Dict[str, str]] = None,
     ) -> None:
-        source_data = await self.get_product_by_id(
+        source_data = await self.get_catalog_item(
             source_product_id, only_required_fields=False
         )
         if not source_data:
@@ -810,63 +851,47 @@ class SellerCloudService:
         #
         # activeStatus: 1 = active only, 0 = inactive only, -1 = all. With -1 each
         # item carries ActiveStatus: "Active" | "InActive".
-        parent_product_id = (
-            "/".join(product_id.split("/")[:-1]) if "/" in product_id else product_id
-        )
+        # Accepts a parent or a child SKU; the parent comes from the products DB, never
+        # from splitting the SKU. Inactive children are always included in the registered
+        # set, because include_inactive exists precisely to surface disabled variants.
+        parent_product_id = await resolve_parent(product_id)
+        registered = {
+            child.lower()
+            for child in await child_skus_for(parent_product_id, include_inactive=True)
+        }
+        family = registered | {parent_product_id.lower()}
 
-        page_size = 50
-        page_number = 1
-        all_children = []
+        all_children = [
+            product
+            for product in await self._search_catalog(
+                parent_product_id, active_status=-1 if include_inactive else 1
+            )
+            if product.get("ID", "").lower() in family
+        ]
 
-        while True:
-            try:
-                data = await self.get(
-                    "/Catalog",
-                    params={
-                        "model.Keyword": parent_product_id,
-                        "model.pageSize": page_size,
-                        "model.pageNumber": page_number,
-                        "model.activeStatus": -1 if include_inactive else 1,
-                    },
-                )
-
-                products = data.get("Items", [])
-
-                if not products:
-                    break
-
-                for product in products:
-                    product_parent_id = (
-                        "/".join(product["ID"].split("/")[:-1])
-                        if "/" in product["ID"]
-                        else product["ID"]
-                    )
-
-                    if product_parent_id == parent_product_id:
-                        all_children.append(product)
-
-                total_count = data.get("TotalResults", 0)
-                current_items = page_number * page_size
-
-                if current_items >= total_count:
-                    break
-
-                page_number += 1
-
-            except Exception as e:
-                logger.error(f"Error fetching children for {parent_product_id}: {e}")
-                raise
+        # SellerCloud keyword search is substring-ish, so this is the canary for the
+        # opposite failure: children we know about that the search did not return.
+        found = {p.get("ID", "").lower() for p in all_children}
+        missed = registered - found
+        if missed and include_inactive:
+            logger.warning(
+                f"SellerCloud returned no catalog row for {len(missed)} registered "
+                f"child(ren) of {parent_product_id}: {sorted(missed)[:10]}"
+            )
 
         def _is_active(product: Dict[str, Any]) -> bool:
             return product.get("ActiveStatus") == "Active"
 
-        # A multi-variant matrix parent is itself inactive and has no "/" in its
-        # ID, so once inactive rows are included it would otherwise show up as a
-        # bogus sizeless child. Drop it, but only when real variants exist - for a
-        # single-SKU product the bare parent row IS the product.
-        if include_inactive and any("/" in p["ID"] for p in all_children):
+        # A multi-variant matrix parent is itself inactive, so once inactive rows are
+        # included it would otherwise show up as a bogus sizeless child. Drop it, but
+        # only when real variants exist - for a single-SKU product the bare parent row
+        # IS the product. The discriminator is identity against the resolved parent, not
+        # the presence of a "/": an ESSX parent SKU contains slashes of its own.
+        if include_inactive and any(p["ID"] != parent_product_id for p in all_children):
             all_children = [
-                p for p in all_children if "/" in p["ID"] or _is_active(p)
+                p
+                for p in all_children
+                if p["ID"] != parent_product_id or _is_active(p)
             ]
 
         if not all_children:
@@ -1017,7 +1042,7 @@ class SellerCloudService:
                 if title_value is not None:
                     list_price = ""
                     try:
-                        sc_product = await self.get_product_by_id(
+                        sc_product = await self.get_catalog_item(
                             child_sku, only_required_fields=False
                         )
                         if sc_product:
@@ -1284,11 +1309,11 @@ class SellerCloudService:
                 f"Successfully populated description template ({len(populated_description)} chars)"
             )
 
-            parent_product_id = (
-                "/".join(product_id.split("/")[:-1])
-                if "/" in product_id
-                else product_id
-            )
+            # product_id is listing.product_id, which is already a parent, so this is
+            # normally a no-op identity resolve. It is kept so that a legacy listing
+            # still holding a chopped phantom parent fails loudly and by name here,
+            # rather than quietly resolving to an empty child set and writing nothing.
+            parent_product_id = await resolve_parent(product_id)
 
             logger.info(f"Fetching children for parent product {parent_product_id}")
             # Deliberately active-only (include_inactive defaults to False): a
