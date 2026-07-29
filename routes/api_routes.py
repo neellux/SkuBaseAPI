@@ -83,23 +83,37 @@ async def _attach_class_names(rows):
 # parent_sku and size so ProductService.apply_size_sort can order rows by
 # canonical size within each parent. raw_columns is the key order pulled from
 # the result dicts; display_columns is the matching header row written to CSV.
+# key_tail is optional and is passed straight to apply_size_sort as a final
+# tiebreak for rows that share a parent and size.
 _EXPORTS = {
     "parent_skus": {
+        # Two kinds of row, with deliberately different filters. Primaries: active
+        # ones only. Secondaries: those tracked by the secondary_skus matview,
+        # i.e. reassigned into a live primary. is_active is NOT checked on that
+        # branch, because merging runs DISABLE_PRODUCT_SC which sets
+        # is_active = FALSE on nearly every secondary. Matview membership already
+        # implies is_primary = FALSE, so the branches cannot overlap. Any
+        # predicate added below must parenthesise the OR.
         "query": """
             SELECT
                 cp.parent_sku,
                 cp.sku,
                 cp.size,
+                cp.is_primary,
                 cu.upc AS primary_upc
             FROM child_products cp
             LEFT JOIN child_upcs cu
                 ON cu.child_sku = cp.sku AND cu.is_primary_upc = TRUE
-            WHERE cp.is_primary = TRUE AND cp.is_active = TRUE
-            ORDER BY cp.parent_sku, cp.sku
+            WHERE (cp.is_primary = TRUE AND cp.is_active = TRUE)
+               OR EXISTS (
+                    SELECT 1 FROM secondary_skus s WHERE s.secondary_sku = cp.sku
+                  )
+            ORDER BY cp.parent_sku, cp.is_primary DESC, cp.sku
         """,
-        "raw_columns": ["parent_sku", "sku", "primary_upc"],
-        "display_columns": ["Parent SKU", "SKU", "Primary UPC"],
+        "raw_columns": ["parent_sku", "sku", "primary_upc", "is_primary"],
+        "display_columns": ["Parent SKU", "SKU", "Primary UPC", "Is Primary"],
         "filename": "parent_skus.csv",
+        "key_tail": lambda r: (0 if r["is_primary"] else 1, r["sku"]),
     },
     # Every child SKU in the internal catalog (active and inactive, primary and
     # secondary) joined to its parent's product info.
@@ -142,8 +156,11 @@ async def export_public(
     """Export product tables as CSV (publicly accessible).
 
     Supported types:
-    - 'parent_skus': each row is a parent SKU mapped to its primary (active)
-      child SKU and that child's primary UPC.
+    - 'parent_skus': each row is a parent SKU mapped to one of its child SKUs
+      and that child's primary UPC. Covers active primary children plus the
+      secondary children tracked in the secondary_skus matview, with an
+      Is Primary column telling them apart. Secondaries have no UPC, because
+      merging moves it onto the primary they were reassigned into.
     - 'product_info': every child SKU in the internal catalog (active and
       inactive) joined to its parent's product info, with columns SKU, Parent
       SKU, Title, Style Name, Brand, Type, General Type, Size, Sizing Scheme.
@@ -162,7 +179,9 @@ async def export_public(
         enrich = export.get("enrich")
         if enrich is not None:
             await enrich(results)
-        await ProductService.apply_size_sort(results)
+        await ProductService.apply_size_sort(
+            results, key_tail=export.get("key_tail", lambda r: ())
+        )
         df = pd.DataFrame(results, columns=export["raw_columns"])
         df.columns = export["display_columns"]
 

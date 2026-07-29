@@ -552,7 +552,12 @@ async def process_bulk_assignment(bulk_id: int = Query(..., description="Bulk re
 async def export_products(
     type: str = Query("primary", description="Export type: 'primary', 'secondary_skus', or 'parent_skus'"),
 ):
-    """Export products as CSV."""
+    """Export products as CSV.
+
+    'parent_skus' covers active primary children plus the secondary children
+    tracked in the secondary_skus matview, with an Is Primary column telling
+    them apart.
+    """
     import io
     import pandas as pd
 
@@ -560,22 +565,37 @@ async def export_products(
         conn = Tortoise.get_connection("product_db")
 
         if type == "parent_skus":
+            # Two kinds of row, with deliberately different filters. Primaries:
+            # active ones only. Secondaries: those tracked by the secondary_skus
+            # matview, i.e. reassigned into a live primary. is_active is NOT
+            # checked on that branch, because merging runs DISABLE_PRODUCT_SC
+            # which sets is_active = FALSE on nearly every secondary. Matview
+            # membership already implies is_primary = FALSE, so the branches
+            # cannot overlap. Any predicate added below must parenthesise the OR.
             query = """
                 SELECT
                     cp.parent_sku,
                     cp.sku,
                     cp.size,
+                    cp.is_primary,
                     cu.upc AS primary_upc
                 FROM child_products cp
                 LEFT JOIN child_upcs cu
                     ON cu.child_sku = cp.sku AND cu.is_primary_upc = TRUE
-                WHERE cp.is_primary = TRUE AND cp.is_active = TRUE
-                ORDER BY cp.parent_sku, cp.sku
+                WHERE (cp.is_primary = TRUE AND cp.is_active = TRUE)
+                   OR EXISTS (
+                        SELECT 1 FROM secondary_skus s WHERE s.secondary_sku = cp.sku
+                      )
+                ORDER BY cp.parent_sku, cp.is_primary DESC, cp.sku
             """
             results = await conn.execute_query_dict(query)
-            await ProductService.apply_size_sort(results)
-            df = pd.DataFrame(results, columns=["parent_sku", "sku", "primary_upc"])
-            df.columns = ["Parent SKU", "SKU", "Primary UPC"]
+            await ProductService.apply_size_sort(
+                results, key_tail=lambda r: (0 if r["is_primary"] else 1, r["sku"])
+            )
+            df = pd.DataFrame(
+                results, columns=["parent_sku", "sku", "primary_upc", "is_primary"]
+            )
+            df.columns = ["Parent SKU", "SKU", "Primary UPC", "Is Primary"]
             filename = "parent_skus_export.csv"
         elif type == "secondary_skus":
             query = """
