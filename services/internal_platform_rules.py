@@ -390,6 +390,38 @@ def needs_tagging(p: SourceProduct, trigger_tag: str, allow: Allowlists,
             and not is_tagged(p, trigger_tag))
 
 
+@dataclass(frozen=True, slots=True)
+class ScheduledActions:
+    """What a scheduled pass is permitted to execute."""
+    tag: bool
+    delist: bool
+
+    @property
+    def any(self) -> bool:
+        return self.tag or self.delist
+
+
+def plan_scheduled_actions(*, auto_submit: bool, auto_delist: bool,
+                           execute_deletes: bool, delists: bool) -> ScheduledActions:
+    """Which halves of a scheduled pass may write. Pure, so the flags are testable.
+
+    auto_submit and auto_delist are INDEPENDENT, and this function exists because they
+    were not. The poller returned early on `not auto_submit` before reaching its delist
+    branch, so the daily pass could never act on auto_delist whatever it held - and it
+    logged "planning only" while doing it, which is what kept the dead flag hidden for as
+    long as it was. Extracting the decision means the branch that ships is the branch the
+    tests drive, rather than a re-implementation of it in a test file.
+
+    `execute` is deliberately NOT an input. It gates every write from the pass, scheduled
+    or manual, and folding it in here would let a caller satisfy this function and still
+    need a second check - one switch, one place.
+    """
+    return ScheduledActions(
+        tag=auto_submit,
+        delist=delists and auto_delist and execute_deletes,
+    )
+
+
 def is_delist_candidate(verdict: FilterVerdict, *,
                         delist_on_no_inventory: bool) -> bool:
     """Has this tagged product stopped qualifying in a way that warrants delisting?

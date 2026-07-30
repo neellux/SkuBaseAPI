@@ -63,6 +63,7 @@ from services.internal_platform_rules import (
     delist_cause,
     is_delist_candidate,
     is_tagged,
+    plan_scheduled_actions,
     qualifies,
 )
 from services.shopify_admin import Product, ShopifyAdmin
@@ -166,9 +167,10 @@ class InternalPlatformSourcePoller:
         self.delist_soak_cycles: int = int(cfg.get("delist_soak_cycles", 2))
 
         # Whether selling out is grounds for delisting. FALSE by default and in config:
-        # stock is transient, and tearing a listing down means Syncio removes it from
-        # Shop The Sample, so the item has to be rebuilt from scratch when it restocks.
-        # 583 of the 1,363 live products were at zero stock when this was measured.
+        # stock is transient, but a delist is not - it untags on 1nventory AND deletes the
+        # Shop The Sample product outright, so the listing has to be rebuilt from nothing
+        # when the item restocks. 583 of the 1,363 live products were at zero stock when
+        # this was measured, so the flag decides the fate of 43% of the live footprint.
         self.delist_on_no_inventory: bool = bool(
             cfg.get("delist_on_no_inventory", False)
         )
@@ -410,7 +412,11 @@ class InternalPlatformSourcePoller:
 
     # -- cycle -------------------------------------------------------------
 
-    async def _cycle(self, manual: bool = False, delists: bool = True) -> SourceReport:
+    # `manual` used to be a parameter here. It is gone: manual_submit() was rewritten to
+    # work from stored state and no longer routes through this method, so no caller ever
+    # passed it, and a dead parameter that appears to unlock the write path is worse than
+    # no parameter at all - it was half of why auto_delist looked reachable.
+    async def _cycle(self, delists: bool = True) -> SourceReport:
         report = SourceReport()
         report.dry_run = not self.execute
 
@@ -707,13 +713,23 @@ class InternalPlatformSourcePoller:
             report.aborted = breach
             return report
 
-        # The scheduled pass is gated by auto_submit; the manual button is not. `execute`
-        # gates both, so with execute=false this returns a plan and writes nothing.
-        if not manual and not self.auto_submit:
-            logger.info("%s: auto_submit=false, planning only. %s",
-                        self.name, report.summary())
+        # auto_submit and auto_delist are INDEPENDENT. They did not used to be: this
+        # returned early on `not auto_submit`, before the delist branch below, so the
+        # daily pass never reached it and auto_delist did nothing whatever it was set to.
+        # Nothing announced that - the pass logged "planning only" and looked correct.
+        allowed = plan_scheduled_actions(
+            auto_submit=self.auto_submit, auto_delist=self.auto_delist,
+            execute_deletes=self.execute_deletes, delists=delists,
+        )
+        may_tag, may_delist = allowed.tag, allowed.delist
+
+        if not allowed.any:
+            logger.info("%s: auto_submit=%s auto_delist=%s execute_deletes=%s - planning "
+                        "only, the buttons execute. %s", self.name, self.auto_submit,
+                        self.auto_delist, self.execute_deletes, report.summary())
             return report
 
+        # `execute` gates every write from this pass, scheduled or not.
         if not self.execute:
             logger.info("%s: dry-run, %s", self.name, report.summary())
             return report
@@ -721,8 +737,13 @@ class InternalPlatformSourcePoller:
         if not writes_enabled():
             enable_writes(f"{self.name} execute=true")
 
-        await self._apply_tags(platform, admin, report)
-        if delists and self.auto_delist and self.execute_deletes:
+        if may_tag:
+            await self._apply_tags(platform, admin, report)
+        elif report.to_tag:
+            logger.info("%s: %d products qualify; the Submit button tags them "
+                        "(auto_submit=false)", self.name, len(report.to_tag))
+
+        if may_delist:
             await self._apply_delists(platform, admin, report, report.to_delist)
         elif report.to_delist:
             logger.info("%s: %d products queued as pending_delisting; the Delist button "
@@ -810,19 +831,27 @@ class InternalPlatformSourcePoller:
 
                 dest_product = await dest_admin.get_product(dest_gid)
                 if dest_product is None:
-                    # Already gone. Expected rather than exceptional: untagging the
-                    # source makes Syncio remove the destination product on its own
-                    # (observed 5 of 5 on 2026-07-29), and it can win this race. The
-                    # outcome we wanted has happened, so record it as such instead of
-                    # dropping the row on the floor.
+                    # Already gone - deleted by hand, removed in Syncio's own UI, or
+                    # cleaned up by an earlier run of this method.
+                    #
+                    # NOT because untagging the source causes Syncio to remove it. Five
+                    # products vanished after an untag on 2026-07-29 and that inference
+                    # was recorded here; it was wrong, and a human had deleted them.
+                    # Assume the opposite: the destination product SURVIVES an untag, so
+                    # the productDelete below is the only thing that removes it and this
+                    # branch is a genuine edge case rather than the normal path.
+                    #
+                    # Still recorded as success: the outcome we wanted is the state we
+                    # are in, and the alternative was dropping the row on the floor.
                     await ledger.record(
                         platform_id=self.platform_id, parent_sku=parent_sku,
                         action=Act.DELETE, status=St.SUCCESS,
                         source_gid=source_gid, dest_gid=dest_gid,
                         payload={"cause": cause},
                         result={"already_absent": True,
-                                "note": "destination product gone before we deleted it; "
-                                        "Syncio removes it when the source is untagged"},
+                                "note": "destination product did not exist when we came "
+                                        "to delete it; removed by something outside this "
+                                        "pipeline"},
                     )
                     await ledger.mark_delisted(state)
                     report.deleted += 1
