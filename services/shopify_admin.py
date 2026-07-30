@@ -53,6 +53,12 @@ logger = logging.getLogger(__name__)
 
 MAX_QUERY_COST = 1000
 
+# Hard ceiling on `nodes(ids:)`. A separate limit from MAX_QUERY_COST and unrelated to it:
+# this one is validated on the input array before costing happens, and over it the request
+# is rejected with "The input array size of N is greater than the maximum allowed of 250"
+# no matter how cheap the query would have been.
+NODES_MAX_IDS = 250
+
 # The budget we pack to, and the ONLY place safety margin lives. The cost functions below
 # model what Shopify charges and nothing else; a fudge factor inside them (reprice_cost
 # carried a +1) hides the margin in two places at once and makes neither number mean what
@@ -289,7 +295,18 @@ class ShopifyAdmin:
             yield parse_product(node)
 
     async def products_by_ids(self, gids: Sequence[str]) -> list[Product]:
-        """Fetch a known set of products in one round trip.
+        """Fetch a known set of products, however many. Chunked at NODES_MAX_IDS.
+
+        `nodes(ids:)` rejects more than 250 ids outright - "The input array size of 398 is
+        greater than the maximum allowed of 250" - and it is a hard API limit, not a cost
+        ceiling, so no budget arithmetic avoids it. Chunking lives HERE rather than in the
+        callers because the limit belongs to the query: manual_submit hit this the first
+        time max_products_in_flight was set to 0 and all 398 ready products became one
+        batch, and a caller that has to remember a transport limit will forget it.
+
+        Sequential, not concurrent. Four reads cost ~316 points against a 4,000 bucket
+        restoring at 200/s, so the governor never paces them and the wall clock is about a
+        second - not worth the extra failure modes concurrency brings to a read path.
 
         Nodes that came back null - deleted since we stored them - are dropped rather
         than raising: a product vanishing between the scan and the submit is a normal
@@ -297,11 +314,15 @@ class ShopifyAdmin:
         """
         if not gids:
             return []
-        data = await self.client.execute(
-            PRODUCTS_BY_IDS, {"ids": list(gids)},
-            operation=f"products.by_ids[{self.store_id}]",
-        )
-        return [parse_product(n) for n in (data.get("nodes") or []) if n]
+        ids = list(gids)
+        out: list[Product] = []
+        for i in range(0, len(ids), NODES_MAX_IDS):
+            data = await self.client.execute(
+                PRODUCTS_BY_IDS, {"ids": ids[i:i + NODES_MAX_IDS]},
+                operation=f"products.by_ids[{self.store_id}]",
+            )
+            out.extend(parse_product(n) for n in (data.get("nodes") or []) if n)
+        return out
 
     async def get_product(self, gid: str) -> Product | None:
         data = await self.client.execute(
