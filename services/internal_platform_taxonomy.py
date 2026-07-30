@@ -94,6 +94,24 @@ def normalize_vendor(vendor: str | None) -> str | None:
     return VENDOR_OVERRIDES.get(upper, upper)
 
 
+def normalize_title(title: str | None) -> str | None:
+    """Uppercase the destination product title. None when there is nothing to normalize.
+
+    Syncio copies the title verbatim from 1nventory, where casing is whatever the person
+    who created the product typed. Shop The Sample presents them uppercase, so this is the
+    same correction normalize_vendor makes and for a related reason - except that vendor
+    casing also breaks smart-collection membership, while this one is purely presentation.
+
+    No override table, unlike VENDOR_OVERRIDES. A title is free text rather than a value
+    matched against collection rules, so there is nothing for an exception list to fix;
+    upper() is the whole rule. Returning None for a blank title means the caller plans no
+    write rather than trying to set an empty string.
+    """
+    if not title or not title.strip():
+        return None
+    return title.strip().upper()
+
+
 def derive_parent_sku(variant_sku: str | None) -> str | None:
     """Parent SKU from a variant SKU shaped PARENT/SIZE.
 

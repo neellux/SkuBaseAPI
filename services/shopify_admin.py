@@ -73,14 +73,21 @@ def reprice_cost(variant_count: int) -> int:
     return 10 + variant_count // 5
 
 
-def normalize_cost(vendor: Any, add: Sequence[str], remove: Sequence[str]) -> int:
+def normalize_cost(product_update: Any, add: Sequence[str],
+                   remove: Sequence[str]) -> int:
     """Requested cost of one product's normalization: 10 per alias it contributes.
+
+    `product_update` is truthy when the product needs a productUpdate at all - vendor,
+    title, or both. It is deliberately ONE argument rather than one per field: Shopify
+    charges a mutation 10 points flat however many fields it sets, so vendor and title
+    share a single alias and adding a third field later would not change this number
+    either.
 
     Costed from what the product ACTUALLY needs, not the worst case. Most products need
     one or two aliases, so assuming three - as a fixed chunk of 28 did - left roughly 40%
     of every document unused.
     """
-    return 10 * (bool(vendor) + bool(add) + bool(remove))
+    return 10 * (bool(product_update) + bool(add) + bool(remove))
 
 
 def batches_by_cost(items: Sequence[Any], cost_of: Any,
@@ -526,15 +533,21 @@ class ShopifyAdmin:
 
     async def apply_normalizations_bulk(
         self,
-        items: Sequence[tuple[str, str | None, Sequence[str], Sequence[str]]],
+        items: Sequence[
+            tuple[str, str | None, str | None, Sequence[str], Sequence[str]]],
         max_cost: int = DOC_BUDGET,
     ) -> dict[str, str | None]:
-        """Vendor and tag corrections for many products per request.
+        """Vendor, title and tag corrections for many products per request.
 
-        items is (product_gid, vendor or None, tags to add, tags to remove). Split by
-        normalize_cost, which charges 10 points per alias the product ACTUALLY needs, so
-        a document holds 28 products that each need all three corrections but 85 that
-        need only one.
+        items is (product_gid, vendor or None, title or None, tags to add, tags to
+        remove). Split by normalize_cost, which charges 10 points per alias the product
+        ACTUALLY needs, so a document holds 28 products that each need all three
+        corrections but 85 that need only one.
+
+        Vendor and title share ONE productUpdate alias. Shopify charges a mutation 10
+        points flat regardless of how many fields it sets, so correcting both costs
+        exactly what correcting either alone costs - which is why title normalization
+        added no measurable load when it was introduced.
 
         add and remove are issued in the same document with no ordering between them.
         That is safe because desired_tags builds them disjoint by construction - every
@@ -548,15 +561,21 @@ class ShopifyAdmin:
         results: dict[str, str | None] = {}
 
         for batch in batches_by_cost(
-            list(items), lambda it: normalize_cost(it[1], it[2], it[3]), max_cost
+            list(items),
+            lambda it: normalize_cost(it[1] or it[2], it[3], it[4]), max_cost
         ):
             defs, aliases, variables = [], [], {}
-            for n, (gid, vendor, add, remove) in enumerate(batch):
+            for n, (gid, vendor, title, add, remove) in enumerate(batch):
                 defs.append(f"$id{n}: ID!")
                 variables[f"id{n}"] = gid
-                if vendor:
+                if vendor or title:
+                    fields = {"id": gid}
+                    if vendor:
+                        fields["vendor"] = vendor
+                    if title:
+                        fields["title"] = title
                     defs.append(f"$vp{n}: ProductUpdateInput!")
-                    variables[f"vp{n}"] = {"id": gid, "vendor": vendor}
+                    variables[f"vp{n}"] = fields
                     aliases.append(
                         f"v{n}: productUpdate(product: $vp{n}) "
                         "{ userErrors { field message } }"
@@ -582,9 +601,10 @@ class ShopifyAdmin:
                     operation=f"normalize.bulk[{self.store_id}]",
                     is_write=True,
                 )
-                for n, (gid, vendor, add, remove) in enumerate(batch):
+                for n, (gid, vendor, title, add, remove) in enumerate(batch):
                     errs = []
-                    for prefix, present in (("v", vendor), ("a", add), ("r", remove)):
+                    for prefix, present in (("v", vendor or title), ("a", add),
+                                            ("r", remove)):
                         if not present:
                             continue
                         errs += (data.get(f"{prefix}{n}") or {}).get("userErrors") or []

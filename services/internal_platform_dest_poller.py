@@ -75,7 +75,7 @@ class PlannedWrite:
     parent_sku: str
     dest_gid: str
     source_gid: str | None
-    kind: str                      # vendor | tags | price
+    kind: str                      # vendor | title | tags | price
     detail: str
     variant_count: int = 0
     payload: dict[str, Any] = field(default_factory=dict)
@@ -250,7 +250,8 @@ class InternalPlatformDestPoller(BasePoller):
         # constant: ~91 products per reprice document at the live variant spread, 31 to
         # 95 per normalize document depending on how many corrections each product needs.
         price_writes = [p for p in report.planned if p.kind == "price"]
-        norm_writes = [p for p in report.planned if p.kind in ("vendor", "tags")]
+        norm_writes = [p for p in report.planned
+                       if p.kind in ("vendor", "title", "tags")]
 
         if price_writes:
             await self._apply_prices_batched(admin, price_writes, report)
@@ -314,7 +315,7 @@ class InternalPlatformDestPoller(BasePoller):
         )
 
         vendor_now = product.vendor
-        from services.internal_platform_taxonomy import normalize_vendor
+        from services.internal_platform_taxonomy import normalize_title, normalize_vendor
         vendor_want = normalize_vendor(product.vendor)
         if vendor_want is None:
             report.skipped.append((parent_sku, Skip.NOT_OURS, "product has no vendor"))
@@ -354,6 +355,21 @@ class InternalPlatformDestPoller(BasePoller):
                 parent_sku, product.gid, product.syncio_source_gid, "vendor",
                 f"{vendor_now!r} -> {vendor_want!r}",
                 payload={"vendor": vendor_want, "before": {"vendor": vendor_now}},
+            ))
+            wrote_anything = True
+
+        # Kept a SEPARATE planned write from vendor even though both are fields of the
+        # same productUpdate mutation, so the plan and the dry-run report say which of the
+        # two actually changed. They are merged back into one alias at write time, where
+        # productUpdate costs 10 points whether it carries one field or both - so the
+        # clarity is free.
+        title_now = product.title
+        title_want = normalize_title(title_now)
+        if title_want is not None and title_want != title_now:
+            report.planned.append(PlannedWrite(
+                parent_sku, product.gid, product.syncio_source_gid, "title",
+                f"{title_now!r} -> {title_want!r}",
+                payload={"title": title_want, "before": {"title": title_now}},
             ))
             wrote_anything = True
 
@@ -517,11 +533,18 @@ class InternalPlatformDestPoller(BasePoller):
         for p in planned:
             e = merged.setdefault(p.parent_sku, {
                 "dest_gid": p.dest_gid, "source_gid": p.source_gid,
-                "vendor": None, "add": [], "remove": [], "payload": {},
+                "vendor": None, "title": None, "add": [], "remove": [],
+                "payload": {},
             })
+            # vendor and title collapse into ONE productUpdate alias; tags are their own
+            # mutations. Three planned writes for a product become at most three aliases,
+            # never four.
             if p.kind == "vendor":
                 e["vendor"] = p.payload["vendor"]
                 e["payload"]["vendor"] = p.payload
+            elif p.kind == "title":
+                e["title"] = p.payload["title"]
+                e["payload"]["title"] = p.payload
             else:
                 e["add"] = list(p.payload["add"])
                 e["remove"] = list(p.payload["remove"])
@@ -530,7 +553,8 @@ class InternalPlatformDestPoller(BasePoller):
         skus = list(merged)
         groups = batches_by_cost(
             skus, lambda s: normalize_cost(
-                merged[s]["vendor"], merged[s]["add"], merged[s]["remove"]))
+                merged[s]["vendor"] or merged[s]["title"],
+                merged[s]["add"], merged[s]["remove"]))
         done = 0
         for group_skus in groups:
             ids = await ledger.claim_and_record(
@@ -546,7 +570,7 @@ class InternalPlatformDestPoller(BasePoller):
             try:
                 errors = await admin.apply_normalizations_bulk([
                     (merged[sku]["dest_gid"], merged[sku]["vendor"],
-                     merged[sku]["add"], merged[sku]["remove"])
+                     merged[sku]["title"], merged[sku]["add"], merged[sku]["remove"])
                     for sku in claimed
                 ])
 
