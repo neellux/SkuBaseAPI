@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, validator, model_validator
 from typing import List, Optional, Union, Literal, Dict, Any
 from datetime import datetime
+from decimal import Decimal
 import re
 
 
@@ -1307,3 +1308,242 @@ class BulkImportJobStatusResponse(BaseModel):
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Internal platforms (consignment pipeline: 1nventory -> Syncio -> Shop The Sample)
+# ---------------------------------------------------------------------------
+
+
+class InternalPlatformStoreStatus(BaseModel):
+    store_key: str = Field(..., description="Config lookup key, e.g. 'xuh30f-dr'")
+    role: str = Field(..., description="'source' or 'destination'")
+    granted_scopes: List[str] = Field(
+        default_factory=list, description="Scopes the Shopify app actually holds"
+    )
+    required_scopes: List[str] = Field(
+        default_factory=list, description="Scopes this pipeline needs on this store"
+    )
+    missing_scopes: List[str] = Field(
+        default_factory=list, description="required - granted; non-empty means blocked"
+    )
+    reachable: bool = Field(True, description="False if the token request failed")
+    error: Optional[str] = Field(None, description="Why the store could not be reached")
+
+
+class InternalPlatformPollerStatus(BaseModel):
+    name: str = Field(..., description="Poller identifier")
+    enabled: bool = Field(..., description="Whether the poller starts at all")
+    execute: bool = Field(..., description="False means dry-run: plans but never writes")
+    execute_deletes: Optional[bool] = Field(
+        None, description="Source poller only; deletes are gated separately"
+    )
+    cadence: str = Field("", description="Human-readable schedule")
+
+
+class InternalPlatformOverviewResponse(BaseModel):
+    platform_id: str = Field(..., description="Internal platform identifier")
+    name: str = Field("", description="Display name")
+    source_store: str = Field("", description="Source store config key")
+    dest_store: str = Field("", description="Destination store config key")
+    trigger_tag: str = Field("", description="Tag that drives the sync")
+    platform_enabled: bool = Field(
+        False, description="Platform row enabled flag; false means nothing runs"
+    )
+
+    # The effective write posture, so an operator reads it rather than inferring it from a
+    # Submit button that returns 409. Three separate switches because they fail at three
+    # different points and a single "read-only" boolean would hide which one is engaged.
+    writes_allowed: bool = Field(
+        True,
+        description="[shopify] allow_writes. False means this environment cannot write "
+        "to Shopify by any caller, including maintenance scripts",
+    )
+    source_poller_enabled: bool = Field(
+        False, description="Source poller runs its scheduled scan"
+    )
+    source_poller_execute: bool = Field(
+        False, description="Source poller may write; false makes POST /submit return 409"
+    )
+    dest_poller_enabled: bool = Field(
+        False, description="Destination poller runs its scheduled reconcile"
+    )
+    dest_poller_execute: bool = Field(
+        False, description="Destination poller may write vendor, tags and prices"
+    )
+
+    tracked: int = Field(0, description="Parent SKUs tracked in state")
+    live: int = Field(0, description="Products confirmed on the destination")
+    awaiting_sync: int = Field(
+        0, description="Tagged on source, Syncio has not delivered yet"
+    )
+    stale_awaiting_sync: int = Field(
+        0, description="Awaiting sync beyond the alert window (needs a human)"
+    )
+    failed: int = Field(0, description="State rows in a failed state")
+    flagged: int = Field(0, description="State rows skipped and flagged")
+    orphaned_delists: int = Field(
+        0, description="Source untagged but the destination action failed"
+    )
+
+    status_counts: Dict[str, int] = Field(
+        default_factory=dict, description="State rows grouped by current_status"
+    )
+    skip_reason_counts: Dict[str, int] = Field(
+        default_factory=dict, description="State rows grouped by skip_reason"
+    )
+    recent_activity: Dict[str, int] = Field(
+        default_factory=dict, description="'{action}.{status}' counts for the window"
+    )
+    activity_window_minutes: int = Field(
+        1440, description="Window used for recent_activity"
+    )
+
+    products_in_flight: int = Field(
+        0, description="Products tagged on source and awaiting Syncio delivery"
+    )
+    max_products_in_flight: int = Field(
+        0, description="Ceiling the submit gate budgets against; 0 means disabled"
+    )
+    submit_blocked: bool = Field(
+        False, description="True when the Syncio capacity gate would refuse a submit"
+    )
+    submit_gate_message: str = Field("", description="Human-readable capacity state")
+    auto_submit: bool = Field(
+        False, description="Whether the scheduled pass tags automatically"
+    )
+    can_submit_for_real: bool = Field(
+        False, description="False means a submit would be a dry-run (execute=false)"
+    )
+    ready_for_listing: int = Field(
+        0, description="Qualify but not yet tagged; waiting on a Submit click"
+    )
+    pending_delisting: int = Field(
+        0, description="Stopped qualifying and soaked; waiting on a Delist click"
+    )
+    can_delist_for_real: bool = Field(
+        False, description="False means Delist would refuse (execute_deletes=false)"
+    )
+    auto_delist: bool = Field(
+        False, description="Whether the scheduled pass delists automatically"
+    )
+
+    stores: List[InternalPlatformStoreStatus] = Field(default_factory=list)
+    pollers: List[InternalPlatformPollerStatus] = Field(default_factory=list)
+    blockers: List[str] = Field(
+        default_factory=list,
+        description="Human-readable reasons the pipeline is not currently writing",
+    )
+
+
+class InternalPlatformStateRow(BaseModel):
+    parent_sku: str = Field(..., description="Parent SKU this row tracks")
+
+    # Shopify-derived facts, refreshed by the source scan on every pass. Null until a scan
+    # has seen the product, so the UI renders these cells empty rather than wrong.
+    title: str | None = Field(None, description="Product title on 1nventory")
+    image_url: str | None = Field(None, description="featuredImage URL")
+    product_type: str | None = Field(None, description="Lux product type")
+    inventory: int = Field(0, description="Total stock across variants")
+    source_price: Decimal | None = Field(None, description="MIN variant price on 1nventory")
+    source_compare_at: Decimal | None = Field(
+        None, description="MAX variant compare-at; the denominator for both discounts"
+    )
+    sts_price: Decimal | None = Field(
+        None, description="Computed destination price; null when pricing does not resolve"
+    )
+    variant_count: int = Field(0, description="Variants this product carries")
+    variants: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Per-variant sku/size/price/compare_at/inventory, as the scan saw them",
+    )
+
+    current_status: str = Field(
+        ...,
+        description="pending|ready_for_listing|pending_normalization|listed|"
+                    "pending_delisting|delisted|failed|skipped",
+    )
+    source_product_gid: Optional[str] = Field(None, description="Shopify GID on the source store")
+    dest_product_gid: Optional[str] = Field(None, description="Shopify GID on the destination")
+    inflight_action: Optional[str] = Field(None, description="Action currently claimed, if any")
+    skip_reason: Optional[str] = Field(None, description="Why the automation declined to act")
+    last_error: Optional[str] = Field(None, description="Most recent failure detail")
+    delist_strikes: int = Field(0, description="Consecutive cycles failing qualification")
+    listed_at: Optional[datetime] = None
+    normalize_done_at: Optional[datetime] = None
+    location_done_at: Optional[datetime] = None
+    delisted_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class InternalPlatformProductsResponse(BaseModel):
+    platform_id: str
+    items: List[InternalPlatformStateRow] = Field(default_factory=list)
+    total: int = Field(0, description="Total rows matching the filters")
+    page: int = Field(1, description="Current page (1-indexed)")
+    page_size: int = Field(50, description="Rows per page")
+
+
+class InternalPlatformSubmissionRow(BaseModel):
+    id: int = Field(..., description="Ledger row id")
+    parent_sku: str
+    action: str = Field(..., description="list|normalize|reprice|location|untag|delete")
+    status: str = Field(..., description="pending|success|failed|skipped")
+    skip_reason: Optional[str] = None
+    source_product_gid: Optional[str] = None
+    dest_product_gid: Optional[str] = None
+    error: Optional[str] = Field(None, description="Redacted failure detail")
+    actor: Optional[str] = None
+    triggered_by: str = Field("scheduler", description="scheduler|manual|backfill")
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class InternalPlatformActivityResponse(BaseModel):
+    platform_id: str
+    items: List[InternalPlatformSubmissionRow] = Field(default_factory=list)
+    total: int = Field(0, description="Total rows matching the filters")
+    page: int = Field(1, description="Current page (1-indexed)")
+    page_size: int = Field(50, description="Rows per page")
+
+
+class InternalPlatformSubmissionDetail(InternalPlatformSubmissionRow):
+    payload: Optional[Dict[str, Any]] = Field(
+        None, description="Whitelisted request payload, includes the pre-image on deletes"
+    )
+    result: Optional[Dict[str, Any]] = Field(None, description="Whitelisted response")
+
+
+class InternalPlatformProductDetailResponse(BaseModel):
+    platform_id: str
+    parent_sku: str
+    state: Optional[InternalPlatformStateRow] = Field(
+        None, description="Current state; null if only history exists"
+    )
+    timeline: List[InternalPlatformSubmissionDetail] = Field(
+        default_factory=list, description="Every action for this SKU, newest first"
+    )
+    status_counts: Dict[str, int] = Field(default_factory=dict)
+
+
+class InternalPlatformSubmitResponse(BaseModel):
+    platform_id: str = Field(..., description="Internal platform the submit ran for")
+    submitted: int = Field(0, description="Products tagged on the source store")
+    variants_submitted: int = Field(0, description="Variants those products carry")
+    held_back: int = Field(
+        0, description="Qualifying products trimmed to fit Syncio's remaining budget"
+    )
+    blocked: bool = Field(False, description="True when the Syncio capacity gate refused")
+    gate_message: str = Field("", description="Human-readable capacity state")
+    products_in_flight: int = Field(0, description="Products awaiting Syncio delivery")
+    max_products_in_flight: int = Field(0, description="Ceiling the gate budgets against")
+
+
+class InternalPlatformDelistResponse(BaseModel):
+    platform_id: str = Field(..., description="Internal platform the delist ran for")
+    untagged: int = Field(0, description="Products untagged on the source store")
+    deleted: int = Field(0, description="Destination products deleted. IRREVERSIBLE")
+    failed: int = Field(0, description="Products whose delist did not complete")
+    still_pending: int = Field(0, description="Queued for delisting after this run")
+    blocked: bool = Field(False, description="True when the run refused to act")
+    gate_message: str = Field("", description="Why it refused, when it did")

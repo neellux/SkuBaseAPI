@@ -14,6 +14,7 @@ from routes.listing_routes import router as listing_router
 from routes.product_routes import router as product_router
 from routes.settings_routes import router as settings_router
 from routes.submissions_routes import router as submissions_router
+from routes.internal_platform_routes import router as internal_platform_router
 from routes.template_routes import router as template_router
 from listingoptions.routes.table_routes import router as lo_table_router
 from listingoptions.routes.list_routes import router as lo_list_router
@@ -35,6 +36,9 @@ from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.spo_poller import spo_poller
 from services.grailed_poller import grailed_poller
 from services.submission_poller import submission_poller
+from services.internal_platform_dest_poller import internal_platform_dest_poller
+from services.internal_platform_source_poller import internal_platform_source_poller
+from services.shopify_client import close_shopify_clients
 from tortoise.contrib.fastapi import register_tortoise
 from utils.load_app_data import app_users, load_app_data
 
@@ -84,6 +88,8 @@ app.include_router(template_router)
 app.include_router(listing_router)
 app.include_router(settings_router)
 app.include_router(submissions_router)
+# Authenticated app only, never api_app: /api is excluded from AuthMiddleware.
+app.include_router(internal_platform_router)
 app.include_router(product_router)
 app.include_router(image_router)
 
@@ -141,12 +147,18 @@ async def startup_event():
     await secondary_inventory_transfer_poller.start()
     await daily_image_import_poller.start()
     await daily_sellercloud_sync_poller.start()
+    # Both default enabled=false. They act on live Shopify storefronts and the source
+    # store still lacks write_products, so nothing starts writing on deploy.
+    await internal_platform_dest_poller.start()
+    await internal_platform_source_poller.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("SkuBase API shutdown...")
 
+    await internal_platform_source_poller.stop()
+    await internal_platform_dest_poller.stop()
     await daily_sellercloud_sync_poller.stop()
     await daily_image_import_poller.stop()
     await secondary_inventory_transfer_poller.stop()
@@ -168,6 +180,10 @@ async def shutdown_event():
     logger.info("Closing Image service...")
     await image_service.close()
     logger.info("Image service closed successfully")
+
+    logger.info("Closing Shopify clients...")
+    await close_shopify_clients()
+    logger.info("Shopify clients closed successfully")
 
 
 @app.get("/")

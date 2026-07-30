@@ -416,3 +416,259 @@ class AppSettings(Model):
 
     def __str__(self):
         return f"AppSettings({self.id})"
+
+
+class InternalPlatformAction(StrEnum):
+    """Actions the consignment pipeline can take against a parent product.
+
+    Written into internal_platform_submissions.action, which carries a CHECK
+    constraint - a typo here would create a private namespace no query ever finds.
+    """
+
+    LIST = "list"           # tag on source; Syncio delivers 1-3 days later
+    NORMALIZE = "normalize"  # vendor + tags on destination
+    REPRICE = "reprice"      # price / compare-at on destination
+    LOCATION = "location"    # zero phantom non-Lakewood inventory
+    UNTAG = "untag"          # remove trigger tag on source (first half of delist)
+    DELETE = "delete"        # productDelete on destination (irreversible)
+
+
+class InternalPlatformStatus(StrEnum):
+    """Terminal-ish states for a ledger row.
+
+    Deliberately NOT SubmissionStatus: there is no human queuer and no overlapping
+    cycles here, so queued/processing have no meaning. `skipped` is the state
+    SubmissionStatus lacks, and without it the two documented skip-and-flag
+    behaviours (unmapped product type, location guard trip) would have to lie as
+    either success or failed.
+    """
+
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class InternalPlatformSkipReason(StrEnum):
+    """Why we deliberately declined to act. Not an error - nothing failed.
+
+    Populates the flagged report (WHERE skip_reason IS NOT NULL), which is how an
+    operator sees what the automation chose not to touch.
+    """
+
+    # Selection: the source product does not qualify for STS.
+    NO_INVENTORY = "no_inventory"
+    UNMAPPED_PRODUCT_TYPE = "unmapped_product_type"
+    UNDERIVABLE_GENDER = "underivable_gender"
+    BELOW_PRICE_FLOOR = "below_price_floor"
+    NO_COMPARE_AT = "no_compare_at"
+    # The discount band has TWO edges and both reject. TOO_HIGH means the markdown is so
+    # steep it cannot be brought inside the 80% cap without an implausible price bump;
+    # TOO_LOW means the product sits near full price and is not worth a consignment slot
+    # (under the 15% floor). The low edge was missing here while qualifies() emitted a
+    # code for it anyway - measured 2026-07-28, 584 products, the fourth largest
+    # rejection category, filed under a reason the Skipped Products filter did not know
+    # existed and so could never surface.
+    DISCOUNT_TOO_HIGH = "discount_too_high"
+    DISCOUNT_TOO_LOW = "discount_too_low"
+    NO_PRICED_VARIANTS = "no_priced_variants"
+    # Normalization: we reached the destination product but declined to write.
+    NOT_OURS = "not_ours"
+    CAS_MISMATCH = "cas_mismatch"
+    # NOTE: location_guard / inventory_would_zero were removed. They skipped the exact
+    # case the location pass exists to fix - stock sitting only at a wrong location is
+    # Syncio's creation bug, not inventory worth protecting. See
+    # internal_platform_rules.plan_location_cleanup.
+    # No variant SKU resolves to a registered parent in the products DB. We do not
+    # list products SkuBase does not know about - they cannot be normalized safely
+    # and would escape the destination ownership guard.
+    UNREGISTERED_PARENT = "unregistered_parent"
+
+
+class InternalPlatform(Model):
+    """A consignment target driven through a third-party sync tool, not an API.
+
+    source_store / dest_store are LOOKUP KEYS into config.toml [shopify.stores.*].
+    They must never be interpolated into a URL host: the token exchange POSTs the
+    client secret to https://{store}.myshopify.com, so a writable DB value reaching
+    the host would exfiltrate that secret.
+    """
+
+    id = fields.CharField(pk=True, max_length=50)
+    name = fields.CharField(max_length=255)
+
+    source_store = fields.CharField(
+        max_length=60, description="Config lookup key for the source store, not a hostname"
+    )
+    dest_store = fields.CharField(
+        max_length=60, description="Config lookup key for the destination store, not a hostname"
+    )
+    trigger_tag = fields.CharField(
+        max_length=64,
+        description="Tag applied on source to trigger sync. Flows into Shopify's query: "
+        "mini-language, which GraphQL variables do not protect, so it is regex-validated",
+    )
+
+    dest_location_gid = fields.TextField(
+        null=True,
+        description="Resolved Shopify location GID. Never match a location by display "
+        "name: a rename would make every location 'not Lakewood' and zero the catalog",
+    )
+    dest_location_name = fields.CharField(max_length=255, null=True)
+
+    enabled = fields.BooleanField(default=False)
+
+    config = fields.JSONField(
+        default=dict,
+        description="Reserved for per-platform settings. Until populated, numeric rules "
+        "live in internal_platform_rules.py so there is one source of truth",
+    )
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "internal_platforms"
+
+    def __str__(self):
+        return f"InternalPlatform({self.id}: {self.source_store} -> {self.dest_store})"
+
+
+class InternalPlatformState(Model):
+    """Current state per (platform, parent_sku). Narrow, hot, bounded at catalog size.
+
+    Loaded into a dict once per cycle. This is what replaces a per-product idempotency
+    query (~72k queries/day -> 24), and it carries the in-flight claim so a crash
+    cannot be mistaken for work in progress forever.
+    """
+
+    id = fields.BigIntField(pk=True)
+
+    internal_platform = fields.ForeignKeyField(
+        "models.InternalPlatform",
+        related_name="states",
+        on_delete=fields.CASCADE,
+        source_field="internal_platform_id",
+    )
+    parent_sku = fields.CharField(
+        max_length=110,
+        description="No FK: parent_products lives in the products DB. Same treatment as "
+        "listings.product_id",
+    )
+
+    # Shopify GIDs as text. Shopify returns GIDs and Syncio's metafield holds one;
+    # round-tripping through bigint invites the ID-namespace confusion we are guarding
+    # against.
+    source_product_gid = fields.TextField(null=True)
+    dest_product_gid = fields.TextField(null=True)
+
+    current_status = fields.CharField(max_length=30, default="pending")
+
+    inflight_action = fields.CharField(
+        max_length=20,
+        null=True,
+        description="Set while an action is being attempted. Backed by a partial unique "
+        "index, and swept by the stale-recovery pass - without that sweep a crash would "
+        "block this key permanently",
+    )
+    inflight_since = fields.DatetimeField(null=True)
+
+    listed_at = fields.DatetimeField(null=True)
+    normalize_done_at = fields.DatetimeField(null=True)
+    location_done_at = fields.DatetimeField(null=True)
+    delisted_at = fields.DatetimeField(null=True)
+
+    last_source_updated_at = fields.TextField(null=True)
+    last_dest_updated_at = fields.TextField(null=True)
+    desired_hash = fields.TextField(
+        null=True, description="Hash of the desired state last successfully written"
+    )
+
+    delist_strikes = fields.IntField(
+        default=0,
+        description="Consecutive cycles failing qualification. Delist fires only at the "
+        "soak threshold, so a transient bad read cannot trigger deletes",
+    )
+
+    # Shopify-derived facts, refreshed by the source scan on every pass. Denormalised
+    # here rather than joined at read time: the database is remote at ~0.57s a round trip
+    # and the Products endpoint was just optimised by removing round trips.
+    title = fields.TextField(null=True)
+    image_url = fields.TextField(null=True)
+    product_type = fields.TextField(null=True)
+    inventory = fields.IntField(default=0)
+    source_price = fields.DecimalField(max_digits=12, decimal_places=2, null=True)
+    source_compare_at = fields.DecimalField(max_digits=12, decimal_places=2, null=True)
+    sts_price = fields.DecimalField(max_digits=12, decimal_places=2, null=True)
+    # [{sku, size, price, compare_at, inventory}] - read whole, never joined or aggregated
+    # across products, so JSONB rather than a child table and a second round trip.
+    variants = fields.JSONField(null=True)
+
+    variant_count = fields.IntField(
+        default=0,
+        description="Variants on the source product. Syncio's throughput limit is "
+        "variants per day, so the submit gate sums this across everything awaiting "
+        "delivery. Refreshed on every scan rather than written once at tag time",
+    )
+
+    skip_reason = fields.CharField(max_length=40, null=True)
+    last_error = fields.TextField(null=True)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "internal_platform_state"
+        unique_together = [("internal_platform", "parent_sku")]
+
+    def __str__(self):
+        return f"InternalPlatformState({self.parent_sku}: {self.current_status})"
+
+
+class InternalPlatformSubmission(Model):
+    """Append-only action history. Audit, not control.
+
+    A row is written ONLY when an API call was actually made. An evaluation that
+    results in no call is not an action - that rule is the difference between
+    ~0.2 GB/year and ~31 GB/year.
+    """
+
+    id = fields.BigIntField(pk=True)
+
+    internal_platform_id = fields.CharField(max_length=50, index=True)
+    parent_sku = fields.CharField(max_length=110)
+
+    action = fields.CharField(max_length=20)
+    status = fields.CharField(max_length=20, default="pending")
+    skip_reason = fields.CharField(max_length=40, null=True)
+
+    source_product_gid = fields.TextField(null=True)
+    dest_product_gid = fields.TextField(null=True)
+
+    payload = fields.JSONField(
+        null=True,
+        description="Whitelisted {mutation, variables, before}. The `before` pre-image is "
+        "the only rollback material a delete will ever have and must be committed before "
+        "the mutation. Never the header map - it holds the access token",
+    )
+    result = fields.JSONField(
+        null=True, description="Whitelisted {userErrors, ids, cost}. Never a raw response"
+    )
+
+    error = fields.TextField(null=True)
+
+    actor = fields.CharField(max_length=100, null=True)
+    triggered_by = fields.CharField(max_length=20, default="scheduler")
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "internal_platform_submissions"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return (
+            f"InternalPlatformSubmission({self.parent_sku} -> "
+            f"{self.internal_platform_id}.{self.action}: {self.status})"
+        )
