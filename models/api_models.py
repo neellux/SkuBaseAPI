@@ -415,6 +415,22 @@ class BatchListResponse(BaseModel):
         from_attributes = True
 
 
+class NextOpenBatchResponse(BaseModel):
+
+    batch: Optional[BatchResponse] = Field(
+        None,
+        description=(
+            "Next open batch with its listings, the same shape as /listings/batch/detail, "
+            "so the caller can render it without a second round trip. Null when no other "
+            "open batch exists"
+        ),
+    )
+    wrapped: bool = Field(
+        False,
+        description="True when the walk ran past the oldest open batch and came back to the newest",
+    )
+
+
 class BatchFilterOptionsResponse(BaseModel):
 
     users: List[Dict[str, str]] = Field(..., description="Available users with id and name")

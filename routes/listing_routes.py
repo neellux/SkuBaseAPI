@@ -18,6 +18,7 @@ from models.api_models import (
     CreateListingRequest,
     ListingResponse,
     ListingSchemaResponse,
+    NextOpenBatchResponse,
     ProductConfirmationData,
     ProductTypeInfoResponse,
     SaveSizeMappingRequest,
@@ -1105,6 +1106,31 @@ async def get_batches(
     batches = await add_user_data(data=batches, keys=["assigned_to"], new_keys=["name"])
 
     return batches
+
+
+@router.get("/batches/next_open", response_model=NextOpenBatchResponse)
+async def get_next_open_batch(batch_id: int = Query(..., description="Current batch ID")):
+    """Batch to move to when the current one is done. Null batch means none is left.
+
+    Returns the listings too, so the batch view can switch straight into it. Same
+    user-data enrichment as /listings/batch/detail, since it is the same payload.
+    """
+    batch, wrapped = await BatchService.get_next_open_batch(batch_id)
+    if not batch:
+        return NextOpenBatchResponse(batch=None, wrapped=False)
+
+    batch_with_user_data = await add_user_data(
+        data=batch.model_dump(), keys=["assigned_to", "created_by"], new_keys=["name"]
+    )
+
+    if batch_with_user_data.get("listings"):
+        batch_with_user_data["listings"] = await add_user_data(
+            data=batch_with_user_data["listings"],
+            keys=["assigned_to", "created_by"],
+            new_keys=["name"],
+        )
+
+    return {"batch": batch_with_user_data, "wrapped": wrapped}
 
 
 @router.put("/batch", response_model=BatchListResponse)

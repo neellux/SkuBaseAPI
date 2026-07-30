@@ -4,7 +4,7 @@ from typing import List, Optional
 from datetime import datetime, timedelta
 from fastapi import HTTPException
 from tortoise import transactions
-from tortoise.expressions import Subquery
+from tortoise.expressions import Q, Subquery
 from models.db_models import Batch, Listing, AppSettings
 from exceptions.batch_exceptions import BatchCreationError
 from models.api_models import (
@@ -25,6 +25,11 @@ from utils.load_app_data import app_users
 from config import config
 
 logger = logging.getLogger(__name__)
+
+# A batch is "open" while it still has unsubmitted listings. status is maintained
+# by the update_batch_counts() trigger on listings, so this is equivalent to
+# submitted_listings < total_listings without needing to count anything.
+OPEN_BATCH_STATUSES = ("new", "in_progress")
 
 
 class BatchService:
@@ -260,7 +265,7 @@ class BatchService:
                 expanded_statuses = []
                 for s in status:
                     if s == "pending":
-                        expanded_statuses.extend(["new", "in_progress"])
+                        expanded_statuses.extend(OPEN_BATCH_STATUSES)
                     else:
                         expanded_statuses.append(s)
                 expanded_statuses = list(dict.fromkeys(expanded_statuses))
@@ -306,6 +311,58 @@ class BatchService:
 
         except Exception as e:
             logger.error(f"Error fetching batches: {e}")
+            raise
+
+    @staticmethod
+    async def get_next_open_batch(batch_id: int) -> tuple[Optional[BatchResponse], bool]:
+        """Next open batch after `batch_id`, in the same order the batch list uses.
+
+        The list is sorted by created_at DESC, so "next" means the closest older
+        batch that is still open. Ordering compares the (created_at, id) pair so
+        batches created inside one transaction keep a stable order instead of
+        being returned arbitrarily.
+
+        When the cursor is already past the oldest open batch the walk wraps to
+        the newest one, so the caller only dead-ends when there genuinely is no
+        other open batch. Returns (batch, wrapped); a null batch means none is
+        left, while an unknown batch_id raises 404.
+
+        Carries the listings, i.e. the same payload as GET /listings/batch/detail,
+        so the batch view can render the next batch the moment the arrow is used
+        instead of showing a spinner while it fetches what the caller already
+        asked for.
+        """
+        current = await Batch.get_or_none(id=batch_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Batch not found")
+
+        try:
+            open_batches = Batch.filter(status__in=OPEN_BATCH_STATUSES).exclude(id=batch_id)
+
+            next_batch = (
+                await open_batches.filter(
+                    Q(created_at__lt=current.created_at)
+                    | Q(created_at=current.created_at, id__lt=current.id)
+                )
+                .order_by("-created_at", "-id")
+                .first()
+            )
+            wrapped = False
+
+            if not next_batch:
+                next_batch = await open_batches.order_by("-created_at", "-id").first()
+                wrapped = next_batch is not None
+
+            if not next_batch:
+                return None, False
+
+            return (
+                await BatchService._to_response(next_batch, include_listings=True),
+                wrapped,
+            )
+
+        except Exception as e:
+            logger.error(f"Error fetching next open batch after {batch_id}: {e}")
             raise
 
     @staticmethod
