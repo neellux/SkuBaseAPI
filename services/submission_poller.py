@@ -4,6 +4,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 
 from config import config
+from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import (
     AppSettings,
     Listing,
@@ -14,6 +15,7 @@ from services.base_poller import BasePoller
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
 from tortoise.transactions import in_transaction
+from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +65,15 @@ class SubmissionPoller(BasePoller):
             sub.error = (
                 f"Stale pending submission recovered at {datetime.now(timezone.utc).isoformat()}"
             )
-            await sub.save()
+            await sub.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
+        await record_step(
+            [s.id for s in stale],
+            "failed",
+            stage="pending",
+            reason=f"no progress for {STALE_PENDING_MINUTES} minutes",
+        )
 
     async def _process_queued_submissions(self) -> None:
         claimed_subs: list[ListingSubmission] = []
@@ -86,12 +96,23 @@ class SubmissionPoller(BasePoller):
                 await sub.save(using_db=conn)
                 claimed_subs.append(sub)
 
+        # Recorded after the transaction commits: record_step uses its own
+        # connection and would block on the rows locked above.
+        await record_step([s.id for s in claimed_subs], "pending")
+
         settings = await AppSettings.first()
         ps_all = settings.platform_settings if settings else {}
 
+        # Fetched once per cycle rather than once per submission: the template is
+        # the same for every row, and against a remote database the per-submission
+        # form cost a round trip each. spo_poller and grailed_poller already fetch
+        # it once per batch.
+        template = await TemplateService.get_template_by_id("default")
+        field_definitions = template.field_definitions if template else []
+
         async def _submit(sub):
             async with self._semaphore:
-                await self._submit_to_platform(sub)
+                await self._submit_to_platform(sub, field_definitions)
 
         tasks = [
             _submit(sub)
@@ -101,18 +122,28 @@ class SubmissionPoller(BasePoller):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _submit_to_platform(self, submission: ListingSubmission) -> None:
+    async def _submit_to_platform(
+        self, submission: ListingSubmission, field_definitions: list | None = None
+    ) -> None:
         listing = await Listing.get_or_none(id=submission.listing_id)
         if not listing:
             submission.status = SubmissionStatus.FAILED
             submission.error_display = "Failed to submit"
             submission.error = "Listing not found"
-            await submission.save()
+            await submission.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
+            await record_step(
+                submission.id, "failed", stage="submit", reason="listing not found"
+            )
             return
 
-        template = await TemplateService.get_template_by_id("default")
         form_data = listing.data or {}
-        field_definitions = template.field_definitions if template else []
+        # Only fetched here when the caller did not supply it (direct callers other
+        # than the poll cycle).
+        if field_definitions is None:
+            template = await TemplateService.get_template_by_id("default")
+            field_definitions = template.field_definitions if template else []
 
         try:
             if submission.platform_id == "sellercloud":
@@ -122,7 +153,8 @@ class SubmissionPoller(BasePoller):
                     field_definitions=field_definitions,
                 )
                 submission.status = SubmissionStatus.SUCCESS
-                await submission.save()
+                await submission.save(update_fields=["status", "updated_at"])
+                await record_step(submission.id, "listed")
             elif submission.platform_id in ("grailed", "spo"):
                 # Both are manual_fallback batch platforms handled by their own
                 # pollers (grailed_poller / spo_poller); nothing to do per-listing.
@@ -133,17 +165,49 @@ class SubmissionPoller(BasePoller):
                 )
                 submission.status = SubmissionStatus.FAILED
                 submission.error_display = f"Unknown platform: {submission.platform_id}"
-                await submission.save()
-        except Exception:
+                await submission.save(
+                    update_fields=["status", "error_display", "updated_at"]
+                )
+                await record_step(
+                    submission.id,
+                    "failed",
+                    stage="submit",
+                    reason=f"unknown platform: {submission.platform_id}",
+                )
+        except Exception as e:
             logger.exception(
                 f"{self.name}: submission failed for {submission.listing_id} on {submission.platform_id}"
             )
+            # Same per-SKU/per-stage detail as the route path in listing_routes,
+            # so a submission looks identical whichever path submitted it.
+            sc_error = e if isinstance(e, SellerCloudSubmitError) else None
             submission = await ListingSubmission.get(id=submission.id)
             if submission.status not in ("success", "failed"):
                 submission.status = SubmissionStatus.FAILED
                 submission.error = traceback.format_exc()
-                submission.error_display = "Failed to submit"
-                await submission.save()
+                submission.error_display = (
+                    sc_error.display() if sc_error else "Failed to submit"
+                )
+                await submission.save(
+                    update_fields=["status", "error", "error_display", "updated_at"]
+                )
+                if sc_error:
+                    await record_step(
+                        submission.id,
+                        "failed",
+                        meta=(
+                            {"sku_errors": sc_error.sku_errors}
+                            if sc_error.sku_errors
+                            else None
+                        ),
+                        stage=sc_error.stage,
+                        sku_errors=sc_error.sku_errors or None,
+                        succeeded_skus=sc_error.succeeded or None,
+                    )
+                else:
+                    await record_step(
+                        submission.id, "failed", stage="submit", reason=str(e)[:300]
+                    )
 
 
 def _log_task_exception(task: asyncio.Task) -> None:

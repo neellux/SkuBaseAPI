@@ -158,10 +158,12 @@ class SpoService:
             )
             row_data[spo_field] = value
 
-        logger.info(f"SPO field map: {list(spo_field_map.keys())}")
-        logger.info(f"SPO row_data keys: {list(row_data.keys())}")
-        logger.info(f"SPO normalized-color: {row_data.get('normalized-color')}")
-        logger.info(f"SPO form standard_color: {form_data.get('standard_color')}")
+        # debug, not info: build_product_rows runs once per submission, so at info
+        # this emitted four lines per submission (~400 per 100-submission batch).
+        logger.debug(f"SPO field map: {list(spo_field_map.keys())}")
+        logger.debug(f"SPO row_data keys: {list(row_data.keys())}")
+        logger.debug(f"SPO normalized-color: {row_data.get('normalized-color')}")
+        logger.debug(f"SPO form standard_color: {form_data.get('standard_color')}")
 
         platform_settings = await self.get_platform_settings()
         require_type_mapping = bool(platform_settings.get("require_type_mapping"))
@@ -288,6 +290,7 @@ class SpoService:
         logger.info(f"Generated SPO product XLSX: {output_path} ({len(products)} rows)")
 
     def generate_offer_csv(self, offers: list[dict[str, Any]], output_path: str) -> None:
+        """UNUSED. Companion to upload_offers(); see the note above that method."""
         with open(output_path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=OFFER_HEADERS, delimiter=";")
             writer.writeheader()
@@ -480,6 +483,23 @@ class SpoService:
             )
 
         return errors
+
+    # ---------------------------------------------------------------------
+    # UNUSED alternate offer path (OF01/OF02 offer-import API).
+    #
+    # Offers reach SPO only through submit_offers() -> AppScript -> Google Sheet.
+    # Nothing calls upload_offers() or generate_offer_csv(), and the poller
+    # branches that consume check_offer_status() / get_offer_error_report() are
+    # gated on platform_status == "offers_processing", which nothing ever sets.
+    # Verified against prod: of 1868 SPO submissions, none has an offer_import_id
+    # and none ever reached "offers_processing" or "products_complete".
+    #
+    # Kept as a reference implementation for wiring the real offer-import API. To
+    # make it live you also have to populate the price, quantity and state-code
+    # columns declared in OFFER_HEADERS: build_offer_rows() emits only
+    # sku/product-id/product-id-type today, and never reads the listing's
+    # list_price. Those three are supplied on the sheet side at present.
+    # ---------------------------------------------------------------------
 
     async def upload_offers(self, csv_path: str) -> int:
         client = await self._get_client()

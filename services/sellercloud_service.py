@@ -12,6 +12,7 @@ import base64
 import httpx
 import orjson
 from config import config
+from exceptions.submission_exceptions import SellerCloudSubmitError
 from fastapi import HTTPException
 from models.db_models import AppSettings
 from services.listing_options_service import listing_options_service
@@ -1102,7 +1103,9 @@ class SellerCloudService:
                         f"Updating {len(normal_fields)} normal fields for product {product_id} (attempt {attempt + 1}/{max_retries})"
                     )
 
-                    logger.info(f"Normal payload: {normal_payload}")
+                    # debug, not info: this is the full field payload, logged once
+                    # per child SKU per retry attempt.
+                    logger.debug(f"Normal payload: {normal_payload}")
                     response = await self._make_request(
                         "PUT", "/Catalog/AdvancedInfo", data=normal_payload
                     )
@@ -1211,14 +1214,23 @@ class SellerCloudService:
         field_definitions: List[Dict[str, Any]],
         max_workers: int = 5,
     ) -> bool:
+        # Names the phase we are in, so a failure can say where it happened rather
+        # than just "Failed to submit". Reported via SellerCloudSubmitError.stage.
+        stage = "map_fields"
         try:
             form_data = copy.deepcopy(form_data)
-            original_form_data = copy.copy(form_data)
-            if "child_size_overrides" in form_data:
-                del form_data["child_size_overrides"]
+            # Strip before the copy is taken: original_form_data feeds the
+            # description template, and because strings are immutable, stripping
+            # form_data afterwards would leave the template rendering unstripped
+            # values while the SellerCloud fields got stripped ones.
             for key, value in form_data.items():
                 if isinstance(value, str):
                     form_data[key] = value.strip()
+            # Shallow copy on purpose: the del below must not remove
+            # child_size_overrides from original_form_data, which still needs it.
+            original_form_data = copy.copy(form_data)
+            if "child_size_overrides" in form_data:
+                del form_data["child_size_overrides"]
 
             sc_field_mapping = {}
             for field_def in field_definitions:
@@ -1267,6 +1279,7 @@ class SellerCloudService:
 
             logger.info("Validating required fields and fetching gender data")
 
+            stage = "gender"
             gender = await self.get_gender_from_product_type(form_data["ProductType"])
             form_data["GENDER"] = gender
             # GENDER is derived from ProductType, not user-entered, so it is
@@ -1282,6 +1295,7 @@ class SellerCloudService:
             # ShippingWeight defaults from the types table but stays editable in
             # the form, so only fill it when the listing carries no value. A
             # deliberate override must survive submission.
+            stage = "weight"
             if not str(form_data.get("ShippingWeight") or "").strip():
                 type_info = await listing_options_service.get_product_type_info(
                     form_data["ProductType"]
@@ -1305,6 +1319,7 @@ class SellerCloudService:
                 )
 
             logger.info("Populating product description template")
+            stage = "description"
             populated_description = await self._populate_description_template(
                 original_form_data, field_definitions
             )
@@ -1318,9 +1333,11 @@ class SellerCloudService:
             # normally a no-op identity resolve. It is kept so that a legacy listing
             # still holding a chopped phantom parent fails loudly and by name here,
             # rather than quietly resolving to an empty child set and writing nothing.
+            stage = "resolve_parent"
             parent_product_id = await resolve_parent(product_id)
 
             logger.info(f"Fetching children for parent product {parent_product_id}")
+            stage = "fetch_children"
             # Deliberately active-only (include_inactive defaults to False): a
             # disabled SKU must never enter all_product_ids below and get written to.
             children_data = await self.get_product_children(parent_product_id)
@@ -1467,7 +1484,15 @@ class SellerCloudService:
                             {"Name": target_field_name, "Value": field_value}
                         )
 
+            stage = "update_children"
             semaphore = asyncio.Semaphore(max_workers)
+            # Collected per child rather than letting the first failure escape the
+            # gather. One failing child still fails the whole submission (raised
+            # below), but every child now runs to a known outcome instead of the
+            # siblings continuing detached with nobody reading their result. Same
+            # shape as update_children_basic_info above.
+            failures: List[Dict[str, str]] = []
+            succeeded: List[str] = []
 
             async def update_with_semaphore(pid: str):
                 async with semaphore:
@@ -1490,33 +1515,51 @@ class SellerCloudService:
                                 break
 
                     if size:
-                        print({"ColumnName": "SIZE", "Value": size})
                         child_custom_fields.append(
                             {"ColumnName": "SIZE", "Value": size}
                         )
 
-                    await self._update_single_product_with_retry(
-                        pid, child_normal_fields, child_custom_fields
-                    )
+                    try:
+                        await self._update_single_product_with_retry(
+                            pid, child_normal_fields, child_custom_fields
+                        )
+                        succeeded.append(pid)
+                    except Exception as e:
+                        logger.error(f"SellerCloud update failed for child {pid}: {e}")
+                        failures.append({"sku": pid, "error": str(e)[:300]})
 
             logger.info(f"Starting concurrent updates with max_workers={max_workers}")
             update_tasks = [update_with_semaphore(pid) for pid in all_product_ids]
 
             await asyncio.gather(*update_tasks)
 
+            if failures:
+                # The successful children are already written on the SellerCloud
+                # side and are not rolled back, so they are reported too.
+                raise SellerCloudSubmitError(
+                    f"{len(failures)} of {len(all_product_ids)} child products failed",
+                    stage=stage,
+                    failures=failures,
+                    succeeded=succeeded,
+                )
+
             logger.info(
                 f"Successfully submitted listing to SellerCloud for all {len(all_product_ids)} child products"
             )
             return True
 
+        except SellerCloudSubmitError:
+            raise
         except HTTPException as e:
             logger.error(f"Failed to submit listing to SellerCloud: {e}")
             raise e
-        except Exception:
+        except Exception as e:
             logger.error(
                 f"Failed to submit listing to SellerCloud: {traceback.format_exc()}"
             )
-            raise Exception("Failed to submit to SellerCloud")
+            raise SellerCloudSubmitError(
+                "Failed to submit to SellerCloud", stage=stage
+            ) from e
 
     async def disable_product(self, product_id: str) -> bool:
         try:

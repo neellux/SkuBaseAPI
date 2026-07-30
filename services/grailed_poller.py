@@ -15,6 +15,7 @@ from services.grailed_service import grailed_service
 from services.template_service import TemplateService
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
+from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,13 @@ class GrailedPoller(BasePoller):
             logger.warning(f"{self.name}: stale processing submission {sub.id}, marking failed")
             sub.status = SubmissionStatus.FAILED
             sub.error_display = "Batch interrupted - verify on Grailed before resubmitting"
-            await sub.save()
+            await sub.save(update_fields=["status", "error_display", "updated_at"])
+            await record_step(
+                sub.id,
+                "failed",
+                stage="stale_processing",
+                reason="batch interrupted after commit to send; may already be on Grailed",
+            )
 
     async def _batch_upload_pending(self, force: bool = False) -> dict[str, Any]:
         grailed_settings = await self._get_grailed_settings()
@@ -113,12 +120,26 @@ class GrailedPoller(BasePoller):
             await (
                 ListingSubmission.filter(id__in=submission_ids)
                 .using_db(conn)
-                .update(status=SubmissionStatus.PROCESSING)
+                # platform_status kept in step with SPO's, so the dashboard's
+                # granular column is populated for Grailed too rather than null.
+                .update(
+                    status=SubmissionStatus.PROCESSING,
+                    platform_status="submitting",
+                )
             )
 
         logger.info(
             f"{self.name}: batch submitting {len(submission_ids)} Grailed submissions "
             f"in chunks of {batch_size}"
+        )
+
+        # Recorded outside the transaction above: record_step uses its own
+        # connection and would block on the rows that transaction has locked.
+        await record_step(
+            submission_ids,
+            "submitting",
+            batch_size=len(submission_ids),
+            chunk_size=batch_size,
         )
 
         template = await TemplateService.get_template_by_id("default")
@@ -148,7 +169,10 @@ class GrailedPoller(BasePoller):
             if not listing:
                 sub.status = SubmissionStatus.FAILED
                 sub.error_display = "Listing not found"
-                await sub.save()
+                await sub.save(update_fields=["status", "error_display", "updated_at"])
+                await record_step(
+                    sub.id, "failed", stage="build_products", reason="listing not found"
+                )
                 continue
             try:
                 products = await grailed_service.build_csv_rows(
@@ -156,7 +180,7 @@ class GrailedPoller(BasePoller):
                 )
                 if not products:
                     raise ValueError("No children found to submit to Grailed")
-            except Exception:
+            except Exception as e:
                 # A build error fails only this submission; the rest of the chunk
                 # still goes out.
                 logger.exception(
@@ -165,7 +189,12 @@ class GrailedPoller(BasePoller):
                 sub.status = SubmissionStatus.FAILED
                 sub.error = traceback.format_exc()
                 sub.error_display = "Failed to build product data"
-                await sub.save()
+                await sub.save(
+                    update_fields=["status", "error", "error_display", "updated_at"]
+                )
+                await record_step(
+                    sub.id, "failed", stage="build_products", reason=str(e)[:300]
+                )
                 continue
 
             active_ids.append(sub.id)
@@ -191,7 +220,14 @@ class GrailedPoller(BasePoller):
             )
             await ListingSubmission.filter(id__in=active_ids).update(
                 status=SubmissionStatus.PENDING,
+                platform_status=None,
                 error_display="Grailed AppScript unreachable, will retry",
+            )
+            await record_step(
+                active_ids,
+                "requeued",
+                stage="appscript",
+                reason="AppScript unreachable, no definitive response",
             )
             return 0
 
@@ -211,7 +247,16 @@ class GrailedPoller(BasePoller):
                 status=SubmissionStatus.FAILED,
                 error=error_msg,
                 error_display=str(error_msg)[:500],
-                platform_meta=batch_meta,
+            )
+            # Merged via record_step rather than assigned: a wholesale
+            # platform_meta write discards the step history on the row.
+            await record_step(
+                active_ids,
+                "failed",
+                meta=batch_meta,
+                stage="appscript",
+                reason=str(error_msg)[:300],
+                batch_number=batch_meta["batch_number"],
             )
             logger.error(f"{self.name}: Grailed AppScript returned error: {error_msg}")
             return 0
@@ -257,20 +302,45 @@ class GrailedPoller(BasePoller):
                 meta = {**batch_meta, "sku_errors": failed_skus}
                 if sub_updated:
                     meta["updated_references"] = sub_updated
-                sub.platform_meta = meta
-                await sub.save()
+                await sub.save(
+                    update_fields=["status", "error", "error_display", "updated_at"]
+                )
+                await record_step(
+                    sub.id,
+                    "failed",
+                    meta=meta,
+                    stage="appscript",
+                    sku_errors=failed_skus,
+                    batch_number=batch_meta["batch_number"],
+                )
                 continue
 
             sub_refs = [ref_by_sku[sku] for sku in sub_skus if sku in ref_by_sku]
             sub.status = SubmissionStatus.SUCCESS
+            sub.platform_status = "listed"
             sub.error_display = None  # clear any "will retry" note from a prior cycle
             meta = dict(batch_meta)
             if sub_updated:
                 meta["updated_references"] = sub_updated
-            sub.platform_meta = meta
             if sub_refs:
                 sub.external_id = sub_refs
-            await sub.save()
+            await sub.save(
+                update_fields=[
+                    "status",
+                    "platform_status",
+                    "error_display",
+                    "external_id",
+                    "updated_at",
+                ]
+            )
+            await record_step(
+                sub.id,
+                "listed",
+                meta=meta,
+                batch_number=batch_meta["batch_number"],
+                references=sub_refs or None,
+                updated_references=sub_updated or None,
+            )
             succeeded += 1
 
         logger.info(

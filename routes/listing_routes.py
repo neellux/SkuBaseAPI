@@ -28,6 +28,7 @@ from models.api_models import (
     UpdateListingRequest,
 )
 from exceptions.batch_exceptions import BatchCreationError
+from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import BatchService
 from services.grailed_service import grailed_service
@@ -40,6 +41,7 @@ from services.template_service import TemplateService
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 from utils.load_app_data import add_user_data, app_users
+from utils.submission_steps import new_step, record_step
 
 logger = logging.getLogger(__name__)
 
@@ -605,6 +607,13 @@ async def submit_listing(
                     status=platform_initial_status,
                     submitted_by=submitted_by,
                     attempt_number=attempt_number,
+                    # Seeded inline rather than via record_step: that uses its
+                    # own connection and would block on this uncommitted row.
+                    platform_meta={
+                        "steps": [
+                            new_step(platform_initial_status, attempt=attempt_number)
+                        ]
+                    },
                     using_db=conn,
                 )
                 submission_records[platform_id] = submission.id
@@ -671,14 +680,40 @@ async def _run_submissions_background(
                 field_definitions=field_definitions,
             )
             submission.status = "success"
-            await submission.save()
+            await submission.save(update_fields=["status", "updated_at"])
+            await record_step(submission_id, "listed")
             logger.info(f"Successfully submitted listing {listing_id} to SellerCloud")
+        except SellerCloudSubmitError as e:
+            # Per-SKU and per-stage detail, so the dashboard can say which child
+            # broke and how far the submission got instead of just "Failed to
+            # submit". Children in e.succeeded are already written on the
+            # SellerCloud side and are not rolled back.
+            logger.error(f"Failed to submit to SellerCloud: {e}", exc_info=True)
+            submission.status = "failed"
+            submission.error = traceback.format_exc()
+            submission.error_display = e.display()
+            await submission.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
+            await record_step(
+                submission_id,
+                "failed",
+                meta={"sku_errors": e.sku_errors} if e.sku_errors else None,
+                stage=e.stage,
+                sku_errors=e.sku_errors or None,
+                succeeded_skus=e.succeeded or None,
+            )
         except Exception as e:
             logger.error(f"Failed to submit to SellerCloud: {str(e)}", exc_info=True)
             submission.status = "failed"
             submission.error = traceback.format_exc()
             submission.error_display = "Failed to submit"
-            await submission.save()
+            await submission.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
+            await record_step(
+                submission_id, "failed", stage="submit", reason=str(e)[:300]
+            )
 
     async def _submit_to_grailed(submission_id: int):
         submission = await ListingSubmission.get(id=submission_id)
@@ -688,7 +723,12 @@ async def _run_submissions_background(
                 submission.status = "failed"
                 submission.error = "Listing not found"
                 submission.error_display = "Failed to submit"
-                await submission.save()
+                await submission.save(
+                    update_fields=["status", "error", "error_display", "updated_at"]
+                )
+                await record_step(
+                    submission_id, "failed", stage="submit", reason="listing not found"
+                )
                 return
             await grailed_service.submit_listing(
                 listing=listing_model,
@@ -704,7 +744,12 @@ async def _run_submissions_background(
                 submission.status = "failed"
                 submission.error = traceback.format_exc()
                 submission.error_display = "Failed to submit"
-                await submission.save()
+                await submission.save(
+                    update_fields=["status", "error", "error_display", "updated_at"]
+                )
+                await record_step(
+                    submission_id, "failed", stage="submit", reason=str(e)[:300]
+                )
 
     settings = await AppSettings.first()
     platform_settings = (
