@@ -587,8 +587,21 @@ class ShopifyAdmin:
         ):
             defs, aliases, variables = [], [], {}
             for n, (gid, vendor, title, add, remove) in enumerate(batch):
-                defs.append(f"$id{n}: ID!")
-                variables[f"id{n}"] = gid
+                # $id{n} is declared ONLY when a tag mutation will reference it.
+                # productUpdate carries the id inside its input object instead, so a
+                # product needing only a vendor or title correction never uses $id{n} -
+                # and GraphQL rejects the WHOLE DOCUMENT for one unused variable:
+                # "Variable $id0 is declared by anonymous mutation but not used".
+                #
+                # Latent since this method was written, but unreachable in practice while
+                # vendor was the only productUpdate field: vendor-only products are rare
+                # (4 against 184 tag changes on the first pass) and never landed in a
+                # batch alone. Title normalization made them common - 592 products needed
+                # a title and nothing else - and 293 normalizations failed on the first
+                # production cycle after it shipped.
+                if add or remove:
+                    defs.append(f"$id{n}: ID!")
+                    variables[f"id{n}"] = gid
                 if vendor or title:
                     fields = {"id": gid}
                     if vendor:
