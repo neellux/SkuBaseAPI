@@ -276,6 +276,9 @@ class ListingResponse(BaseModel):
     original_description: Optional[str] = Field(
         None, description="Original SellerCloud description"
     )
+    original_title: Optional[str] = Field(
+        None, description="Title at creation, before the title template rewrote it"
+    )
     submitted: bool = Field(..., description="Whether listing is submitted")
     submitted_at: Optional[datetime] = Field(None, description="Submission timestamp")
     submitted_by: Optional[str] = Field(None, description="User ID who submitted this listing")

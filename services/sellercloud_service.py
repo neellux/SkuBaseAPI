@@ -1187,9 +1187,14 @@ class SellerCloudService:
             ]
             return "".join(f"<div>{line}</div>" for line in processed_lines)
 
+        # Keyed on the resolved placeholder name, which is the internal field id.
+        # This was "MATERIAL" until 2026-07-30, a leftover from the SellerCloud field
+        # ids that transform_listing_data_to_internal_fields.sql renamed, so the
+        # transform silently never ran and the description shipped the raw value.
+        # GENDER has no internal-id counterpart and stays as-is.
         value_transforms = {
             "GENDER": lambda v: GENDER_MAPPING[v] if v in GENDER_MAPPING else v,
-            "MATERIAL": _material_transform,
+            "material": _material_transform,
         }
 
         populated_template, missing_fields = render_template(

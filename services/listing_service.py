@@ -51,7 +51,11 @@ class ListingService:
 
     @staticmethod
     async def _generate_product_name(data: Dict[str, Any]) -> str:
-        DEFAULT_TEMPLATE = "{BrandName} {BRAND_COLOR/COLOR} {STYLE_NAME}"
+        # Internal field ids, not the SellerCloud ones. listings.data was renamed by
+        # transform_listing_data_to_internal_fields.sql (2026-01-22) and this default
+        # was missed, so every placeholder resolved to empty and the generated title
+        # came out blank.
+        DEFAULT_TEMPLATE = "{brand_name} {brand_color/standard_color} {style_name}"
 
         template = DEFAULT_TEMPLATE
         try:
@@ -69,7 +73,7 @@ class ListingService:
 
         product_name, _missing = render_template(template, data, collapse_whitespace=True)
 
-        logger.debug(f"Generated ProductName: {product_name}")
+        logger.debug(f"Generated title: {product_name}")
         return product_name
 
     @staticmethod
@@ -348,21 +352,28 @@ class ListingService:
                             prefilled_data["description"] = ai_description
                             logger.debug("Set LongDescription to AI-generated description")
 
-            style_name = prefilled_data.get("STYLE_NAME")
+            # The SellerCloud product name as prefilled, captured before the block below
+            # rewrites it from the title template. This is what the title field's restore
+            # button reverts to, so it is read here and never written again.
+            original_title = prefilled_data.get("title")
+
+            style_name = prefilled_data.get("style_name")
             if style_name and len(str(style_name).strip()) >= 3:
                 generated_name = await ListingService._generate_product_name(prefilled_data)
                 if generated_name:
-                    prefilled_data["ProductName"] = generated_name
-                    logger.debug(f"Generated ProductName '{generated_name}' from template")
-            elif "ProductName" in prefilled_data:
+                    prefilled_data["title"] = generated_name
+                    logger.debug(f"Generated title '{generated_name}' from template")
+            elif "title" in prefilled_data:
+                # product_data is still keyed by SellerCloud field ids, so ProductName is
+                # correct on that side; prefilled_data is keyed by internal field ids.
                 product_name_source = None
                 if product_data and product_data.get("ProductName"):
                     product_name_source = product_data["ProductName"]
                 else:
-                    product_name_source = prefilled_data.get("ProductName")
+                    product_name_source = prefilled_data.get("title")
 
                 if isinstance(product_name_source, str) and product_name_source.strip():
-                    prefilled_data["ProductName"] = re.split(
+                    prefilled_data["title"] = re.split(
                         r"\s+size\s+",
                         product_name_source,
                         flags=re.IGNORECASE,
@@ -390,6 +401,7 @@ class ListingService:
                 ai_response=ai_response_data,
                 ai_description=ai_description,
                 original_description=original_description,
+                original_title=original_title,
                 upload_status=upload_status,
                 created_by=created_by,
             )
@@ -800,6 +812,7 @@ class ListingService:
             ai_response=listing.ai_response,
             ai_description=listing.ai_description,
             original_description=listing.original_description,
+            original_title=listing.original_title,
             submitted=listing.submitted,
             submitted_at=listing.submitted_at,
             submitted_by=listing.submitted_by,

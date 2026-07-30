@@ -185,6 +185,10 @@ class Listing(Model):
     original_description = fields.TextField(
         null=True, description="Original SellerCloud description"
     )
+    original_title = fields.TextField(
+        null=True,
+        description="Title at creation, before the title template rewrites it; write-once",
+    )
     submitted = fields.BooleanField(
         default=False, description="Whether the listing has been submitted"
     )
