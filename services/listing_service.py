@@ -382,6 +382,11 @@ class ListingService:
                 info_product_id=request.info_product_id,
                 assigned_to=request.assigned_to,
                 data=prefilled_data,
+                # The creation-time baseline: what prefill and AI handed the
+                # operator, before any edit. Write-once, so nothing else in the
+                # codebase may assign it. A separate dict so the two can never
+                # alias. Not on ListingResponse: read it from the database.
+                original_data=dict(prefilled_data),
                 ai_response=ai_response_data,
                 ai_description=ai_description,
                 original_description=original_description,

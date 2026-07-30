@@ -175,6 +175,10 @@ class Listing(Model):
         description="User ID assigned to this listing",
     )
     data = fields.JSONField(default=dict, description="Form data based on template JSON schema")
+    original_data = fields.JSONField(
+        null=True,
+        description="Snapshot of `data` at creation time; write-once, never updated",
+    )
 
     ai_response = fields.JSONField(null=True, description="AI generated response or suggestions")
     ai_description = fields.TextField(null=True, description="AI generated description")
