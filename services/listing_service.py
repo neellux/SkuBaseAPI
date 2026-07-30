@@ -483,6 +483,22 @@ class ListingService:
             raise
 
     @staticmethod
+    async def get_latest_listing_by_product_id(product_id: str) -> Optional[Listing]:
+        """Most recent listing for a parent SKU, submitted or not, batched or not.
+
+        Product search wants whatever listing already exists for the product, so the
+        operator lands on the previously submitted data instead of a second listing
+        row for the same parent. get_draft_listing_by_product_id stays as it is for
+        the batch paths: those may only ever adopt an unattached draft, never a
+        submitted listing or one belonging to another batch.
+        """
+        try:
+            return await Listing.filter(product_id=product_id).order_by("-created_at").first()
+        except Exception as e:
+            logger.error(f"Error fetching latest listing for product {product_id}: {e}")
+            raise
+
+    @staticmethod
     async def get_all_listings(
         assigned_to: Optional[str] = None,
         submitted: Optional[bool] = None,

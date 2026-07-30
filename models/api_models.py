@@ -297,7 +297,11 @@ class ProductConfirmationData(BaseModel):
 
     product: Dict[str, Any] = Field(..., description="Product data from SellerCloud")
     existing_listing_id: Optional[str] = Field(
-        None, description="The ID of an existing draft listing if one is found"
+        None,
+        description=(
+            "ID of the listing this product already has, submitted or not, if one exists. "
+            "The caller opens it instead of creating a second listing for the same parent."
+        ),
     )
 
 

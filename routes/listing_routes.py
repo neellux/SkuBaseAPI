@@ -73,6 +73,20 @@ async def get_product_confirmation_data(
 
     parent_product_id = product["PARENT_ID"]
 
+    # Reuse whatever listing this parent already has - submitted or not, batched or
+    # not - so a product listed in an earlier batch reopens its own listing and the
+    # operator can see what was previously submitted, instead of getting a second
+    # listing row for the same parent SKU. Two listings sharing a product_id also
+    # cross-contaminate the SPO poller, which matches failed_skus against each
+    # listing's child SKUs and so fails both.
+    existing_listing = await ListingService.get_latest_listing_by_product_id(parent_product_id)
+    if existing_listing:
+        return ProductConfirmationData(
+            product=product, existing_listing_id=str(existing_listing.id)
+        )
+
+    # Image validation gates creating a NEW listing only. An already-listed product
+    # whose GCS blobs were moved or re-shot must still be openable.
     (
         all_valid,
         missing_images,
@@ -83,10 +97,7 @@ async def get_product_confirmation_data(
     if not all_valid:
         raise HTTPException(status_code=400, detail="Product images not found")
 
-    draft_listing = await ListingService.get_draft_listing_by_product_id(parent_product_id)
-    existing_listing_id = str(draft_listing.id) if draft_listing else None
-
-    return ProductConfirmationData(product=product, existing_listing_id=existing_listing_id)
+    return ProductConfirmationData(product=product, existing_listing_id=None)
 
 
 @router.post("", response_model=ListingResponse)
