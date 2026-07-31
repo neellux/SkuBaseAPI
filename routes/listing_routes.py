@@ -641,12 +641,27 @@ async def submit_listing(
             detail="No platforms available for submission",
         )
 
+    # update_fields is load-bearing, not tidiness. listing_model was fetched at
+    # the top of this request, before any submission row existed. Creating those
+    # rows fires mark_listing_submitted_if_complete, which sets
+    # listings.submitted = TRUE and cascades into batches.submitted_listings via
+    # update_batch_counts. A bare save() writes every column from this now-stale
+    # instance, putting submitted back to FALSE and reopening a batch that had
+    # just completed. The submit path is the only writer that reads the listing
+    # before the trigger and writes it after, so it is the only one that needs
+    # this; every other listing save re-reads first.
     listing_model.submitted_by = submitted_by
-    await listing_model.save()
+    await listing_model.save(update_fields=["submitted_by", "updated_at"])
 
+    # Iterate submission_records, not platforms: a platform skipped above (already
+    # in flight, or succeeded on a platform that disallows resubmission) has no
+    # record, and _run_submissions_background indexes submission_record_ids by
+    # platform id. Passing a skipped platform through raised KeyError there,
+    # killing the whole background task before anything was submitted - which
+    # left every row of the submit parked in 'pending' for good.
     pending_platforms = [
         p
-        for p in platforms
+        for p in submission_records
         if not platform_settings.get(p, {}).get("manual_fallback", False)
         and not (
             listing_model.upload_status == "pending"
@@ -877,7 +892,10 @@ async def _run_submissions_background(
             listing_model.error = "\n---\n".join(post_submission_errors)
         else:
             listing_model.error = None
-        await listing_model.save()
+        # Scoped for the same reason as the save in submit_listing: this runs
+        # after the platform submissions have moved, and a background poller can
+        # flip listings.submitted between the fetch above and this write.
+        await listing_model.save(update_fields=["error", "updated_at"])
 
 
 @router.post("/disable_product")
