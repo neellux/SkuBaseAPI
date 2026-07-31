@@ -53,6 +53,13 @@ PRODUCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_/]{0,199}$")
 # Resolution is deliberately not scoped to the latest batch. GCS blobs are keyed
 # by product_id alone, so each section shows whatever wrote that blob namespace
 # last, and for a product shot twice the two shoots can win different sections.
+#
+# Writes follow the same split. Image saves only ever land on a row from
+# IMAGE_SOURCES: an existing one when there is one, otherwise a fresh "upload" row
+# with source_id "manual" and no batch_id. They never write to a batch_creation
+# row, because the photography app owns it and rewrites it whenever the batch is
+# re-processed. Washtag saves stay on the batch_creation row for the same reason in
+# reverse: it is the row the photography app looks for.
 IMAGE_SOURCES = ("upload", "manual")
 WASHTAG_SOURCE = "batch_creation"
 
@@ -240,7 +247,8 @@ class ImageService:
                     rows = await raw_conn.fetch(
                         """
                         SELECT id, image_source, image_data, washtag_data,
-                               product_images_count, washtag_count, updated_at
+                               product_images_count, washtag_count, product_type,
+                               updated_at
                         FROM productimages
                         WHERE product_id = $1
                         ORDER BY updated_at DESC
@@ -251,25 +259,16 @@ class ImageService:
                     # Edit the row that actually owns this section, which for
                     # washtags is usually not the newest row. See _resolve_rows.
                     image_row, washtag_row = _resolve_rows(rows)
-                    row = image_row if image_type == "image" else washtag_row
+                    # The row the client read. Its updated_at is what came back in the
+                    # form and its data is what new_order indexes into, even when the
+                    # write itself lands on a different row.
+                    source_row = image_row if image_type == "image" else washtag_row
 
-                    if not row:
-                        # First save for this product — create a manual-source row.
-                        # batch_id is nullable; source_id is NOT NULL without a default.
-                        row = await raw_conn.fetchrow(
-                            """
-                            INSERT INTO productimages
-                                (id, product_id, image_source, source_id)
-                            VALUES ($1, $2, 'manual', '')
-                            RETURNING id, image_data, washtag_data, product_images_count,
-                                      washtag_count, updated_at
-                            """,
-                            uuid.uuid4(),
-                            product_id,
-                        )
-                        logger.info(f"Created manual productimages row for {product_id}")
-
-                    db_updated_at = row["updated_at"].isoformat() if row["updated_at"] else None
+                    db_updated_at = (
+                        source_row["updated_at"].isoformat()
+                        if source_row and source_row["updated_at"]
+                        else None
+                    )
                     if updated_at and db_updated_at and updated_at != db_updated_at:
                         return {
                             "success": False,
@@ -277,13 +276,58 @@ class ImageService:
                             "status_code": 409,
                         }
 
-                    record_id = row["id"]
                     data_field = "image_data" if image_type == "image" else "washtag_data"
-                    current_data = row[data_field] or []
+                    current_data = (source_row[data_field] if source_row else None) or []
                     if isinstance(current_data, str):
                         current_data = json.loads(current_data)
 
                     resolutions = load_resolutions_config() if image_type == "image" else load_washtag_resolutions_config()
+
+                    row = source_row
+                    # An existing upload or manual row is ours to update, partial
+                    # replacements included, so slots the operator kept stay where the
+                    # rest of the set already lives. Only take a new row when there is
+                    # none, or when the image section resolved onto a batch_creation
+                    # row: that one belongs to the photography app, which rewrites it
+                    # in place every time the batch is re-processed, so writing there
+                    # would let a re-process silently replace the operator's edits.
+                    if row is None or (
+                        image_type == "image" and row["image_source"] not in IMAGE_SOURCES
+                    ):
+                        # 'upload' so everything that looks for a product's published
+                        # photos sees this row, source_id 'manual' to mark who wrote
+                        # it, and no batch_id, which is what keeps the photography
+                        # app's (product_id, batch_id, 'upload') upsert from ever
+                        # finding it. A washtag-only row stays 'manual': it publishes
+                        # nothing an 'upload' consumer should be counting.
+                        # product_resolutions cannot be left NULL on an upload row,
+                        # PhotoManagementNew's /getProductImagesCount evaluates
+                        # `"fullsize" in record["product_resolutions"]` over all of
+                        # them. batch_id is nullable; source_id is NOT NULL without a
+                        # default.
+                        is_image = image_type == "image"
+                        row = await raw_conn.fetchrow(
+                            """
+                            INSERT INTO productimages
+                                (id, product_id, image_source, source_id, product_type,
+                                 product_resolutions)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            RETURNING id
+                            """,
+                            uuid.uuid4(),
+                            product_id,
+                            "upload" if is_image else "manual",
+                            "manual" if is_image else "",
+                            source_row["product_type"] if source_row else None,
+                            [r["name"] for r in resolutions] if is_image else None,
+                        )
+                        logger.info(
+                            f"Created gallery productimages row for {product_id} "
+                            f"(was: {source_row['image_source'] if source_row else 'no row'})"
+                        )
+
+                    record_id = row["id"]
+
                     indices_to_delete = set(deleted_indices)
 
                     # Build reordered_data from unified slot list.
