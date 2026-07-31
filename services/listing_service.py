@@ -208,24 +208,35 @@ class ListingService:
     async def _apply_product_type_derived(
         data: Dict[str, Any],
         *,
-        apply_weight_default: bool,
         fallback_product_type: Optional[str] = None,
     ) -> None:
-        """Refresh the fields derived from ProductType so the snapshot stays in sync.
+        """Refresh the fields derived from the product type so the data stays in sync.
 
-        GENDER is fully derived from the type (never user-entered), so it is
-        recomputed whenever the type resolves a gender; a stale GENDER here is
-        what makes a SellerCloud submit fail on a missing template field. The
-        ProductType alias is canonicalized. item_weight_oz seeds shipping_weight
-        only when apply_weight_default is set (listing creation) — on an edit the
-        user may have overridden the weight, and a re-save must not clobber it.
+        GENDER and shipping_weight are both fully server-derived: neither is in the
+        form, so neither can carry an operator override, and both are recomputed on
+        every save. A stale GENDER is what makes a SellerCloud submit fail on a
+        missing template field; a stale weight silently ships the wrong
+        PackageWeightLbs/Oz and the wrong SPO weight. Recomputing unconditionally is
+        also what makes correcting item_weight_oz in Listing Options actually reach
+        existing listings, which is the replacement for the form field that used to
+        let an operator fix it by hand. The product type alias is canonicalized.
 
-        Mutates `data` in place; never raises (a lookup failure leaves the
-        existing values untouched).
+        listings.data is keyed by internal field ids, so the type is read from and
+        written back to "product_type". This used to read "ProductType" and write the
+        canonical value there too, which had two consequences: the function was a
+        complete no-op on the update path (which passes no fallback, so the lookup
+        found nothing and returned early), and on the create path it minted a second
+        uppercase key, leaving rows where the form and SPO read one key and
+        SellerCloud the other. The SellerCloud id survives only as the create-time
+        fallback, which comes straight off the raw catalog payload.
+
+        Mutates `data` in place; never raises (a lookup failure leaves the existing
+        values untouched rather than blanking them).
         """
-        product_type = data.get("ProductType") or fallback_product_type
+        product_type = data.get("product_type") or fallback_product_type
         if not product_type:
             return
+
         try:
             info = await listing_options_service.get_product_type_info(product_type)
         except Exception as e:
@@ -235,18 +246,23 @@ class ListingService:
         if info.get("is_alias_match"):
             canonical_type = info.get("type")
             if canonical_type:
-                data["ProductType"] = canonical_type
+                data["product_type"] = canonical_type
                 logger.info(
-                    f"Replaced ProductType alias '{product_type}' with canonical type '{canonical_type}'"
+                    f"Replaced product type alias '{product_type}' with canonical type '{canonical_type}'"
                 )
 
         if info.get("gender") is not None:
             data["GENDER"] = info["gender"]
             logger.debug(f"Set GENDER to {info['gender']} from types table")
 
-        if apply_weight_default and info.get("item_weight_oz") is not None:
+        # Guarded rather than unconditional: an unrecognised type resolves no weight,
+        # and leaving the existing value alone is always better than blanking it. The
+        # SellerCloud submit path drops empty values from the payload entirely.
+        if info.get("item_weight_oz") is not None:
             data["shipping_weight"] = int(info["item_weight_oz"])
-            logger.debug(f"Set ShippingWeight to {info['item_weight_oz']} from types table")
+            logger.debug(
+                f"Set shipping_weight to {info['item_weight_oz']} from types table"
+            )
 
     @staticmethod
     async def create_listing(
@@ -287,7 +303,6 @@ class ListingService:
 
                     await ListingService._apply_product_type_derived(
                         prefilled_data,
-                        apply_weight_default=True,
                         fallback_product_type=product_data.get("ProductType"),
                     )
 
@@ -441,12 +456,13 @@ class ListingService:
                 # ID is server-owned. A client payload that omits it must not
                 # be able to drop it, since the description template requires it.
                 new_data = {**request.data, "ID": listing.product_id}
-                # Recompute type-derived fields (GENDER, canonical ProductType)
-                # so editing the product type and saving keeps them in sync,
-                # rather than leaving a stale GENDER the submit path would reject.
-                await ListingService._apply_product_type_derived(
-                    new_data, apply_weight_default=False
-                )
+                # Recompute the type-derived fields (GENDER, shipping_weight, and the
+                # canonical product type) so editing the product type and saving keeps
+                # them in sync, rather than leaving a stale GENDER the submit path would
+                # reject or a weight that no longer matches the type. This call did
+                # nothing at all until 2026-07-31: it looked up "ProductType" while
+                # listings.data is keyed "product_type", so it returned immediately.
+                await ListingService._apply_product_type_derived(new_data)
                 listing.data = new_data
 
             if request.ai_response is not None:

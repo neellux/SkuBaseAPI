@@ -1297,9 +1297,16 @@ class SellerCloudService:
             original_form_data["ID"] = product_id
             logger.info(f"Added GENDER='{gender}' to form_data")
 
-            # ShippingWeight defaults from the types table but stays editable in
-            # the form, so only fill it when the listing carries no value. A
-            # deliberate override must survive submission.
+            # ShippingWeight is resolved at save time by
+            # ListingService._apply_product_type_derived and is no longer in the form
+            # (hide_shipping_weight_from_listing_form.sql), so this is the
+            # platform-specific recalc rather than a default: it only fires for a
+            # listing that reaches submit carrying no weight, i.e. a draft saved before
+            # the field became derived, or one created through create_listing's
+            # degraded branches, which skip derivation. spo_service has the mirror of
+            # this. item_weight_oz is NOT NULL on prod with every row populated, but it
+            # is nullable on TEST where 5 types have none, so the 404 below is reachable
+            # there.
             stage = "weight"
             if not str(form_data.get("ShippingWeight") or "").strip():
                 type_info = await listing_options_service.get_product_type_info(

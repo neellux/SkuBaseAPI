@@ -193,12 +193,48 @@ class SpoService:
                     f"for color {standard_color!r}"
                 )
 
+        # Platform-specific recalc, mirroring the net in sellercloud_service. The oz
+        # value is normally resolved once at save time by
+        # ListingService._apply_product_type_derived, so this only fires for a listing
+        # that reaches SPO carrying none: a draft saved before the field became
+        # derived, or one created through create_listing's degraded branches (missing
+        # template, or the SellerCloud product lookup returned nothing), which skip
+        # derivation entirely.
+        #
+        # Without it a blank falls straight through the `if weight:` guard below and
+        # SPO ships an empty weight cell with no error and nothing in the log.
         weight = row_data.get("weight")
+        if not str(weight or "").strip():
+            product_type_for_weight = form_data.get("product_type")
+            if product_type_for_weight:
+                type_info = await listing_options_service.get_product_type_info(
+                    product_type_for_weight
+                )
+                item_weight_oz = type_info.get("item_weight_oz")
+                if item_weight_oz is not None:
+                    weight = int(item_weight_oz)
+                    row_data["weight"] = weight
+                    logger.info(
+                        f"SPO: derived weight={weight}oz from product_type "
+                        f"{product_type_for_weight!r} (listing had none)"
+                    )
+
+        # oz -> lbs. Platform formatting, not derivation: SPO is the only consumer
+        # that wants pounds.
         if weight:
             try:
                 row_data["weight"] = round(float(weight) / 16, 1)
             except (ValueError, TypeError):
                 row_data["weight"] = 0.0
+        else:
+            # Loud rather than a silent empty cell. Reaching here means the product
+            # type resolved no weight at all: either an unrecognised type, or one whose
+            # item_weight_oz is NULL (possible on TEST, where the column is nullable
+            # and 5 types have no weight; prod has it NOT NULL with none missing).
+            raise ValueError(
+                f"SPO: no weight for product_type "
+                f"{form_data.get('product_type')!r} and the listing carries none"
+            )
 
         child_size_overrides = form_data.get("child_size_overrides", {})
         if not child_size_overrides:
