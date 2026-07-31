@@ -191,6 +191,7 @@ SPO_DEFAULT_SETTINGS = {
     "min_batch_size": 200,
     "require_type_mapping": False,
     "require_color_mapping": False,
+    "require_brand_mapping": False,
 }
 
 GRAILED_DEFAULT_SETTINGS = {

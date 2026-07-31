@@ -379,6 +379,7 @@ async def get_mapping_status(
     return {
         "product_type": product_type,
         "standard_color": color,
+        "brand_name": brand,
         **status,
     }
 
@@ -502,28 +503,50 @@ async def submit_listing(
         )
 
     # Mapping gates run in a fixed order so the front end resolves them one
-    # category at a time (each resubmit surfaces the next): types -> sizes ->
-    # colors. A type explicitly excluded from a platform means the item is not
-    # listed there at all, so that platform is dropped from the size and color
-    # gates too.
+    # category at a time (each resubmit surfaces the next): brands -> types ->
+    # sizes -> colors. A brand or type explicitly excluded from a platform means
+    # the item is not listed there at all, so that platform is dropped from the
+    # later gates too.
     if non_sc_platforms:
         form_data = listing.data or {}
         product_type = form_data.get("product_type")
         color = form_data.get("standard_color")
+        brand = form_data.get("brand_name")
 
         type_excluded = await listing_options_service.get_excluded_platforms(
             "types", "type", product_type
         )
+        brand_excluded = await listing_options_service.get_excluded_platforms(
+            "brands", "brand", brand
+        )
+        excluded = type_excluded | brand_excluded
 
-        missing_type_or_color = await listing_options_service.check_unmapped_type_or_color(
-            product_type, color, non_sc_platforms, platform_settings
+        missing_mappings = await listing_options_service.check_unmapped_mappings(
+            product_type, color, non_sc_platforms, platform_settings, brand=brand
         )
 
-        # 1. Types
+        # 1. Brands
+        missing_brands = [
+            {**e, "missing": ["brand"]}
+            for e in missing_mappings
+            if "brand" in (e.get("missing") or [])
+        ]
+        if missing_brands:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "type": "unmapped_brands",
+                    "brand_name": brand,
+                    "platforms_with_missing": missing_brands,
+                },
+            )
+
+        # 2. Types (skip platforms whose brand is excluded here)
         missing_types = [
             {**e, "missing": ["type"]}
-            for e in missing_type_or_color
+            for e in missing_mappings
             if "type" in (e.get("missing") or [])
+            and e.get("platform_id") not in brand_excluded
         ]
         if missing_types:
             raise HTTPException(
@@ -535,10 +558,10 @@ async def submit_listing(
                 },
             )
 
-        # 2. Sizes (skip platforms whose type is excluded here)
+        # 3. Sizes (skip platforms whose brand or type is excluded here)
         sizing_scheme = form_data.get("SIZING_SCHEME")
         child_sizes = list(set(v for v in child_size_overrides.values() if v and v.strip()))
-        size_platforms = [p for p in non_sc_platforms if p not in type_excluded]
+        size_platforms = [p for p in non_sc_platforms if p not in excluded]
         if sizing_scheme and child_sizes and size_platforms:
             sizing_type = None
             if product_type:
@@ -563,11 +586,11 @@ async def submit_listing(
                     },
                 )
 
-        # 3. Colors (skip platforms whose type is excluded here)
+        # 4. Colors (skip platforms whose brand or type is excluded here)
         missing_colors = [
             {**e, "missing": ["color"]}
-            for e in missing_type_or_color
-            if "color" in (e.get("missing") or []) and e.get("platform_id") not in type_excluded
+            for e in missing_mappings
+            if "color" in (e.get("missing") or []) and e.get("platform_id") not in excluded
         ]
         if missing_colors:
             raise HTTPException(

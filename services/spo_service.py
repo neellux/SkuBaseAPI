@@ -168,6 +168,25 @@ class SpoService:
         platform_settings = await self.get_platform_settings()
         require_type_mapping = bool(platform_settings.get("require_type_mapping"))
         require_color_mapping = bool(platform_settings.get("require_color_mapping"))
+        require_brand_mapping = bool(platform_settings.get("require_brand_mapping"))
+
+        # The brand's SPO field id comes from the field map rather than a literal:
+        # unlike category/normalized-color it is not fixed, it is whatever
+        # field_definitions maps brand_name to for this platform.
+        brand_field = (spo_field_map.get("brand_name") or {}).get("field_id")
+        brand_name = form_data.get("brand_name")
+        if brand_name:
+            spo_brand = await listing_options_service.get_platform_brand(
+                brand_name, self.PLATFORM_ID
+            )
+            if spo_brand:
+                if brand_field:
+                    row_data[brand_field] = spo_brand
+            elif require_brand_mapping:
+                raise ValueError(
+                    f"SPO: require_brand_mapping is on and no platform brand mapping exists "
+                    f"for brand {brand_name!r}"
+                )
 
         category = row_data.get("category")
         if category:

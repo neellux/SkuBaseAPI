@@ -468,6 +468,27 @@ class GrailedService:
 
         require_type_mapping = bool(settings.get("require_type_mapping"))
         require_color_mapping = bool(settings.get("require_color_mapping"))
+        require_brand_mapping = bool(settings.get("require_brand_mapping"))
+
+        # Only the Grailed brand field takes the mapped value; the title and
+        # _format_description keep the raw brand_name, the same split the sizes
+        # already use (raw size in the text, mapped size in the size fields).
+        # The field id comes from the field map because, unlike category/color,
+        # it is whatever field_definitions maps brand_name to.
+        brand_field = (grailed_field_map.get("brand_name") or {}).get("field_id")
+        brand_name = form_data.get("brand_name")
+        if brand_name:
+            grailed_brand = await listing_options_service.get_platform_brand(
+                brand_name, self.PLATFORM_ID
+            )
+            if grailed_brand:
+                if brand_field:
+                    row_data[brand_field] = grailed_brand
+            elif require_brand_mapping:
+                raise ValueError(
+                    f"Grailed: require_brand_mapping is on and no platform brand mapping exists "
+                    f"for brand {brand_name!r}"
+                )
 
         category = row_data.get("category")
         if category:

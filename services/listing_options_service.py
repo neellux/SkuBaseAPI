@@ -220,6 +220,40 @@ class ListingOptionsService:
             logger.error(f"Error fetching {platform} color for {color}: {e}")
             raise
 
+    async def get_platform_brand(self, brand: str, platform: str) -> str | None:
+        try:
+            conn = connections.get("default")
+
+            query = """
+                SELECT bdl.platform_value
+                FROM listingoptions_brands_default_list bdl
+                JOIN listingoptions_brands b ON bdl.primary_id = b.id
+                WHERE bdl.platform_id = $2
+                  AND (
+                      LOWER(b.brand) = LOWER($1)
+                      OR EXISTS (
+                          SELECT 1
+                          FROM jsonb_array_elements_text(b.aliases) AS alias
+                          WHERE LOWER(alias) = LOWER($1)
+                      )
+                  )
+                LIMIT 1
+            """
+
+            result = await conn.execute_query_dict(query, [brand, platform])
+
+            if not result:
+                logger.warning(f"No {platform} brand mapping found for: {brand}")
+                return None
+
+            platform_value = result[0].get("platform_value")
+            logger.info(f"{platform} brand for '{brand}': {platform_value}")
+            return platform_value
+
+        except Exception as e:
+            logger.error(f"Error fetching {platform} brand for {brand}: {e}")
+            raise
+
     async def get_excluded_platforms(self, table_name: str, value_column: str, value: str | None) -> set:
         """platform_ids the given brand/type/color value is explicitly excluded from.
 
@@ -253,28 +287,38 @@ class ListingOptionsService:
             raw = orjson.loads(raw)
         return {str(p) for p in raw} if isinstance(raw, list) else set()
 
-    async def check_unmapped_type_or_color(
+    async def check_unmapped_mappings(
         self,
         product_type: str | None,
         color: str | None,
         platforms: list,
         platform_settings: dict,
+        brand: str | None = None,
     ) -> list:
         result = []
         type_excluded = await self.get_excluded_platforms("types", "type", product_type)
         color_excluded = await self.get_excluded_platforms("colors", "color", color)
+        brand_excluded = await self.get_excluded_platforms("brands", "brand", brand)
         for platform_id in platforms:
             if platform_id == "sellercloud":
                 continue
             settings = platform_settings.get(platform_id, {}) or {}
             require_type = bool(settings.get("require_type_mapping"))
             require_color = bool(settings.get("require_color_mapping"))
-            if not require_type and not require_color:
+            require_brand = bool(settings.get("require_brand_mapping"))
+            if not require_type and not require_color and not require_brand:
                 continue
 
             missing = []
             # An explicit exclusion is treated as satisfied: the user has said this
-            # type/color is intentionally not mapped here, so it must not block.
+            # brand/type/color is intentionally not mapped here, so it must not block.
+            if require_brand and platform_id not in brand_excluded:
+                if not brand:
+                    missing.append("brand")
+                else:
+                    mapped = await self.get_platform_brand(brand, platform_id)
+                    if not mapped:
+                        missing.append("brand")
             if require_type and platform_id not in type_excluded:
                 if not product_type:
                     missing.append("type")
@@ -304,6 +348,7 @@ class ListingOptionsService:
                         "missing": missing,
                         "product_type": product_type,
                         "color": color,
+                        "brand": brand,
                     }
                 )
         return result
@@ -318,8 +363,10 @@ class ListingOptionsService:
     ) -> dict:
         type_status: dict = {}
         color_status: dict = {}
+        brand_status: dict = {}
         type_required: dict = {}
         color_required: dict = {}
+        brand_required: dict = {}
         type_excluded: dict = {}
         color_excluded: dict = {}
         brand_excluded: dict = {}
@@ -333,6 +380,7 @@ class ListingOptionsService:
             settings = platform_settings.get(platform_id, {}) or {}
             type_required[platform_id] = bool(settings.get("require_type_mapping"))
             color_required[platform_id] = bool(settings.get("require_color_mapping"))
+            brand_required[platform_id] = bool(settings.get("require_brand_mapping"))
             type_excluded[platform_id] = platform_id in type_excluded_set
             color_excluded[platform_id] = platform_id in color_excluded_set
             brand_excluded[platform_id] = platform_id in brand_excluded_set
@@ -343,11 +391,16 @@ class ListingOptionsService:
             color_status[platform_id] = bool(
                 color and await self.get_platform_color(color, platform_id)
             )
+            brand_status[platform_id] = bool(
+                brand and await self.get_platform_brand(brand, platform_id)
+            )
         return {
             "type": type_status,
             "color": color_status,
+            "brand": brand_status,
             "type_required": type_required,
             "color_required": color_required,
+            "brand_required": brand_required,
             "type_excluded": type_excluded,
             "color_excluded": color_excluded,
             "brand_excluded": brand_excluded,
