@@ -206,8 +206,8 @@ class ListingService:
         return options_map
 
     @staticmethod
-    def _normalize_mpn(data: Dict[str, Any]) -> None:
-        """Canonicalize manufacturer_sku (the MPN) in place, on every save.
+    def normalize_mpn(data: Dict[str, Any]) -> bool:
+        """Canonicalize manufacturer_sku (the MPN) in place. Returns True if changed.
 
         Reuses product_service.format_mpn, the same function SKU creation uses, so
         a listing and the SKUs built from it can never disagree about the same MPN.
@@ -220,17 +220,20 @@ class ListingService:
         is overwritten with the child SKU (spo_service), so SPO is unaffected either
         way.
 
-        Idempotent, so re-saving a normalized value is a no-op.
+        Idempotent, so re-running it on a normalized value is a no-op. The return
+        value lets the submit path skip a pointless write when nothing changed.
         """
         mpn = data.get("manufacturer_sku")
         if mpn is None:
-            return
+            return False
         # No whitespace-only special case: format_mpn collapses "   " to "", which is
         # what it means. Leaving it would be the one value that escapes normalization.
         formatted = format_mpn(str(mpn))
-        if formatted != mpn:
-            data["manufacturer_sku"] = formatted
-            logger.info(f"Normalized MPN {mpn!r} -> {formatted!r}")
+        if formatted == mpn:
+            return False
+        data["manufacturer_sku"] = formatted
+        logger.info(f"Normalized MPN {mpn!r} -> {formatted!r}")
+        return True
 
     @staticmethod
     async def _apply_product_type_derived(
@@ -431,7 +434,7 @@ class ListingService:
             # prefill or from AI rather than from the operator. original_data below
             # is snapshotted after this, so the creation baseline records the
             # normalized value that would actually be submitted.
-            ListingService._normalize_mpn(prefilled_data)
+            ListingService.normalize_mpn(prefilled_data)
 
             upload_status = "pending"
             if await ListingService._check_photos_uploaded(request.product_id):
@@ -497,7 +500,7 @@ class ListingService:
                 # nothing at all until 2026-07-31: it looked up "ProductType" while
                 # listings.data is keyed "product_type", so it returned immediately.
                 await ListingService._apply_product_type_derived(new_data)
-                ListingService._normalize_mpn(new_data)
+                ListingService.normalize_mpn(new_data)
                 listing.data = new_data
 
             if request.ai_response is not None:

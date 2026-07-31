@@ -405,6 +405,21 @@ async def submit_listing(
     if not listing_model:
         raise HTTPException(status_code=404, detail="Listing not found")
 
+    # Normalize the MPN once, here, on the data as submit received it. create and
+    # update already normalize, but the operator can edit the field and hit submit
+    # inside the 2s autosave debounce, so this is the last point that sees the value
+    # before it fans out to the platforms.
+    #
+    # Persisted rather than patched in memory: SPO and Grailed are manual_fallback
+    # platforms whose pollers re-read listings.data minutes later, and
+    # submit_listing_to_sellercloud deep-copies form_data, so an in-memory-only fix
+    # would reach neither. listing.data is the separate dict the background task is
+    # dispatched with, so it is pointed at the same object. format_mpn is idempotent,
+    # so the write only happens when the value actually changed.
+    if listing_model.data and ListingService.normalize_mpn(listing_model.data):
+        await listing_model.save(update_fields=["data", "updated_at"])
+    listing.data = listing_model.data
+
     platforms = body.platforms if body and body.platforms else None
     if not platforms:
         settings = await AppSettings.first()
