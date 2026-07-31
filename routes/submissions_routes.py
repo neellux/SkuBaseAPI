@@ -27,6 +27,7 @@ from services.spo_poller import spo_poller
 from services.spo_service import spo_service
 from services.template_service import TemplateService
 from tortoise import connections
+from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/submissions", tags=["submissions"])
@@ -37,7 +38,12 @@ MAX_PAGE_SIZE = 200
 
 
 def _effective_status(sub: ListingSubmission) -> str:
-    """A failed submission that has been manually reviewed counts as success."""
+    """A failed submission that has been manually reviewed counts as success.
+
+    Legacy rows only: mark_import_reviewed now writes SUCCESS to the row itself,
+    so reviewing resolves the failure everywhere rather than just on this screen.
+    Kept for rows reviewed before that change, which are still stored as failed.
+    """
     if sub.status == SubmissionStatus.FAILED and sub.reviewed_at is not None:
         return SubmissionStatus.SUCCESS
     return sub.status
@@ -425,19 +431,31 @@ async def mark_import_reviewed(
 
     user_id = request.state.user["id"]
     now = datetime.now(timezone.utc)
-    reviewed_count = 0
+    # Reviewing resolves the failure, so the row becomes a real success rather
+    # than a failure the dashboard translates on the way out. _effective_status
+    # only ever applied here; every other surface (the listing platform pills,
+    # the batch product tabs, the submit button label) reads the raw status, so
+    # a reviewed row used to stay red everywhere outside this screen.
+    # error_display and platform_meta.sku_errors are left in place: the row is
+    # resolved, not rewritten, and the import detail still shows what failed.
+    reviewed_ids: list[int] = []
     for sub in submissions:
         if sub.status == SubmissionStatus.FAILED and sub.reviewed_at is None:
+            sub.status = SubmissionStatus.SUCCESS
             sub.reviewed_at = now
             sub.reviewed_by = user_id
-            await sub.save(update_fields=["reviewed_at", "reviewed_by"])
-            reviewed_count += 1
+            await sub.save(update_fields=["status", "reviewed_at", "reviewed_by"])
+            reviewed_ids.append(sub.id)
+
+    await record_step(
+        reviewed_ids, "reviewed", reviewed_by=user_id, previous_status="failed"
+    )
 
     logger.info(
         "Import %s (%s): marked %d failed submission(s) reviewed by %s",
         import_id,
         platform,
-        reviewed_count,
+        len(reviewed_ids),
         user_id,
     )
 

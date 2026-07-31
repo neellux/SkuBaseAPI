@@ -700,7 +700,9 @@ class ImportListingDetail(BaseModel):
     )
     updated_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = Field(
-        None, description="Set when a failed submission was manually reviewed"
+        None,
+        description="Set when a failed submission was manually reviewed. Such a row "
+        "reports status 'success'; this field is what marks it as manually resolved",
     )
 
 

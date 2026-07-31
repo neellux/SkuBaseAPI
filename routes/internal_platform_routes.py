@@ -223,8 +223,14 @@ async def get_overview(
                 "                   AND dest_product_gid IS NULL) AS awaiting, "
                 "  count(DISTINCT dest_product_gid) "
                 "    FILTER (WHERE dest_product_gid IS NOT NULL) AS live, "
-                "  COALESCE(sum(variant_count) FILTER (WHERE listed_at IS NOT NULL "
-                "                   AND dest_product_gid IS NULL), 0) AS in_flight, "
+                # COUNT, not SUM(variant_count). This was a variant sum while the submit
+                # gate budgeted in variants; the gate moved to whole products and this did
+                # not follow, so `products_in_flight` reported roughly 3.7x the number of
+                # products it named - 1,434 against 391 - and the Overview read as though
+                # the queue had exploded. ledger.products_in_flight() is the same
+                # predicate and must stay the same arithmetic.
+                "  count(*) FILTER (WHERE listed_at IS NOT NULL "
+                "                   AND dest_product_gid IS NULL) AS in_flight, "
                 "  count(*) FILTER (WHERE listed_at IS NOT NULL "
                 "                   AND dest_product_gid IS NULL "
                 "                   AND listed_at < $2) AS stale "

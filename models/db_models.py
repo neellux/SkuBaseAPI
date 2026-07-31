@@ -358,7 +358,9 @@ class ListingSubmission(Model):
 
     reviewed_at = fields.DatetimeField(
         null=True,
-        description="When a failed manual-fallback submission was acknowledged/triaged",
+        description="When a failed manual-fallback submission was triaged. Reviewing "
+        "also moves the row to 'success', so this is the audit trail of why a "
+        "submission succeeded without the platform ever accepting it",
     )
     reviewed_by = fields.CharField(
         max_length=100,
