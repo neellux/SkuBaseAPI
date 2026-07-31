@@ -15,6 +15,7 @@ from models.api_models import (
 from models.db_models import AppSettings, Listing, Template
 from services.ai_service import AIService
 from services.listing_options_service import listing_options_service
+from services.product_service import format_mpn
 from services.sellercloud_service import sellercloud_service
 from services.template_render import render_template, resolve_field_template
 from services.template_service import TemplateService
@@ -203,6 +204,33 @@ class ListingService:
 
         logger.info(f"Successfully loaded options for {len(options_map)} fields total")
         return options_map
+
+    @staticmethod
+    def _normalize_mpn(data: Dict[str, Any]) -> None:
+        """Canonicalize manufacturer_sku (the MPN) in place, on every save.
+
+        Reuses product_service.format_mpn, the same function SKU creation uses, so
+        a listing and the SKUs built from it can never disagree about the same MPN.
+
+        Normalized at the source rather than per platform because the value is read
+        from this one key by every consumer: SellerCloud's ManufacturerSKU, and the
+        {manufacturer_sku} placeholder that appears in BOTH the sellercloud and
+        grailed description templates. Formatting it at each of those would be three
+        copies of the same rule. SPO maps it to `sku` in the template, but that column
+        is overwritten with the child SKU (spo_service), so SPO is unaffected either
+        way.
+
+        Idempotent, so re-saving a normalized value is a no-op.
+        """
+        mpn = data.get("manufacturer_sku")
+        if mpn is None:
+            return
+        # No whitespace-only special case: format_mpn collapses "   " to "", which is
+        # what it means. Leaving it would be the one value that escapes normalization.
+        formatted = format_mpn(str(mpn))
+        if formatted != mpn:
+            data["manufacturer_sku"] = formatted
+            logger.info(f"Normalized MPN {mpn!r} -> {formatted!r}")
 
     @staticmethod
     async def _apply_product_type_derived(
@@ -399,6 +427,12 @@ class ListingService:
             # SKU, which request.product_id already holds for every caller.
             prefilled_data["ID"] = request.product_id
 
+            # Last, so it also catches an MPN that arrived from the SellerCloud
+            # prefill or from AI rather than from the operator. original_data below
+            # is snapshotted after this, so the creation baseline records the
+            # normalized value that would actually be submitted.
+            ListingService._normalize_mpn(prefilled_data)
+
             upload_status = "pending"
             if await ListingService._check_photos_uploaded(request.product_id):
                 upload_status = "uploaded"
@@ -463,6 +497,7 @@ class ListingService:
                 # nothing at all until 2026-07-31: it looked up "ProductType" while
                 # listings.data is keyed "product_type", so it returned immediately.
                 await ListingService._apply_product_type_derived(new_data)
+                ListingService._normalize_mpn(new_data)
                 listing.data = new_data
 
             if request.ai_response is not None:
