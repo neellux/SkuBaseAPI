@@ -45,6 +45,7 @@ from models.api_models import (
 )
 from models.db_models import (
     InternalPlatform,
+    InternalPlatformSkipReason,
     InternalPlatformState,
     InternalPlatformSubmission,
 )
@@ -71,6 +72,13 @@ DEFAULT_PLATFORM = "shopthesample"
 # deliberately: nothing ever writes it, and a status the database can hold but the
 # pipeline never sets is worse than an explicit filter-only value.
 AWAITING_SYNCIO = "awaiting_syncio"
+
+# Hidden from the dashboard (2026-08-03, on request). The pipeline still detects, flags and
+# excludes these rows from tagging - this only suppresses them in the UI, in the Products
+# list and in the Overview's skip-reason tiles. They remain reachable via an explicit
+# ?skip_reason=reassigned_sku, so nothing is hidden from someone looking for it. Delete this
+# constant and its two uses to surface them.
+HIDDEN_SKIP_REASON = InternalPlatformSkipReason.REASSIGNED_SKU.value
 
 # What each store needs for the pipeline to function end to end. Surfaced on the
 # overview so the page can explain exactly why nothing is running.
@@ -206,11 +214,17 @@ async def get_overview(
                 "WHERE internal_platform_id = $1 GROUP BY current_status",
                 [platform],
             ),
+            # reassigned_sku is excluded (2026-08-03, on request). Those rows describe
+            # products whose SKUs were merged onto another parent; the pipeline detects and
+            # flags them so they stay out of tagging, but they are not yet an operator-facing
+            # category and would otherwise appear as a new tile nobody can act on. Remove
+            # this predicate - and the twin in get_products - to surface them.
             conn.execute_query_dict(
                 "SELECT skip_reason, count(*) AS n FROM internal_platform_state "
                 "WHERE internal_platform_id = $1 AND skip_reason IS NOT NULL "
+                "  AND skip_reason <> $2 "
                 "GROUP BY skip_reason ORDER BY n DESC",
-                [platform],
+                [platform, HIDDEN_SKIP_REASON],
             ),
             # Five scalars over internal_platform_state in ONE statement. They were five
             # separate round trips at ~0.57s each against a remote database, for five
@@ -384,6 +398,11 @@ async def get_products(
     try:
         await _get_platform(platform)
         qs = InternalPlatformState.filter(internal_platform_id=platform)
+        # Hidden unless explicitly asked for by ?skip_reason=reassigned_sku, which stays
+        # available so the rows can still be inspected without being on the dashboard. See
+        # the matching exclusion in get_overview's skip_reason_counts.
+        if skip_reason != HIDDEN_SKIP_REASON:
+            qs = qs.exclude(skip_reason=HIDDEN_SKIP_REASON)
         if exclude_skipped:
             qs = qs.exclude(current_status="skipped")
         # `pending_normalization` spans two stages that look nothing alike to an

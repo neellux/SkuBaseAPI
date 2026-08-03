@@ -38,12 +38,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from config import config
 from models.db_models import (
     InternalPlatformAction as Act,
+    InternalPlatformSkipReason as Skip,
     InternalPlatformStatus as St,
 )
 from services import internal_platform_ledger as ledger
 from services.internal_platform_type_map import check_taxonomy_health, load_taxonomy
 from services.internal_platform_products import (
+    load_reassigned,
     product_parent,
+    reassigned_skus_on,
     resolve_registered_parents,
 )
 from services.internal_platform_rules import (
@@ -52,6 +55,7 @@ from services.internal_platform_rules import (
     check_submit_cooldown,
     compute_price,
     pricing_basis,
+    check_reconcile_cap,
     check_syncio_capacity,
     derive_scan_status,
     fit_to_capacity,
@@ -97,6 +101,13 @@ def to_source_product(p: Product, parent_sku: str | None) -> SourceProduct:
 class SourceReport:
     scanned: int = 0
     unregistered: int = 0        # no registered parent in the products DB -> not listed
+    # Every variant SKU merged onto another parent. Counted apart from `unregistered`
+    # because the causes are opposite: SkuBase has never heard of an unregistered product,
+    # and knows a reassigned one too well.
+    reassigned: int = 0
+    queued_reassigned: int = 0   # orphaned rows moved to pending_delisting
+    reconciled: int = 0          # rows whose stored stock the scan corrected
+    zeroed: int = 0              # of those, rows whose SKUs are gone from Shopify entirely
     qualifying: int = 0
     to_tag: list[tuple[str, str, str]] = field(default_factory=list)      # sku, gid, why
     to_delist: list[tuple[str, str, str]] = field(default_factory=list)   # sku, gid, cause
@@ -117,6 +128,8 @@ class SourceReport:
     def summary(self) -> str:
         return (
             f"scanned={self.scanned} unregistered={self.unregistered} "
+            f"reassigned={self.reassigned} queued_reassigned={self.queued_reassigned} "
+            f"reconciled={self.reconciled} zeroed={self.zeroed} "
             f"qualifying={self.qualifying} "
             f"to_tag={len(self.to_tag)} to_delist={len(self.to_delist)} "
             f"soaking={self.soaking} stock_held={self.stock_held} "
@@ -175,6 +188,22 @@ class InternalPlatformSourcePoller:
             cfg.get("delist_on_no_inventory", False)
         )
 
+        # Correct stored stock against what the scan actually saw, including zeroing rows
+        # whose SKUs are gone from Shopify. ON by default: without it a row whose parent key
+        # stopped resolving freezes forever, which is how nine phantom units survived on the
+        # Products tab from merge day until 2026-08-03.
+        self.reconcile_stock: bool = bool(cfg.get("reconcile_stock", True))
+
+        # Move orphaned reassigned rows to pending_delisting. OFF by default and shipped off
+        # deliberately: pending_delisting is the queue the Delist button drains, and
+        # execute_deletes is TRUE in production. Turn this on only after a cycle has run with
+        # it off and the mispaired rows have been confirmed to have healed their
+        # source_product_gid - see the plan's landing order. While off, reassigned products
+        # are still detected, counted and kept out of tagging; they are simply not queued.
+        self.queue_reassigned_delists: bool = bool(
+            cfg.get("queue_reassigned_delists", False)
+        )
+
         self.caps = SafetyCaps(
             max_actions_per_cycle=int(cfg.get("max_tags_per_cycle", 150)),
             max_deletes_per_cycle=int(cfg.get("max_deletes_per_cycle", 0)),
@@ -182,6 +211,7 @@ class InternalPlatformSourcePoller:
             max_pct_of_footprint_changed=float(cfg.get("max_pct_of_footprint_changed", 10.0)),
             min_candidate_set_size=int(cfg.get("min_candidate_set_size", 50)),
             max_candidate_set_shrink_pct=float(cfg.get("max_candidate_set_shrink_pct", 50.0)),
+            max_rows_zeroed_per_cycle=int(cfg.get("max_rows_zeroed_per_cycle", 50)),
         )
 
         self.allowlists = Allowlists(
@@ -311,6 +341,21 @@ class InternalPlatformSourcePoller:
         fresh = {p.gid: p for p in await admin.products_by_ids(gids)}
         report.scanned = len(fresh)
 
+        # A row can have been merged away between the scan that marked it ready and this
+        # press. Tagging it would hand Syncio a product whose SKUs now belong to another
+        # parent, so the same check the scan makes is repeated here on fresh data. Fail
+        # closed for the same reason it does there.
+        try:
+            reassigned = await load_reassigned(
+                {s for p in fresh.values() for s in p.variant_skus if s}
+            )
+        except Exception as exc:                                     # noqa: BLE001
+            logger.error("%s: could not read secondary_skus, refusing to tag: %s",
+                         self.name, exc)
+            report.aborted = "reassigned-read-failed"
+            report.gate_message = f"secondary_skus unreadable: {exc}"
+            return report
+
         by_gid = {r.source_product_gid: r for r in candidates}
         variant_counts: dict[str, int] = {}
         for gid, product in fresh.items():
@@ -320,6 +365,18 @@ class InternalPlatformSourcePoller:
             sp = to_source_product(product, row.parent_sku)
             if is_tagged(sp, platform.trigger_tag):
                 continue        # already tagged between the scan and now
+            skus = [s for s in product.variant_skus if s]
+            moved = reassigned_skus_on(product.variant_skus, reassigned)
+            if skus and len(moved) == len(skus):
+                # Every SKU merged away since the scan. Correct the row so the tab stops
+                # offering it, and do not tag.
+                await ledger.apply_scan_statuses(
+                    self.platform_id,
+                    {row.parent_sku: (SKIPPED, Skip.REASSIGNED_SKU.value,
+                                      len(product.variants))},
+                )
+                report.reassigned += 1
+                continue
             verdict = qualifies(sp, self.allowlists, DEFAULT_PRICING, taxonomy=taxonomy)
             if not verdict.qualified:
                 # Went stale - usually sold out. Correct the row so the tab agrees.
@@ -491,12 +548,46 @@ class InternalPlatformSourcePoller:
         all_skus = {s for p in scanned_products for s in p.variant_skus if s}
         registered = await resolve_registered_parents(all_skus)
 
+        # Which of those SKUs have been merged onto another parent. Loaded BEFORE any write,
+        # and fail-closed: an unreadable matview must never be read as "nothing is
+        # reassigned", because that is precisely the state in which the mislink happens.
+        try:
+            reassigned = await load_reassigned(all_skus)
+        except Exception as exc:                                     # noqa: BLE001
+            logger.error("%s: could not read secondary_skus, aborting before any write: %s",
+                         self.name, exc)
+            report.aborted = "reassigned-read-failed"
+            report.gate_message = f"secondary_skus unreadable: {exc}"
+            return report
+
+        # sku -> live inventoryQuantity, for the reconciliation pass below. Built from the
+        # products this scan returned, so it is only trustworthy on a cycle that completed -
+        # which the ShopifyError/ShopifyScopeError aborts above have already established.
+        live_stock: dict[str, int] = {}
+        for product in scanned_products:
+            for variant in product.variants:
+                if variant.sku:
+                    live_stock[variant.sku] = variant.inventory_quantity
+
+        # Source products whose every resolvable SKU has been reassigned away. Keyed by
+        # source gid because that is the only handle left: they no longer resolve to a
+        # parent, so they cannot be found in state_map by key.
+        reassigned_gids: dict[str, list[str]] = {}
+
         variant_counts: dict[str, int] = {}
         facts: dict[str, ledger.ProductFacts] = {}
         for product in scanned_products:
-            parent = product_parent(product.variant_skus, registered)
+            parent = product_parent(product.variant_skus, registered, reassigned)
             if parent is None:
-                report.unregistered += 1
+                moved = reassigned_skus_on(product.variant_skus, reassigned)
+                if moved:
+                    # SkuBase knows these SKUs; they have just stopped describing this
+                    # product. Do NOT fall through to the unregistered branch - that would
+                    # bury a merge under a count that means "never heard of it".
+                    report.reassigned += 1
+                    reassigned_gids[product.gid] = moved
+                else:
+                    report.unregistered += 1
                 continue
             # Refreshed every scan, not written once at tag time, so a product whose size
             # run changed on 1nventory is not budgeted at its old weight forever.
@@ -644,6 +735,18 @@ class InternalPlatformSourcePoller:
             n = await ledger.apply_scan_statuses(self.platform_id, desired_status)
             logger.info("%s: wrote %d status rows", self.name, n)
 
+        # Every parent a scanned product resolved to this cycle. A row holding one of these
+        # keys has a living owner and must never be treated as orphaned - see the guard in
+        # both blocks below.
+        claimed = {sp.parent_sku for sp, _ in candidates if sp.parent_sku}
+
+        if self.reconcile_stock:
+            await self._reconcile_stock(report, state_map, claimed, live_stock)
+
+        if reassigned_gids:
+            await self._flag_reassigned(report, state_map, claimed, reassigned_gids,
+                                        reassigned)
+
         self._previous_candidate_size = len(qualifying)
 
         # Syncio capacity, BEFORE the blast-radius caps. Order matters: the gate trims
@@ -754,6 +857,128 @@ class InternalPlatformSourcePoller:
         logger.info("%s: %s pass done, %s",
                     self.name, "delist" if delists else "scan", report.summary())
         return report
+
+    # -- reconciliation ----------------------------------------------------
+
+    async def _reconcile_stock(self, report: SourceReport, state_map: dict[str, Any],
+                               claimed: set[str], live_stock: dict[str, int]) -> None:
+        """Correct stored stock on rows this scan could not key.
+
+        The scan writes by RESOLVED parent, so a row whose key stopped resolving - after a
+        merge, a rename, a child_products cleanup - is no longer a possible write target and
+        freezes at whatever it held that day. Nothing sweeps for it: the design note above
+        check_candidate_set explains why absence from a scan is never signal, which is right
+        for a truncated page and wrong for a key that will never resolve again.
+
+        So this is the one place absence IS signal, and it is scoped as narrowly as the
+        problem allows:
+
+          - only rows NOT claimed by a scanned product this cycle (rows the scan just wrote
+            are correct by construction)
+          - a SKU still on Shopify takes its live quantity, whichever product now carries it
+          - a SKU absent from a COMPLETE catalog sweep is set to 0
+          - stock columns ONLY. current_status, skip_reason and dest_product_gid are not
+            touched, so a bad read cannot cascade into the delete queue
+
+        Reached only on a cycle that completed: the ShopifyError and ShopifyScopeError paths
+        in _cycle return before this. Runs regardless of `execute`, matching
+        refresh_product_facts - `execute` gates STOREFRONT writes, not state corrections.
+        """
+        updates: dict[str, tuple[int, list[dict]]] = {}
+        rows_with_missing_skus = 0
+
+        for parent_sku, row in state_map.items():
+            if parent_sku in claimed:
+                continue
+            stored = row.variants or []
+            if not stored:
+                continue
+
+            corrected: list[dict] = []
+            changed = False
+            saw_missing = False
+            for variant in stored:
+                sku = variant.get("sku")
+                live = live_stock.get(sku) if sku else None
+                if live is None:
+                    live = 0
+                    if sku:
+                        saw_missing = True
+                if variant.get("inventory") != live:
+                    changed = True
+                corrected.append({**variant, "inventory": live})
+
+            total = sum(v["inventory"] for v in corrected)
+            if not changed and row.inventory == total:
+                continue
+            if saw_missing:
+                rows_with_missing_skus += 1
+            updates[parent_sku] = (total, corrected)
+
+        if not updates:
+            return
+
+        breach = check_reconcile_cap(rows_with_missing_skus, self.caps)
+        if breach:
+            # Deliberately ALL-OR-NOTHING. Zeroing the first 50 and stopping would leave the
+            # catalog half-corrected on exactly the cycle we decided not to trust.
+            logger.error("%s: RECONCILE CAP BREACH, zero stock writes: %s (%d rows wanted "
+                         "correction)", self.name, breach, len(updates))
+            report.gate_message = breach
+            return
+
+        report.reconciled = await ledger.reconcile_stock(self.platform_id, updates)
+        report.zeroed = rows_with_missing_skus
+        logger.info("%s: reconciled stock on %d row(s); %d had SKUs absent from Shopify "
+                    "and were zeroed", self.name, report.reconciled, report.zeroed)
+
+    async def _flag_reassigned(self, report: SourceReport, state_map: dict[str, Any],
+                               claimed: set[str], reassigned_gids: dict[str, list[str]],
+                               reassigned: dict[str, str]) -> None:
+        """Mark ORPHANED rows of reassigned products, and queue them only if configured.
+
+        The claimed-key guard is the whole safety of this method. A reassigned product's gid
+        can appear on two rows - the row it wrongly took over, and the row it left behind -
+        and state_map was loaded at the START of the cycle, before any healing write. Queuing
+        every row on that gid would therefore queue the SURVIVOR.
+
+        Concretely, before this change RHD-MOTW-0038 and RHD-MOTW-0040 both carried gid
+        10142326358316. RHD-MOTW-0038 is a live BLACK AMARINO with 4 units on 1nventory and 3
+        on Shop The Sample; its rightful source product (10104636113196) reclaims the key on
+        this very cycle. Queueing it would delist a selling product. So: a row is queued only
+        when nothing claims its parent_sku.
+        """
+        by_gid: dict[str, list[Any]] = {}
+        for row in state_map.values():
+            if row.source_product_gid:
+                by_gid.setdefault(row.source_product_gid, []).append(row)
+
+        items: dict[str, str] = {}
+        for gid, moved in reassigned_gids.items():
+            for row in by_gid.get(gid, []):
+                if row.parent_sku in claimed:
+                    # Reclaimed this cycle by its rightful product. Not an orphan.
+                    continue
+                detail = "; ".join(
+                    f"{sku} -> {reassigned.get(sku, '?')}" for sku in moved[:5]
+                )
+                if len(moved) > 5:
+                    detail += f" (+{len(moved) - 5} more)"
+                items[row.parent_sku] = f"reassigned: {detail}"
+
+        if not items:
+            return
+
+        n = await ledger.flag_reassigned(self.platform_id, items,
+                                         queue=self.queue_reassigned_delists)
+        if self.queue_reassigned_delists:
+            report.queued_reassigned = n
+            logger.info("%s: queued %d orphaned row(s) as pending_delisting/reassigned_sku: "
+                        "%s", self.name, n, sorted(items)[:10])
+        else:
+            logger.info("%s: flagged %d orphaned row(s) as reassigned_sku and kept them out "
+                        "of tagging; queue_reassigned_delists=false so current_status was "
+                        "not changed: %s", self.name, n, sorted(items)[:10])
 
     async def _apply_tags(self, platform: Any, admin: ShopifyAdmin,
                           report: SourceReport) -> None:

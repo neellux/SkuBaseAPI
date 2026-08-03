@@ -614,6 +614,31 @@ class SafetyCaps:
     max_units_zeroed_per_cycle: int = 400
     min_candidate_set_size: int = 50
     max_candidate_set_shrink_pct: float = 50.0
+    # Stock-reconciliation blast radius. Distinct from max_units_zeroed_per_cycle, which
+    # counts Shopify inventory-level writes on the destination; this counts STATE ROWS whose
+    # stored stock the scan is about to correct downward because their SKUs are no longer on
+    # Shopify. Reconciliation is the one place the pipeline treats absence as signal, so it
+    # gets its own ceiling rather than sharing one. 0 disables, like every cap here.
+    max_rows_zeroed_per_cycle: int = 50
+
+
+def check_reconcile_cap(rows_zeroed: int, caps: SafetyCaps) -> str | None:
+    """Breach message if a reconciliation pass wants to zero too many rows, else None.
+
+    A mass disappearance is a broken read until a human says otherwise. This is the guard
+    that keeps `absence -> zero` from becoming the SPO mapping wipe: there, an unexpectedly
+    small input set was treated as authoritative and sibling rows were destroyed.
+
+    Note the caller must ALSO have established that the scan completed. This cap bounds the
+    damage from a scan that completed but was wrong; it cannot detect one that was truncated,
+    because a truncated scan is what the abort paths in _cycle already catch.
+    """
+    if caps.max_rows_zeroed_per_cycle > 0 and rows_zeroed > caps.max_rows_zeroed_per_cycle:
+        return (
+            f"max_rows_zeroed_per_cycle: {rows_zeroed} > "
+            f"{caps.max_rows_zeroed_per_cycle}; refusing to zero stock this cycle"
+        )
+    return None
 
 
 def check_caps(

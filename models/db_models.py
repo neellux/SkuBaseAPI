@@ -493,6 +493,12 @@ class InternalPlatformSkipReason(StrEnum):
     # list products SkuBase does not know about - they cannot be normalized safely
     # and would escape the destination ownership guard.
     UNREGISTERED_PARENT = "unregistered_parent"
+    # Every variant SKU on this product has been reassigned (merged) onto another parent.
+    # Distinct from UNREGISTERED_PARENT: SkuBase knows these SKUs perfectly well, they
+    # have simply stopped describing this product. Resolving them would key the product's
+    # state row under a DIFFERENT garment's parent, which is how three rows came to hold
+    # the wrong source_product_gid. See internal_platform_products.load_reassigned.
+    REASSIGNED_SKU = "reassigned_sku"
 
 
 class InternalPlatform(Model):

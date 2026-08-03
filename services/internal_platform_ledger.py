@@ -413,7 +413,9 @@ async def mark_pending_delist(state: InternalPlatformState, cause: str) -> None:
     when someone presses Delist, so this status is the reviewable step in between.
     """
     state.current_status = "pending_delisting"
-    state.skip_reason = cause[:50] if cause else None
+    # [:40], not [:50]. The column is varchar(40); a longer cause raised on write rather
+    # than truncating. Latent until now only because every existing cause is a short code.
+    state.skip_reason = cause[:40] if cause else None
     await state.save(update_fields=["current_status", "skip_reason", "updated_at"])
 
 
@@ -423,13 +425,26 @@ async def mark_delisted(state: InternalPlatformState) -> None:
     dest_product_gid is cleared: the destination product no longer exists, and leaving a
     dangling GID would make footprint() keep counting it and would give a later delist
     something to try to delete twice.
+
+    listed_at is cleared for the same reason, and it is not optional. "Awaiting Syncio" is
+    defined purely as `listed_at IS NOT NULL AND dest_product_gid IS NULL` - it never looks
+    at current_status - so clearing only the GID leaves the row in a state indistinguishable
+    from a product still waiting on delivery. Every successful delist then reappeared as an
+    awaiting-Syncio row, and since listed_at was weeks old it cleared the four-day staleness
+    cutoff instantly rather than aging into it: on 2026-08-03 one delist run put 155 products
+    into "waiting over 4 days" the moment it finished deleting them. The row is no longer
+    tagged on the source, so the timestamp saying it is has to go with the GID.
+
+    delisted_at carries the history that listed_at used to imply.
     """
     state.current_status = "delisted"
     state.dest_product_gid = None
+    state.listed_at = None
     state.delisted_at = _now()
     state.delist_strikes = 0
     await state.save(update_fields=[
-        "current_status", "dest_product_gid", "delisted_at", "delist_strikes", "updated_at",
+        "current_status", "dest_product_gid", "listed_at", "delisted_at",
+        "delist_strikes", "updated_at",
     ])
 
 
@@ -683,6 +698,100 @@ async def refresh_product_facts(
             "  variants           = EXCLUDED.variants, "
             "  updated_at         = CURRENT_TIMESTAMP",
             params,
+        )
+        written += len(chunk)
+    return written
+
+
+async def flag_reassigned(platform_id: str, items: Mapping[str, str],
+                          queue: bool = False) -> int:
+    """Mark orphaned rows as reassigned_sku, and optionally queue them for delisting.
+
+    `items` is parent_sku -> human detail, e.g. "RHD-MOTW-0040/L -> RHD-MOTW-0038/L".
+
+    FLAGGING and QUEUEING are separate on purpose, and the default is flag-only. Marking a
+    row costs nothing and is reversible; moving it to pending_delisting puts it in the queue
+    the Delist button drains, and execute_deletes is TRUE in production. So the pipeline can
+    run for as long as it takes to build confidence with `queue=False`, identifying every
+    affected row without any of them becoming deletable.
+
+    `queue=False` deliberately leaves current_status ALONE. A row that is `listed` stays
+    `listed` - it describes where the product is, and this function has no basis to change
+    that. Only the skip_reason and the detail are written.
+
+    Separate from apply_scan_statuses because this writes last_error and must NOT touch
+    variant_count - these rows have no scanned product to take a count from, and passing a
+    stale one back would overwrite a real value with a guess.
+
+    Deliberately an UPDATE, never an upsert. Every target already exists; an INSERT path
+    could conjure a pending_delisting row for a parent that has no state at all.
+    """
+    if not items:
+        return 0
+    conn = connections.get("default")
+    written = 0
+    rows = list(items.items())
+    status_set = "  current_status = 'pending_delisting', " if queue else ""
+    for i in range(0, len(rows), 200):
+        chunk = rows[i:i + 200]
+        values, params = [], []
+        for n, (parent_sku, detail) in enumerate(chunk):
+            base = n * 2
+            values.append(f"(${base + 3}::text, ${base + 4}::text)")
+            params.extend([parent_sku, (detail or "")[:2000]])
+        await conn.execute_query(
+            "UPDATE internal_platform_state AS s SET "
+            + status_set +
+            "  skip_reason    = $2, "
+            "  last_error     = v.detail, "
+            "  updated_at     = CURRENT_TIMESTAMP "
+            f"FROM (VALUES {', '.join(values)}) AS v(parent_sku, detail) "
+            "WHERE s.internal_platform_id = $1 AND s.parent_sku = v.parent_sku",
+            [platform_id, InternalPlatformSkipReason.REASSIGNED_SKU.value, *params],
+        )
+        written += len(chunk)
+    return written
+
+
+async def reconcile_stock(platform_id: str,
+                          rows: Mapping[str, tuple[int, list[dict]]]) -> int:
+    """Correct stored stock against what a COMPLETE scan just saw on Shopify.
+
+    `rows` is parent_sku -> (row_inventory, variants), already diffed by the caller so only
+    genuine changes arrive.
+
+    This is the ONLY writer that may act on a SKU's absence from Shopify, and it is
+    deliberately narrow: stock columns only. It must never touch current_status,
+    skip_reason or dest_product_gid. A row whose product vanished is a row with no stock,
+    which is a fact; whether it should be delisted is a judgement, and keeping the two
+    apart is what stops a truncated scan cascading into the delete queue.
+
+    Why this exists at all: the scan writes by RESOLVED parent, so once a merge repoints a
+    SKU the old row stops being a possible write target and freezes. Measured 2026-08-03,
+    every one of the 9 units the state table claimed on reassigned SKUs was a frozen
+    merge-day figure; live Shopify held 0 for all of them.
+    """
+    if not rows:
+        return 0
+    conn = connections.get("default")
+    written = 0
+    items = list(rows.items())
+    for i in range(0, len(items), 200):
+        chunk = items[i:i + 200]
+        values, params = [], []
+        for n, (parent_sku, (inventory, variants)) in enumerate(chunk):
+            base = n * 3
+            values.append(
+                f"(${base + 2}::text, ${base + 3}::int, ${base + 4}::jsonb)")
+            params.extend([parent_sku, inventory, json.dumps(variants)])
+        await conn.execute_query(
+            "UPDATE internal_platform_state AS s SET "
+            "  inventory  = v.inventory, "
+            "  variants   = v.variants, "
+            "  updated_at = CURRENT_TIMESTAMP "
+            f"FROM (VALUES {', '.join(values)}) AS v(parent_sku, inventory, variants) "
+            "WHERE s.internal_platform_id = $1 AND s.parent_sku = v.parent_sku",
+            [platform_id, *params],
         )
         written += len(chunk)
     return written
