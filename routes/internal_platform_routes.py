@@ -29,6 +29,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 from tortoise import connections
+from tortoise.expressions import Q
 
 from models.api_models import (
     InternalPlatformActivityResponse,
@@ -401,8 +402,18 @@ async def get_products(
         # Hidden unless explicitly asked for by ?skip_reason=reassigned_sku, which stays
         # available so the rows can still be inspected without being on the dashboard. See
         # the matching exclusion in get_overview's skip_reason_counts.
+        #
+        # NOT .exclude(skip_reason=...), which is a three-valued-logic trap. Tortoise
+        # compiles it to `NOT skip_reason = 'reassigned_sku'`, and for a NULL skip_reason
+        # that is NULL rather than TRUE, so the row fails the WHERE and vanishes. Only
+        # `skipped` rows carry a skip_reason, so this silently emptied the Products tab for
+        # every other status: 1,560 listed and 2 pending_normalization rows were dropped
+        # while the Overview - which counts them in raw SQL - kept reporting them. The tab
+        # looked like it had lost the products rather than like it had a filter bug.
         if skip_reason != HIDDEN_SKIP_REASON:
-            qs = qs.exclude(skip_reason=HIDDEN_SKIP_REASON)
+            qs = qs.filter(
+                Q(skip_reason__isnull=True) | ~Q(skip_reason=HIDDEN_SKIP_REASON)
+            )
         if exclude_skipped:
             qs = qs.exclude(current_status="skipped")
         # `pending_normalization` spans two stages that look nothing alike to an
