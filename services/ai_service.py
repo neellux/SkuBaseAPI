@@ -20,16 +20,40 @@ os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "service-account.json"
 logger = logging.getLogger(__name__)
 
 
+# OpenAI rejects an unrecognised reasoning_effort with a 400, and the aspects
+# call below turns any exception into an empty result, so a typo in config would
+# silently blank ai_response on every new listing rather than fail loudly. The
+# set is the union across the gpt-5.x models: individual models reject some of
+# these (gpt-5.6-luna has no "minimal"), which surfaces as an ordinary API error.
+VALID_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
+DEFAULT_REASONING_EFFORT = "low"
+
+
+def _reasoning_effort(value: Any) -> str:
+    if not value:
+        return DEFAULT_REASONING_EFFORT
+    if value not in VALID_REASONING_EFFORTS:
+        logger.error(
+            f"Invalid aspects_reasoning_effort {value!r} in config; "
+            f"falling back to {DEFAULT_REASONING_EFFORT!r}. "
+            f"Valid values: {sorted(VALID_REASONING_EFFORTS)}"
+        )
+        return DEFAULT_REASONING_EFFORT
+    return value
+
+
 try:
     AI_CONFIG = config.get("ai", {})
     ASPECTS_MODEL = AI_CONFIG.get("aspects_model")
     ASPECTS_API_KEY = AI_CONFIG.get("aspects_api_key")
+    ASPECTS_REASONING_EFFORT = _reasoning_effort(AI_CONFIG.get("aspects_reasoning_effort"))
     CAPTION_MODEL = AI_CONFIG.get("caption_model")
     CAPTION_API_KEY = AI_CONFIG.get("caption_api_key")
 except Exception as e:
     logger.error(f"Error loading config.toml: {e}")
     ASPECTS_MODEL = None
     ASPECTS_API_KEY = None
+    ASPECTS_REASONING_EFFORT = DEFAULT_REASONING_EFFORT
     CAPTION_MODEL = None
     CAPTION_API_KEY = None
 
@@ -411,7 +435,10 @@ class AIService:
         ]
 
         try:
-            logger.info(f"Calling Aspects AI model {ASPECTS_MODEL} for product {product_name}")
+            logger.info(
+                f"Calling Aspects AI model {ASPECTS_MODEL} "
+                f"(reasoning_effort={ASPECTS_REASONING_EFFORT}) for product {product_name}"
+            )
 
             if ASPECTS_MODEL and ASPECTS_MODEL.startswith("vertex"):
                 direct_image_urls = None
@@ -440,11 +467,14 @@ class AIService:
                     max_output_tokens=8192,
                 )
             else:
+                # No temperature: the gpt-5.x reasoning models accept only the
+                # default of 1 and 400 on anything else, so this call is not
+                # reproducible run to run even at a fixed effort.
                 response = await litellm.acompletion(
                     model=ASPECTS_MODEL,
                     messages=messages,
                     api_key=ASPECTS_API_KEY,
-                    reasoning_effort="low",
+                    reasoning_effort=ASPECTS_REASONING_EFFORT,
                 )
 
                 ai_response_content = response.choices[0].message.content
