@@ -18,14 +18,12 @@ Scheduled with APScheduler at a fixed wall-clock time, mirroring
 """
 
 import asyncio
-import io
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
-import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from tortoise import connections
@@ -33,41 +31,14 @@ from tortoise import connections
 from config import config
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
+from utils.sellercloud_image_import import add_default_image_row, build_image_import_tsv
 
 logger = logging.getLogger(__name__)
-
-# image_upload_format column order — must match SellerCloud's image import schema
-# (see PhotoManagementNew/API/utils/sellercloud.py:update_images_new).
-_IMPORT_COLUMNS = [
-    "ProductID", "ImageID", "ImageURL", "IsDefault", "IsMainDescriptionImage",
-    "IsSupplementImage", "SupplementImageOrder", "IsOtherImage", "IsSwatchImage",
-    "Caption", "ImageSource", "IsWarehouseImage", "_ACTION_",
-]
 
 
 def _build_image_import_tsv(rows: List[Tuple[str, str]]) -> bytes:
     """rows: list of (child_sku, image_url). Returns the tab-separated import file bytes."""
-    records = []
-    for sku, url in rows:
-        records.append({
-            "ProductID": sku,
-            "ImageID": None,
-            "ImageURL": url,
-            "IsDefault": True,
-            "IsMainDescriptionImage": True,
-            "IsSupplementImage": False,
-            "SupplementImageOrder": None,
-            "IsOtherImage": None,
-            "IsSwatchImage": None,
-            "Caption": None,
-            "ImageSource": None,
-            "IsWarehouseImage": None,
-            "_ACTION_": None,
-        })
-    df = pd.DataFrame(records, columns=_IMPORT_COLUMNS)
-    buf = io.StringIO()
-    df.to_csv(buf, index=False, sep="\t")
-    return buf.getvalue().encode("utf-8")
+    return build_image_import_tsv([add_default_image_row(sku, url) for sku, url in rows])
 
 
 class DailyImageImportPoller:

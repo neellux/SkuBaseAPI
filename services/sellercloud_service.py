@@ -669,6 +669,56 @@ class SellerCloudService:
         """Fetch a queued job's details (Basic.CompletedOn, TotalRecords, TotalProcessed)."""
         return await self.get(f"/QueuedJobs/{job_id}")
 
+    async def is_job_complete(self, job_id: str) -> bool:
+        """Whether a queued job finished. Raises only when SellerCloud says it failed.
+
+        Every other outcome, including a transport error or SellerCloud answering 500
+        with "Could not find or load record with ID <id>!" for a job it has queued but
+        not yet materialized, is reported as "not done yet" so the caller polls again.
+        A raise here would be latched into the job row's error and the row would then
+        be skipped forever, which is the trap PhotoManagementNew documents on its own
+        get_sellercloud_job_status.
+        """
+        try:
+            basic = (await self.get_job_status(job_id)).get("Basic") or {}
+        except Exception as e:
+            logger.debug(f"Job {job_id} status poll failed, treating as pending: {e}")
+            return False
+
+        status = basic.get("Status")
+        if status == 3:
+            return True
+        if status in (4, 5):
+            raise RuntimeError(
+                f"SellerCloud job {job_id} failed: {basic.get('ErrorMessage') or status}"
+            )
+        return False
+
+    async def create_image_export(self, product_ids: List[str]) -> str:
+        """Queue a StandardExportKind 11 export (one row per existing product image).
+
+        The output file lists each product's ImageID and ImageURL, which is the only way
+        to build the DELETE rows an image import needs.
+        """
+        data = await self.post(
+            "/Catalog/Exports/Basic",
+            data={"StandardExportKind": 11, "ProductIds": product_ids},
+        )
+        link = data.get("QueuedJobLink", "") or ""
+        if "id=" not in link:
+            raise RuntimeError(f"Catalog/Exports/Basic returned no job link: {data}")
+        return link.split("id=")[1].split("&")[0]
+
+    async def get_job_output_file(self, job_id: str) -> bytes:
+        """A finished job's output file. SellerCloud base64-encodes it, but not always."""
+        response = await self._make_request(
+            "GET", "/QueuedJobs/OutputFile", params={"id": job_id}
+        )
+        try:
+            return base64.b64decode(response.content, validate=True)
+        except Exception:
+            return response.content
+
     async def update_product_upc(self, product_id: str, upc: str) -> Dict[str, Any]:
         response = await self.put(
             "/Catalog/BasicInfo",

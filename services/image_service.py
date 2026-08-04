@@ -10,9 +10,10 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from gcloud.aio.storage import Storage
-from tortoise import Tortoise
+from tortoise import Tortoise, connections
 
 from config import config
+from services import gallery_image_sync_queue
 from utils.image_processor import (
     load_resolutions_config,
     load_washtag_resolutions_config,
@@ -362,7 +363,7 @@ class ImageService:
                                 entry["shot_type"] = shot_types[idx_key]
 
                     # GCS operations — still holding the session advisory lock on raw_conn.
-                    await self._sync_gcs(
+                    top_shot_resource = await self._sync_gcs(
                         product_id=product_id,
                         current_data=current_data,
                         new_data=reordered_data,
@@ -392,6 +393,15 @@ class ImageService:
                         *params,
                     )
 
+                    if image_type == "image":
+                        await self._queue_sellercloud_sync(
+                            product_id=product_id,
+                            record_id=record_id,
+                            before=current_data[0] if current_data else None,
+                            after=reordered_data[0] if reordered_data else None,
+                            top_shot_resource=top_shot_resource,
+                        )
+
                     return {"success": True, "image_count": len(reordered_data)}
                 finally:
                     # Always release the session advisory lock before returning the
@@ -406,6 +416,73 @@ class ImageService:
             error_msg = f"Error saving product images: {str(e)}\n{traceback.format_exc()}"
             logger.error(error_msg)
             return {"success": False, "error": str(e), "status_code": 500}
+
+    # ── SellerCloud hand-off ───────────────────────────────────────────
+
+    async def _queue_sellercloud_sync(
+        self,
+        product_id: str,
+        record_id,
+        before: Optional[Dict],
+        after: Optional[Dict],
+        top_shot_resource: Optional[Dict],
+    ) -> None:
+        """Queue a SellerCloud push when this save changed the product's slot 1.
+
+        SellerCloud does not read our GCS URL, it copies the bytes once, so an edited
+        top shot only reaches the listing if something pushes it. The push is an export
+        job plus an import job, minutes of waiting, so all that happens here is one row;
+        GalleryImageSyncPoller does the rest.
+
+        Never raises. The images are already written and the operator's save has already
+        succeeded, so a queue problem is a logged warning, not a failed save.
+        """
+        try:
+            identity = lambda entry: (
+                (entry.get("id"), entry.get("md5_hash")) if entry else None
+            )
+            if identity(before) == identity(after):
+                return
+
+            if after is None:
+                action = "delete_all"
+                top_shot_md5 = None
+                generation = None
+            else:
+                action = "replace"
+                top_shot_md5 = after.get("md5_hash")
+                generation = (top_shot_resource or {}).get("generation")
+
+            child_rows = await connections.get("product_db").execute_query_dict(
+                "SELECT sku FROM child_products "
+                "WHERE parent_sku = $1 AND is_active = TRUE ORDER BY sku",
+                [product_id],
+            )
+            child_skus = [r["sku"] for r in child_rows]
+            if not child_skus:
+                logger.info(
+                    f"Slot 1 changed for {product_id} but it has no active children, "
+                    f"nothing to push to SellerCloud"
+                )
+                return
+
+            job_id = await gallery_image_sync_queue.enqueue(
+                product_id=product_id,
+                child_skus=child_skus,
+                action=action,
+                productimages_id=str(record_id),
+                top_shot_md5=top_shot_md5,
+                gcs_generation=str(generation) if generation else None,
+            )
+            logger.info(
+                f"Queued SellerCloud image sync {job_id} for {product_id} "
+                f"({action}, {len(child_skus)} children, generation={generation})"
+            )
+        except Exception:
+            logger.warning(
+                f"Failed to queue SellerCloud image sync for {product_id}; "
+                f"images were saved:\n{traceback.format_exc()}"
+            )
 
     # ── Shot Type Queries ──────────────────────────────────────────────
 
@@ -449,13 +526,24 @@ class ImageService:
         new_order: List,
         image_type: str,
         resolutions: List[Dict],
-    ):
+    ) -> Optional[Dict]:
+        """Apply the save to GCS and return slot 1's object resource, if this save wrote it.
+
+        The resource carries `generation`, which the SellerCloud push uses as its
+        cache-buster: GCS serves these blobs immutable for a year, so an unversioned URL
+        hands SellerCloud whatever a cache still holds. Reading it from the write that
+        produced it, rather than a HEAD afterwards, means a later edit cannot slip in
+        between and make us publish a version we never wrote. None when slot 1 was left
+        untouched, deleted, or when the write failed.
+        """
         if isinstance(current_data, str):
             current_data = json.loads(current_data)
 
         current_count = len(current_data)
         resolution_names = [r["name"] for r in resolutions]
         deleted_set = set(deleted_indices)
+        top_shot_blob = f"{product_id}/1_1500.jpg" if image_type == "image" else None
+        top_shot_resource: Optional[Dict] = None
 
         # 1. Delete removed images from GCS
         if deleted_indices:
@@ -505,17 +593,27 @@ class ImageService:
 
             # Copy from temp to final positions
             copy_to_final_tasks = []
+            copy_to_final_targets = []
             for old_idx, new_idx_val in old_to_new.items():
                 if image_type == "image":
                     for res_name in resolution_names:
                         tmp = f"{product_id}/{temp_prefix}_{old_idx}_{res_name}.jpg"
                         final = f"{product_id}/{new_idx_val}_{res_name}.jpg"
                         copy_to_final_tasks.append(self._copy_blob(tmp, final))
+                        copy_to_final_targets.append(final)
                 else:
                     tmp = f"{product_id}/{temp_prefix}_washtag_{old_idx}.jpg"
                     final = f"{product_id}/washtag_{new_idx_val}.jpg"
                     copy_to_final_tasks.append(self._copy_blob(tmp, final))
-            await asyncio.gather(*copy_to_final_tasks, return_exceptions=True)
+                    copy_to_final_targets.append(final)
+            copy_results = await asyncio.gather(
+                *copy_to_final_tasks, return_exceptions=True
+            )
+            # A reorder that promotes an existing photo into slot 1 writes the blob by
+            # copy, so the new generation comes from here rather than from an upload.
+            for target, result in zip(copy_to_final_targets, copy_results):
+                if target == top_shot_blob and isinstance(result, dict):
+                    top_shot_resource = result
 
             # Delete temp files
             delete_temp_tasks = []
@@ -539,6 +637,7 @@ class ImageService:
                 )
 
             upload_tasks = []
+            upload_targets = []
             for res_name, img_data, extension, storage_class in processed:
                 if image_type == "image":
                     blob_path = f"{product_id}/{file_index}_{res_name}.{extension}"
@@ -555,7 +654,11 @@ class ImageService:
                 upload_tasks.append(
                     self._upload_blob(blob_path, img_data, content_type, storage_class)
                 )
-            await asyncio.gather(*upload_tasks)
+                upload_targets.append(blob_path)
+            upload_results = await asyncio.gather(*upload_tasks)
+            for target, result in zip(upload_targets, upload_results):
+                if target == top_shot_blob and isinstance(result, dict):
+                    top_shot_resource = result
 
         # 4. Clean up: delete GCS files beyond the new count
         new_count = len(new_data)
@@ -571,14 +674,25 @@ class ImageService:
                     cleanup_tasks.append(self._delete_blob(blob_path))
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
-    async def _copy_blob(self, src_path: str, dest_path: str):
+        return top_shot_resource
+
+    async def _copy_blob(self, src_path: str, dest_path: str) -> Optional[Dict]:
+        """Returns the destination's object resource, or None if the copy failed.
+
+        gcloud-aio copies through rewriteTo, whose response wraps the new object under
+        "resource" rather than being the object itself.
+        """
         try:
-            await self._storage.copy(
+            result = await self._storage.copy(
                 GCS_BUCKET, src_path,
                 GCS_BUCKET, new_name=dest_path,
             )
         except Exception as e:
             logger.warning(f"Failed to copy {src_path} -> {dest_path}: {e}")
+            return None
+        if isinstance(result, dict):
+            return result.get("resource") or result
+        return None
 
     async def _delete_blob(self, blob_path: str):
         try:
@@ -589,10 +703,11 @@ class ImageService:
     async def _upload_blob(
         self, blob_path: str, img_data: io.BytesIO, content_type: str,
         storage_class: str = "STANDARD",
-    ):
+    ) -> Optional[Dict]:
+        """Returns the uploaded object's resource, which carries generation and md5Hash."""
         try:
             image_bytes = img_data.getvalue()
-            await self._storage.upload(
+            result = await self._storage.upload(
                 GCS_BUCKET,
                 blob_path,
                 image_bytes,
@@ -604,6 +719,7 @@ class ImageService:
                 },
             )
             logger.info(f"Uploaded: {blob_path}")
+            return result if isinstance(result, dict) else None
         finally:
             img_data.close()
 

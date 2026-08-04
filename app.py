@@ -32,6 +32,7 @@ from services.photo_upload_poller import photo_upload_poller
 from services.secondary_inventory_transfer_poller import secondary_inventory_transfer_poller
 from services.daily_image_import_poller import daily_image_import_poller
 from services.sellercloud_sync_poller import sellercloud_sync_poller
+from services.gallery_image_sync_poller import gallery_image_sync_poller
 from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.spo_poller import spo_poller
 from services.grailed_poller import grailed_poller
@@ -142,6 +143,7 @@ async def startup_event():
     await spo_poller.start()
     await grailed_poller.start()
     await sellercloud_sync_poller.start()
+    await gallery_image_sync_poller.start()
     await alias_bulk_import_poller.start()
     await photo_upload_poller.start()
     await secondary_inventory_transfer_poller.start()
@@ -164,6 +166,7 @@ async def shutdown_event():
     await secondary_inventory_transfer_poller.stop()
     await photo_upload_poller.stop()
     await alias_bulk_import_poller.stop()
+    await gallery_image_sync_poller.stop()
     await sellercloud_sync_poller.stop()
     await grailed_poller.stop()
     await spo_poller.stop()
