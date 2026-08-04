@@ -23,7 +23,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Mapping
 
 from config import config
 from models.db_models import (
@@ -33,6 +33,10 @@ from models.db_models import (
 )
 from services import internal_platform_ledger as ledger
 from services.base_poller import BasePoller
+from services.internal_platform_products import (
+    load_reassigned,
+    resolve_registered_parents,
+)
 from services.internal_platform_type_map import (
     TypeTaxonomy,
     check_taxonomy_health,
@@ -200,12 +204,17 @@ class InternalPlatformDestPoller(BasePoller):
         )
 
         # ---- plan (no writes) --------------------------------------------
+        #
+        # Buffered rather than planned inside the loop, because ownership now needs a
+        # products-DB lookup and one query for the whole page set beats one per product.
+        # Same shape the source poller uses.
         try:
+            scanned_products = []
             async for product in admin.products_by_tag(
                 platform.trigger_tag, updated_after=watermark, page_size=self.page_size
             ):
                 report.scanned += 1
-                self._plan_product(platform, product, state_map, taxonomy, report)
+                scanned_products.append(product)
         except ShopifyScopeError as exc:
             # Latch: without this the first enabled pass emits one identical failure
             # per product instead of a single actionable line.
@@ -218,6 +227,37 @@ class InternalPlatformDestPoller(BasePoller):
             logger.warning("%s: transient failure mid-scan, aborting cycle: %s", self.name, exc)
             report.aborted = "transient"
             return report
+
+        # Ownership is catalog membership, resolved from the products DB exactly as the
+        # source poller resolves it. Loaded once for the whole scan.
+        all_skus = {s for p in scanned_products for s in p.variant_skus if s}
+        registered = await resolve_registered_parents(all_skus)
+
+        # Fail-closed, and for a sharper reason than the source poller's: an unreadable
+        # matview read as "nothing is reassigned" would let a merged SKU resolve to its
+        # NEW parent and relink a live destination product onto a different garment.
+        try:
+            reassigned = await load_reassigned(all_skus)
+        except Exception as exc:                                     # noqa: BLE001
+            logger.error("%s: could not read secondary_skus, aborting before any write: %s",
+                         self.name, exc)
+            report.aborted = "reassigned-read-failed"
+            return report
+
+        # Resolving nothing from a non-empty scan means the catalog lookup is broken, not
+        # that we suddenly own nothing. Every product would fall out as "not ours" and the
+        # cycle would correct nothing while reporting success - the same silent-no-op shape
+        # check_taxonomy_health exists to catch, so it aborts the same way.
+        if scanned_products and not registered:
+            logger.error("%s: %d products scanned but ZERO SKUs resolved to a registered "
+                         "parent; aborting rather than treating the catalog as empty",
+                         self.name, len(scanned_products))
+            report.aborted = "no-registered-parents"
+            return report
+
+        for product in scanned_products:
+            self._plan_product(platform, product, state_map, taxonomy,
+                               registered, reassigned, report)
 
         # An incomplete scan is indistinguishable from "everything changed", so caps are
         # evaluated on the FULL planned set before the first write.
@@ -277,10 +317,12 @@ class InternalPlatformDestPoller(BasePoller):
 
     def _plan_product(self, platform: Any, product: Product,
                       state_map: dict[str, Any], taxonomy: TypeTaxonomy,
+                      registered: Mapping[str, str], reassigned: Mapping[str, str],
                       report: CycleReport) -> None:
         own = assess_ownership(
             product.variant_skus, product.tags,
             platform.trigger_tag, product.syncio_source_gid,
+            registered, reassigned,
         )
         if not own.ours:
             report.not_ours += 1

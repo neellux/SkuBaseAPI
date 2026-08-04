@@ -112,22 +112,14 @@ def normalize_title(title: str | None) -> str | None:
     return title.strip().upper()
 
 
-def derive_parent_sku(variant_sku: str | None) -> str | None:
-    """Parent SKU from a variant SKU shaped PARENT/SIZE.
-
-    Returns None for anything not matching that shape, which is the primary guard
-    against touching STS-native products - their SKUs look like `i175851` with no
-    slash, whereas ours look like `RHD-MACC-0033/OS`.
-    """
-    if not variant_sku:
-        return None
-    sku = variant_sku.strip()
-    if "/" not in sku:
-        return None
-    parent, _, size = sku.rpartition("/")
-    if not parent or not size:
-        return None
-    return parent
+# derive_parent_sku() lived here: parent = everything before the last "/" in a variant
+# SKU. It is gone on purpose. Parent resolution belongs to the products DB
+# (child_products.sku -> parent_sku, via services/product_resolver.py), which both
+# pollers now use. The string form was only ever a proxy: it rejected the 1,893
+# registered child SKUs that carry no size suffix, and it could not see a merge, so it
+# reported the pre-merge parent as though nothing had happened. Do not reintroduce it -
+# see the note in the source poller, "String-splitting is deliberately not a resolution
+# path - it would invent unregistered parents."
 
 
 def is_sts_native_sku(variant_sku: str | None) -> bool:

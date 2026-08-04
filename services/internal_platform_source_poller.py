@@ -604,9 +604,11 @@ class InternalPlatformSourcePoller:
             )
             pricing = compute_price(product.variant_prices, product.variant_compare_at,
                                     DEFAULT_PRICING, product.variant_inventory)
-            # Size comes from the variant SKU's PARENT/SIZE shape, which is the same
-            # convention derive_parent_sku relies on. Falls back to the raw SKU so a
-            # non-conforming variant still identifies itself rather than showing blank.
+            # Size comes from the trailing segment of a PARENT/SIZE variant SKU. This is
+            # display only - it labels the size rail on the Products tab and nothing keys
+            # off it. Parent RESOLUTION deliberately does not work this way; it goes
+            # through the products DB below. Falls back to None so a non-conforming
+            # variant shows no size rather than a wrong one.
             variant_rows = tuple(
                 {
                     "sku": v.sku,
@@ -1082,7 +1084,7 @@ class InternalPlatformSourcePoller:
                     report.deleted += 1
                     continue
 
-                if not self._delete_guards_pass(platform, dest_product, state):
+                if not await self._delete_guards_pass(platform, dest_product, state):
                     # The ONE case that must not be marked delisted: a destination
                     # product that still exists but no longer looks like ours. The source
                     # is untagged, so this is a genuine orphan and needs a human. A FAILED
@@ -1134,11 +1136,36 @@ class InternalPlatformSourcePoller:
             finally:
                 await ledger.release(state)
 
-    def _delete_guards_pass(self, platform: Any, product: Product, state: Any) -> bool:
-        """All must hold. Nine checks for one irreversible action is proportionate."""
+    async def _delete_guards_pass(self, platform: Any, product: Product,
+                                  state: Any) -> bool:
+        """All must hold. Nine checks for one irreversible action is proportionate.
+
+        Async now: ownership resolves the parent through the products DB rather than by
+        splitting the SKU string. Resolved per product rather than per cycle because the
+        destination product is only fetched inside the delist loop - two small queries
+        against a path that already makes several Shopify round trips per delete, and
+        deletes are a daily batch rather than a hot loop.
+        """
+        from services.internal_platform_products import (
+            load_reassigned,
+            resolve_registered_parents,
+        )
         from services.internal_platform_rules import assess_ownership
+
+        skus = {s for s in product.variant_skus if s}
+        try:
+            registered = await resolve_registered_parents(skus)
+            reassigned = await load_reassigned(skus)
+        except Exception as exc:                                     # noqa: BLE001
+            # Fail CLOSED. This gates a delete, so an unreadable catalog must read as
+            # "cannot confirm this is ours", never as "nothing is reassigned".
+            logger.error("%s: parent resolution failed for %s, refusing delete: %s",
+                         self.name, state.parent_sku, exc)
+            return False
+
         own = assess_ownership(product.variant_skus, product.tags,
-                               platform.trigger_tag, product.syncio_source_gid)
+                               platform.trigger_tag, product.syncio_source_gid,
+                               registered, reassigned)
         # The destination product should still look like ours, and its Syncio pairing
         # must still point where the ledger says it does.
         if product.syncio_source_gid != state.source_product_gid:

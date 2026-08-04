@@ -18,12 +18,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Sequence
+from typing import TYPE_CHECKING, Final, Mapping, Sequence
 
 from models.db_models import InternalPlatformSkipReason
 from services.internal_platform_taxonomy import (
     OWNED_TAG_PREFIXES,
-    derive_parent_sku,
     is_sts_native_sku,
     normalize_vendor,
 )
@@ -221,15 +220,37 @@ def assess_ownership(
     tags: Sequence[str],
     trigger_tag: str,
     syncio_source_gid: str | None,
+    registered: Mapping[str, str],
+    reassigned: Mapping[str, str],
 ) -> OwnershipVerdict:
     """Is this destination product one of ours?
 
     Shopify-derived, deliberately not ledger-derived. A ledger-based definition has a
     permanent-orphan failure mode: crash between the Shopify write and the DB write
-    and that product is never touched again, including never delisted.
+    and that product is never touched again, including never delisted. `registered` is
+    the product CATALOG (child_products), not the ledger, so it does not reintroduce
+    that failure mode - and it is the same resolution the source poller has always
+    used. Callers load it once per cycle and pass it in; this module stays DB-free.
 
-    All four conditions must hold. Any STS-native SKU anywhere in the product is an
-    immediate rejection, not a majority vote.
+    Ownership is catalog membership. A SKU that resolves to a registered parent is ours;
+    one that does not is not. That replaces the old PARENT/SIZE string test, which was
+    never a definition of ownership - only a proxy for one. The proxy rejected 1,893 of
+    167,801 registered child SKUs that legitimately carry no size suffix, and on the live
+    STS set it stranded 11 delivered products that could never be linked, normalized or
+    safely delisted. See the twin note in the source poller: "String-splitting is
+    deliberately not a resolution path - it would invent unregistered parents."
+
+    Reassigned SKUs are rejected outright. A merge repoints child_products.parent_sku at
+    the new parent while the SKU STRING keeps its original shape, so the catalog answers
+    "which parent" with a value the 1nventory product is not - and internal_platform_state
+    is keyed on the old one. Resolving them would silently relink live destination
+    products to a different garment. Skipping matches what the source poller already does.
+
+    Any STS-native SKU anywhere in the product is an immediate rejection, not a majority
+    vote. That check is now belt-and-braces rather than the primary guard: STS-native SKUs
+    are not in child_products at all (verified in prod: zero SKUs match the `i175851`
+    shape), so they would fail resolution regardless. It is kept because it names the
+    reason precisely in the skip report.
     """
     if not any(t.upper() == trigger_tag.upper() for t in tags):
         return OwnershipVerdict(False, None, f"missing trigger tag {trigger_tag}")
@@ -237,10 +258,18 @@ def assess_ownership(
     if any(is_sts_native_sku(s) for s in variant_skus):
         return OwnershipVerdict(False, None, "carries an STS-native SKU")
 
-    parents = {derive_parent_sku(s) for s in variant_skus}
+    merged = sorted({s for s in variant_skus if s and s in reassigned})
+    if merged:
+        return OwnershipVerdict(
+            False, None, f"carries reassigned SKU(s): {merged}"
+        )
+
+    parents = {registered.get(s) for s in variant_skus if s}
     parents.discard(None)
     if not parents:
-        return OwnershipVerdict(False, None, "no variant SKU has the PARENT/SIZE shape")
+        return OwnershipVerdict(
+            False, None, "no variant SKU resolves to a registered parent"
+        )
     if len(parents) > 1:
         return OwnershipVerdict(
             False, None, f"variants resolve to multiple parents: {sorted(parents)}"
