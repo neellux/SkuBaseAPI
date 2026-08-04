@@ -25,6 +25,14 @@ logger = logging.getLogger(__name__)
 GCS_BUCKET = config.get("gcs_bucket_products", "lux_products")
 GCS_BASE_URL = f"https://storage.googleapis.com/{GCS_BUCKET}"
 SERVICE_ACCOUNT_FILE = config.get("gcs_service_account", "service-account-2.json")
+
+# These URLs are stable but their bytes are not: a re-shoot or a gallery edit replaces
+# the object in place. "no-cache" does not mean "do not cache", it means "cache it, then
+# revalidate before each use", so a browser keeps the bytes and spends one conditional
+# request per view, getting a 304 with no body while the image is unchanged. The previous
+# "max-age=31536000, immutable" promised the opposite and was why an edited image kept
+# showing the old photo for a year, in the UI and on every platform that fetched the URL.
+GCS_CACHE_CONTROL = "public, no-cache"
 MAX_PRODUCT_IMAGES = 8
 MAX_WASHTAG_IMAGES = 3
 MAX_CONCURRENT_RESIZE = 3
@@ -713,7 +721,7 @@ class ImageService:
                 image_bytes,
                 content_type=content_type,
                 metadata={
-                    "cache-control": "public, max-age=31536000, immutable",
+                    "cache-control": GCS_CACHE_CONTROL,
                     "content-disposition": "inline",
                     "storage-class": storage_class,
                 },
