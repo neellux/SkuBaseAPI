@@ -375,6 +375,10 @@ class DatabaseService:
                         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                         primary_id UUID NULL REFERENCES "{DatabaseService._table(table_name)}"(id) ON DELETE SET NULL,
                         platform_value TEXT NOT NULL,
+                        -- Structured facts about the platform value that are not its label
+                        -- (eBay: {{"category_id": "15687"}}). platform_value stays readable
+                        -- because MappingResolutionDialog renders it raw.
+                        platform_meta JSONB,
                         platform_id TEXT NOT NULL REFERENCES "{DatabaseService._table("platforms")}"(id) ON DELETE RESTRICT,
                         value TEXT,
                         primary_table_column TEXT NOT NULL,
@@ -389,6 +393,7 @@ class DatabaseService:
                         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                         sizing_scheme TEXT NOT NULL,
                         platform_value TEXT NOT NULL,
+                        platform_meta JSONB,
                         platform TEXT NOT NULL REFERENCES "{DatabaseService._table("platforms")}"(id) ON DELETE RESTRICT,
                         value TEXT NOT NULL,
                         created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),

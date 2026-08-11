@@ -32,6 +32,7 @@ from exceptions.batch_exceptions import BatchCreationError
 from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import BatchService
+from services.ebay_aspect_service import ebay_aspect_service
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
@@ -261,6 +262,15 @@ async def get_listing(listing_id: str = Query(..., description="Listing ID")):
     listing_dict = listing.model_dump()
     listing_dict = await add_user_data(
         data=listing_dict, keys=["assigned_to", "created_by"], new_keys=["name"]
+    )
+
+    # Bundled with the listing rather than left to a follow-up call: the category decides
+    # which schema to fetch, so a separate request would serialize in front of it.
+    product_type = (listing.data or {}).get("product_type")
+    listing_dict["ebay_categories"] = (
+        await ebay_aspect_service.get_categories_for_type(product_type)
+        if product_type
+        else []
     )
 
     return listing_dict
@@ -982,8 +992,28 @@ async def get_listings(
 
 
 @router.get("/schema", response_model=ListingSchemaResponse)
-async def get_listing_schema(template_id: str = Query(..., description="Template ID")):
-    schema = await ListingService.get_listing_schema(template_id)
+async def get_listing_schema(
+    template_id: str = Query(..., description="Template ID"),
+    product_type: Optional[str] = Query(
+        None,
+        description=(
+            "Listing's product type. Adds the eBay aspects set to 'On form' for the eBay "
+            "category resolved below. Omitted, the schema is the template alone."
+        ),
+    ),
+    ebay_category_id: Optional[str] = Query(
+        None,
+        description=(
+            "The listing's chosen eBay category. Optional: an id that is not among the "
+            "type's mapped categories is ignored in favour of the type's default, and so "
+            "is a missing one. Optional rather than required so the running UI does not "
+            "422 in the window between the API and UI deploys."
+        ),
+    ),
+):
+    schema = await ListingService.get_listing_schema(
+        template_id, product_type, ebay_category_id
+    )
     if not schema:
         raise HTTPException(status_code=404, detail="Template not found")
 

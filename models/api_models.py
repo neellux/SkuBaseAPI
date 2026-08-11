@@ -238,6 +238,17 @@ class UpdateListingRequest(BaseModel):
 
     assigned_to: Optional[str] = Field(None, description="User ID assigned to this listing")
     data: Optional[Dict[str, Any]] = Field(None, description="Form data")
+    # Served here so the listing page does not need a round trip of its own before it can
+    # ask for the schema. The client cannot know a type's default category without asking,
+    # and the schema request cannot be issued until it does -- which would insert a fourth
+    # serialized wave into every listing open, paid even on schema cache hits.
+    ebay_categories: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "eBay categories this listing's product type maps to, default first. "
+            "Empty when the type maps nowhere."
+        ),
+    )
     ai_response: Optional[Dict[str, Any]] = Field(None, description="AI response data")
     ai_description: Optional[str] = Field(None, description="AI generated description")
     submitted: Optional[bool] = Field(None, description="Submission status")
@@ -271,6 +282,17 @@ class ListingResponse(BaseModel):
     assigned_to: Optional[str] = Field(None, description="User ID assigned to this listing")
     assigned_to_name: Optional[str] = Field(None, description="Name of assigned user")
     data: Dict[str, Any] = Field(..., description="Form data")
+    # Served here so the listing page does not need a round trip of its own before it can
+    # ask for the schema. The client cannot know a type's default category without asking,
+    # and the schema request cannot be issued until it does -- which would insert a fourth
+    # serialized wave into every listing open, paid even on schema cache hits.
+    ebay_categories: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "eBay categories this listing's product type maps to, default first. "
+            "Empty when the type maps nowhere."
+        ),
+    )
     ai_response: Optional[Dict[str, Any]] = Field(None, description="AI response data")
     ai_description: Optional[str] = Field(None, description="AI generated description")
     original_description: Optional[str] = Field(

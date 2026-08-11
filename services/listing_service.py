@@ -1,6 +1,7 @@
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +14,7 @@ from models.api_models import (
     UpdateListingRequest,
 )
 from models.db_models import AppSettings, Listing, Template
+from services.ebay_aspect_service import ebay_aspect_service
 from services.ai_service import AIService
 from services.listing_options_service import listing_options_service
 from services.product_service import format_mpn
@@ -22,6 +24,23 @@ from services.template_service import TemplateService
 from tortoise import connections
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AiAspectField:
+    """An eBay aspect presented to the AI prompt builder.
+
+    Duck-types the handful of attributes AIService reads off a template field
+    (`.name`, `.type`, `.options`, `.multiselect`, `.ai_tagging`) without pretending to be
+    one. A FieldDefinition cannot represent an eBay aspect: its `name` validator requires a
+    Python identifier and most aspect names contain spaces.
+    """
+
+    name: str
+    type: str
+    options: Optional[List[Any]] = None
+    multiselect: bool = False
+    ai_tagging: bool = True
 
 
 class ListingService:
@@ -49,6 +68,54 @@ class ListingService:
                 )
 
         return fields_for_ai
+
+    @staticmethod
+    async def _get_ebay_ai_aspects(
+        product_type: Optional[str], category_id: Optional[str] = None
+    ) -> tuple[List["AiAspectField"], Dict[str, List[Any]]]:
+        """eBay aspects to hand the AI, resolved for one eBay category.
+
+        Settings are aspect level, but the aspect's allowed values are not: `Brand` offers
+        19,161 values under Men's Dress Shirts and 4,523 under Women's Dresses, so the
+        category has to be decided before the values are asked for. `category_id` is the
+        listing's; without one the type's default is used. Silent no-op when the type maps
+        nowhere, which is the case for 103 of 239 types today.
+
+        These are NOT FieldDefinitions. FieldDefinition.name must be a valid Python
+        identifier, and eBay aspect names routinely contain spaces ("Size Type", "Sleeve
+        Length", "Outer Shell Material"), so most of them can never satisfy that validator.
+        AIService only reads .name/.type/.options/.multiselect/.ai_tagging off these, so a
+        narrow carrier is both sufficient and honest about not being a template field.
+        """
+        if not product_type:
+            return [], {}
+        try:
+            category_id = await ebay_aspect_service.resolve_listing_category(
+                product_type, category_id
+            )
+            if not category_id:
+                return [], {}
+            rows = await ebay_aspect_service.get_ai_aspects_for_category(
+                product_type, category_id
+            )
+        except Exception as e:  # noqa: BLE001 - AI enrichment must never block creation
+            logger.warning(f"Could not load eBay AI aspects for {product_type!r}: {e}")
+            return [], {}
+
+        fields, options = [], {}
+        for row in rows:
+            values = row["values"] or None
+            fields.append(
+                AiAspectField(
+                    name=row["aspect_name"],
+                    type=row["field_type"],
+                    options=values,
+                    multiselect=row["cardinality"] == "MULTI",
+                )
+            )
+            if values:
+                options[row["aspect_name"]] = values
+        return fields, options
 
     @staticmethod
     async def _generate_product_name(data: Dict[str, Any]) -> str:
@@ -377,11 +444,56 @@ class ListingService:
                         sellercloud_template.field_definitions or []
                     )
 
+                    # eBay aspects with AI tagging on, for whatever category this listing's
+                    # product type maps to. They are appended as ordinary AI fields because
+                    # the AI path is entirely name-driven and the prompt already speaks
+                    # eBay's language (aspectName / aspectOptions / itemToAspectCardinality
+                    # in utils/prompts/aspects_prompt.txt).
+                    #
+                    # The options MUST come from this listing's category. The same aspect
+                    # name carries a different list per category: Brand offers 19,161 values
+                    # under Men's Dress Shirts and 4,523 under Women's Dresses, and handing
+                    # the model the wrong list is how it invents a brand the category will
+                    # not accept.
+                    ebay_type = prefilled_data.get("product_type")
+                    ebay_categories = (
+                        await ebay_aspect_service.get_categories_for_type(ebay_type)
+                        if ebay_type
+                        else []
+                    )
+                    # The category is decided in THIS call, not a follow-up turn. The type
+                    # is already known here, so nothing has to wait for the model; and on
+                    # Chat Completions reasoning is discarded between turns, so a
+                    # conversation would buy only prefix-cache reuse of the images while
+                    # tripling the reasoning passes and inviting the model to anchor on its
+                    # own turn-1 answer.
+                    #
+                    # Skipped when there is one candidate, which is every type today: asking
+                    # a vision model to choose from a list of one is pure cost.
+                    if len(ebay_categories) > 1:
+                        fields_for_ai = fields_for_ai + [
+                            AiAspectField(
+                                name="ebay_category_id",
+                                type="text",
+                                options=[c["category_id"] for c in ebay_categories],
+                            )
+                        ]
+
+                    ebay_fields, ebay_options = await ListingService._get_ebay_ai_aspects(
+                        ebay_type,
+                        ebay_categories[0]["category_id"] if ebay_categories else None,
+                    )
+                    if ebay_fields:
+                        fields_for_ai = fields_for_ai + ebay_fields
+
                     if fields_for_ai:
                         if mapped_options is None:
                             mapped_options = await ListingService._load_mapped_options(
                                 sellercloud_template.field_definitions or []
                             )
+                        # Template mappings win on a name clash: an operator who mapped a
+                        # template field to a list column chose that list deliberately.
+                        mapped_options = {**ebay_options, **(mapped_options or {})}
 
                         ai_content = await AIService.generate_ai_content(
                             product_data, fields_for_ai, mapped_options
@@ -390,6 +502,24 @@ class ListingService:
                         ai_description = ai_content.get("description")
 
                         if ai_response_data:
+                            # Never take the model's word for a category id. An unmapped one
+                            # would render aspects the submit path will never send, and it
+                            # is stored on the listing where nothing later re-checks it.
+                            chosen = ai_response_data.get("ebay_category_id")
+                            if chosen is not None:
+                                allowed = {c["category_id"] for c in ebay_categories}
+                                if str(chosen) in allowed:
+                                    ai_response_data["ebay_category_id"] = str(chosen)
+                                else:
+                                    logger.warning(
+                                        "AI chose eBay category %r for %r, which is not one "
+                                        "of %s. Falling back to the type default.",
+                                        chosen,
+                                        ebay_type,
+                                        sorted(allowed),
+                                    )
+                                    ai_response_data.pop("ebay_category_id", None)
+
                             for key, value in ai_response_data.items():
                                 if key not in prefilled_data:
                                     prefilled_data[key] = value
@@ -602,18 +732,112 @@ class ListingService:
             raise
 
     @staticmethod
-    async def get_listing_schema(template_id: str) -> Optional[ListingSchemaResponse]:
+    def _ebay_category_field(
+        candidates: List[Dict[str, Any]], category_id: str
+    ) -> Dict[str, Any]:
+        """The category selector, as a template-shaped field dict.
+
+        A real schema field rather than a bespoke control, so it participates in formData,
+        autosave and validation without a parallel path. `enum` carries the ids and
+        `ui:enumNames` the paths, which is what lets the operator read a breadcrumb while
+        the listing stores something stable.
+
+        Deliberately carries no `default`. RJSF materialises a JSON Schema default into
+        formData and the next autosave freezes it into the listing -- the same hazard the
+        aspect defaults already refuse. The listing's category is resolved server-side
+        instead, so an untouched listing stores nothing.
+
+        `order` is explicit rather than relying on 999 being both the aspects' base and the
+        sort key's default: it must sit ahead of the aspects, and a tie-break is not a
+        statement of intent.
+        """
+        return {
+            "name": "ebay_category_id",
+            "display_name": "eBay category",
+            "type": "text",
+            "options": [c["category_id"] for c in candidates],
+            "option_labels": [
+                " > ".join(c["path"]) if c["path"] else c["name"] for c in candidates
+            ],
+            "display_in_form": True,
+            "section": "ebay",
+            "order": 950,
+            "ui_size": 12,
+        }
+
+    @staticmethod
+    async def _get_ebay_form_aspects(
+        product_type: Optional[str], category_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """eBay aspects to render on the listing form, as template-shaped field dicts.
+
+        Whether they are JSON Schema `required` hangs on eBay being an ENABLED platform.
+        The submit button is disabled while any validation error stands
+        (ListingView.jsx:5203), and that check does not know which platform a field belongs
+        to, so marking an eBay aspect required while eBay is switched off would block
+        submission to SPO and Grailed over a field nothing consumes yet. Enabling eBay
+        turns the requirement on with no further change here.
+        """
+        if not product_type:
+            return []
+        try:
+            # Resolved, not trusted: an id that is not this type's is ignored in favour of
+            # the default, so a hand-edited query string cannot render aspects for a
+            # category the submit path will never send.
+            category_id = await ebay_aspect_service.resolve_listing_category(
+                product_type, category_id
+            )
+            if not category_id:
+                return []
+            candidates = await ebay_aspect_service.get_categories_for_type(product_type)
+            # One AppSettings read for both answers: whether eBay is enabled, and which
+            # mappings it collects.
+            settings = await AppSettings.first()
+            enabled = (settings.platforms if settings else None) or []
+            ebay_settings = (
+                (settings.platform_settings if settings else None) or {}
+            ).get("ebay") or {}
+            aspects = await ebay_aspect_service.get_form_aspects_for_category(
+                product_type,
+                category_id,
+                mark_required="ebay" in enabled,
+                ebay_settings=ebay_settings,
+            )
+            return [
+                ListingService._ebay_category_field(candidates, category_id)
+            ] + aspects
+        except Exception as e:  # noqa: BLE001 - the form must render without eBay
+            logger.warning(f"Could not load eBay form aspects for {product_type!r}: {e}")
+            return []
+
+    @staticmethod
+    async def get_listing_schema(
+        template_id: str,
+        product_type: Optional[str] = None,
+        ebay_category_id: Optional[str] = None,
+    ) -> Optional[ListingSchemaResponse]:
         try:
             template = await Template.get_or_none(id=template_id)
             if not template:
                 return None
 
+            # eBay aspects set to "On form" belong to the eBay category the product type
+            # maps to, so the schema differs per type and the caller has to say which.
+            # Without a type the schema is the template alone, which is what every caller
+            # got before eBay aspects existed.
+            ebay_fields = await ListingService._get_ebay_form_aspects(
+                product_type, ebay_category_id
+            )
+
+            # eBay fields go through the same options load: a `form` aspect may carry an
+            # optional mapping target, and the point of that mapping is to take the list
+            # from a SkuBase table instead of eBay's own.
             mapped_options = await ListingService._load_mapped_options(
-                template.field_definitions or []
+                (template.field_definitions or []) + ebay_fields
             )
 
             json_schema, ui_schema = await ListingService._convert_template_to_schema(
-                template, mapped_options
+                template, mapped_options, ebay_fields
             )
 
             return ListingSchemaResponse(
@@ -633,9 +857,36 @@ class ListingService:
 
     @staticmethod
     async def _convert_template_to_schema(
-        template: Template, mapped_options: Dict[str, List[Any]] = None
+        template: Template,
+        mapped_options: Dict[str, List[Any]] = None,
+        extra_fields: List[Dict[str, Any]] = None,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        if not template.field_definitions:
+        """Build the form schema from the template, plus any per-listing extra fields.
+
+        `extra_fields` are template-shaped dicts contributed by a platform (today: eBay
+        aspects the operator put on the form). They run through this same loop rather than
+        a builder of their own, so they pick up every type, constraint and widget rule the
+        template fields get.
+        """
+        template_fields = template.field_definitions or []
+
+        # A name collision would have the extra field overwrite a template property, so
+        # the template keeps the name and the loser is reported rather than dropped in
+        # silence. Template field names are Python identifiers and eBay aspect names carry
+        # spaces, so in practice this is a guard, not a routine path.
+        owned = {f.get("name") for f in template_fields}
+        accepted_extras = []
+        for extra in extra_fields or []:
+            if extra.get("name") in owned:
+                logger.warning(
+                    f"Ignoring extra field {extra.get('name')!r}: the template already "
+                    "defines a field with that name"
+                )
+                continue
+            accepted_extras.append(extra)
+
+        all_fields = list(template_fields) + accepted_extras
+        if not all_fields:
             return {"type": "object", "properties": {}, "required": []}, {}
 
         if mapped_options is None:
@@ -645,7 +896,7 @@ class ListingService:
         ui_schema_props = {}
         required_fields = []
 
-        sorted_fields = sorted(template.field_definitions, key=lambda f: f.get("order", 999))
+        sorted_fields = sorted(all_fields, key=lambda f: f.get("order", 999))
 
         for field in sorted_fields:
             field_name = field.get("name")
@@ -659,9 +910,35 @@ class ListingService:
             if ui_size and isinstance(ui_size, int) and 1 <= ui_size <= 12:
                 ui_prop["ui:grid"] = {"xs": ui_size}
 
+            # Read by CustomObjectFieldTemplate, which lifts sectioned fields out of the
+            # main grid and renders them under their own heading beneath it.
+            if field.get("section"):
+                ui_prop["ui:section"] = field["section"]
+
+            # What the field will send while left empty. Carried as a placeholder rather
+            # than a JSON Schema `default` on purpose: RJSF materialises a default into
+            # formData, and the next save would freeze it into the listing, so a later
+            # change to that default could never reach the listing again.
+            if field.get("placeholder"):
+                ui_prop["ui:placeholder"] = field["placeholder"]
+
             field_type = field.get("type")
 
             field_options = mapped_options.get(field_name, field.get("options"))
+
+            # Paired positionally with `enum`, so they are only emitted together. A
+            # mapped_table list can override `options` while option_labels passes through
+            # untouched, and a desynced pair means the operator picks one category and the
+            # listing stores another.
+            option_labels = field.get("option_labels")
+            if option_labels and field_options and len(option_labels) == len(field_options):
+                ui_prop["ui:enumNames"] = option_labels
+            elif option_labels:
+                logger.warning(
+                    f"Dropping ui:enumNames for {field_name}: "
+                    f"{len(option_labels)} labels for {len(field_options or [])} options"
+                )
+
 
             if field_type == "text":
                 prop["type"] = "string"

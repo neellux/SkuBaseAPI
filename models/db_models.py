@@ -688,3 +688,220 @@ class InternalPlatformSubmission(Model):
             f"InternalPlatformSubmission({self.parent_sku} -> "
             f"{self.internal_platform_id}.{self.action}: {self.status})"
         )
+
+
+# ---------------------------------------------------------------------------
+# eBay item aspects
+# ---------------------------------------------------------------------------
+# Reference data (EbayCategory, EbayAspectValues, EbayCategoryAspect) is loaded from the
+# offline dump in API/data/ebay/ by scripts/ebay_load_dump_to_db.py and is replaced
+# wholesale on a tree-version reload. Operator data (EbayCategoryAspectConfig,
+# EbayTypeAspectValue) is never touched by a reload.
+#
+# See docs/plans/2026-08-05-feat-ebay-aspect-mapping-plan.md
+
+
+class EbayCategory(Model):
+
+    # Composite PK (marketplace_id, category_id) in SQL. Tortoise has no composite-pk
+    # support, so category_id carries pk=True here purely to stop it generating an `id`
+    # column that the table does not have. Always filter on marketplace_id as well.
+    category_id = fields.CharField(pk=True, max_length=32, description="eBay's own category id")
+    marketplace_id = fields.CharField(max_length=20, default="EBAY_US")
+    tree_version = fields.CharField(max_length=20)
+    name = fields.CharField(max_length=255, description="Leaf name, e.g. 'Dress Shirts'")
+    path = fields.JSONField(default=list, description="Ancestor chain, root first")
+    is_leaf = fields.BooleanField(default=True)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "pm_ebay_categories"
+
+    def __str__(self):
+        return f"EbayCategory({self.category_id}: {self.name})"
+
+
+class EbayAspectValues(Model):
+
+    # Content hash of the value list. 39,753 distinct lists cover 9.1M values, so the
+    # lists are stored once and referenced rather than repeated per (category, aspect).
+    values_id = fields.CharField(pk=True, max_length=32)
+    values_json = fields.JSONField(description="The allowed-value list")
+    # Denormalised so callers can choose inline options vs typeahead without reading the
+    # JSONB. 91.5% of lists hold <= 200 values; the largest holds 79,116.
+    value_count = fields.IntField()
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "pm_ebay_aspect_values"
+
+    def __str__(self):
+        return f"EbayAspectValues({self.values_id}: {self.value_count} values)"
+
+
+class EbayCategoryAspect(Model):
+
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    marketplace_id = fields.CharField(max_length=20, default="EBAY_US")
+    category_id = fields.CharField(max_length=32)
+    tree_version = fields.CharField(max_length=20)
+    aspect_name = fields.CharField(max_length=255)
+
+    is_required = fields.BooleanField(default=False, description="eBay's aspectRequired")
+    mode = fields.CharField(max_length=20, description="SELECTION_ONLY or FREE_TEXT")
+    data_type = fields.CharField(max_length=20, description="STRING, NUMBER or DATE")
+    cardinality = fields.CharField(max_length=20, description="SINGLE or MULTI")
+    usage = fields.CharField(max_length=20, null=True, description="RECOMMENDED or OPTIONAL")
+    # eBay's aspectMaxLength, present on only 11% of aspects. There is no corresponding
+    # minimum: eBay publishes no lower bound and no numeric bounds at all.
+    max_length = fields.IntField(null=True)
+    variations = fields.BooleanField(default=False)
+    values_id = fields.CharField(max_length=32, null=True)
+    sort_order = fields.IntField(default=0)
+    # eBay's aspectConstraint verbatim. The typed columns above are lifted out for querying;
+    # this keeps every other key so one eBay adds later survives the load rather than being
+    # dropped at compaction, which is what happened to aspectMaxLength and four others.
+    constraint_json = fields.JSONField(default=dict)
+    # Hash of the eBay-derived definition at load time, for detecting what moved under an
+    # operator's configuration after a reload. Same primitive as
+    # InternalPlatformState.desired_hash.
+    definition_hash = fields.CharField(max_length=32, null=True)
+
+    class Meta:
+        table = "pm_ebay_category_aspects"
+        unique_together = (("marketplace_id", "category_id", "aspect_name"),)
+        ordering = ["sort_order"]
+
+    def __str__(self):
+        return f"EbayCategoryAspect({self.category_id}.{self.aspect_name})"
+
+
+class EbayAspectSettings(Model):
+
+    # Keyed on the ASPECT NAME, not on (category, aspect). eBay is consistent about a given
+    # name almost everywhere: across the categories a Lux type maps to, data_type and
+    # aspectApplicableTo never differ between categories, and mode/cardinality/required
+    # differ for only 22 of 125 shared names. What is not consistent is the allowed values
+    # (59 of 125 differ, and Brand has 61 distinct lists across 62 categories), so values
+    # are never stored here and are always resolved per category.
+    #
+    # Every column below is something eBay does not publish. Nothing eBay-derived is stored,
+    # so a tree reload cannot be masked by a stale operator copy.
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    marketplace_id = fields.CharField(max_length=20, default="EBAY_US")
+    aspect_name = fields.CharField(max_length=255)
+
+    enabled = fields.BooleanField(default=True)
+    source = fields.CharField(
+        max_length=20,
+        default="type_based",
+        description=(
+            "Where the value comes from: 'mapped_field' (from the listing, never on the "
+            "form), 'form' (per-listing field), 'type_based' (once per product type)"
+        ),
+    )
+    mapped_field = fields.CharField(max_length=255, null=True, description="Template field name")
+    mapped_table = fields.CharField(max_length=255, null=True)
+    mapped_column = fields.CharField(max_length=255, null=True)
+
+    display_name = fields.CharField(max_length=255, null=True)
+    # The column this aspect becomes in the SellerCloud import file (Size -> EbaySize).
+    # Free text: no convention is settled yet. NULL means "not set" and the service derives
+    # a default at read time, so a later bulk map can tell defaults from operator edits.
+    sellercloud_field = fields.CharField(max_length=255, null=True)
+    ai_tagging = fields.BooleanField(default=False)
+    ui_size = fields.IntField(null=True)
+    # eBay publishes no minimum and no pattern of any kind. `max` is absent on purpose: the
+    # only bound eBay gives is aspectMaxLength, which is read from the reference row.
+    min_length = fields.IntField(null=True)
+    regex = fields.TextField(null=True)
+    # Aspect-wide default, every category. Nothing sets it today; the resolver falls back
+    # to it when the category below has no entry of its own.
+    default_value = fields.JSONField(null=True)
+    # The one field on this row that is NOT aspect level: {"15687": "Men"}, keyed by eBay
+    # category id. Scalar for SINGLE cardinality, array for MULTI. Held here rather than in
+    # a table of its own because this row is already the operator's half of an aspect and
+    # is already exempt from the wholesale replacement a tree reload performs on the
+    # reference tables. Written one key at a time with jsonb_set, never read-modify-write.
+    category_defaults = fields.JSONField(default=dict)
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "pm_ebay_aspect_settings"
+        unique_together = (("marketplace_id", "aspect_name"),)
+
+    def __str__(self):
+        return f"EbayAspectSettings({self.aspect_name}={self.source})"
+
+
+class EbayReferenceLoad(Model):
+
+    # One row per reference load. Until this existed a reload printed its report to stdout
+    # and lost it, so nothing could tell an operator what had moved beneath their settings.
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    marketplace_id = fields.CharField(max_length=20)
+    tree_version_from = fields.CharField(max_length=20, null=True)
+    tree_version_to = fields.CharField(max_length=20)
+    categories = fields.IntField(default=0)
+    aspects = fields.IntField(default=0)
+    value_lists = fields.IntField(default=0)
+    added = fields.IntField(default=0)
+    removed = fields.IntField(default=0)
+    changed = fields.IntField(default=0)
+    status = fields.CharField(max_length=20, default="completed")
+    refused_reason = fields.TextField(null=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "pm_ebay_reference_loads"
+        ordering = ["-created_at"]
+
+
+class EbayReferenceLoadChange(Model):
+
+    # Only changes touching a CONFIGURED aspect. A full tree diff would be hundreds of
+    # thousands of rows and nobody would read it.
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    load = fields.ForeignKeyField("models.EbayReferenceLoad", related_name="changes")
+    category_id = fields.CharField(max_length=32)
+    aspect_name = fields.CharField(max_length=255)
+    verb = fields.CharField(max_length=24)
+    was = fields.TextField(null=True)
+    now_value = fields.TextField(null=True)
+    acknowledged = fields.BooleanField(default=False)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "pm_ebay_reference_load_changes"
+
+
+class EbayTypeAspectValue(Model):
+
+    # Keyed on (Lux product type, eBay category). The type is in the key because many Lux
+    # types share one eBay category and the aspects that distinguish them would otherwise
+    # collide. The category is in the key so that remapping a type to a different category
+    # yields an empty set (the submit gate asks again) instead of carrying stale answers
+    # onto a different aspect set.
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    product_type_id = fields.UUIDField(description="listingoptions_types.id")
+    marketplace_id = fields.CharField(max_length=20, default="EBAY_US")
+    category_id = fields.CharField(max_length=32)
+    aspect_name = fields.CharField(max_length=255)
+    value = fields.JSONField(description="Scalar for SINGLE cardinality, array for MULTI")
+
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "pm_ebay_type_aspect_values"
+        unique_together = (
+            ("product_type_id", "marketplace_id", "category_id", "aspect_name"),
+        )
+
+    def __str__(self):
+        return f"EbayTypeAspectValue({self.product_type_id}.{self.aspect_name})"

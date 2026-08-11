@@ -155,9 +155,15 @@ class SubmissionPoller(BasePoller):
                 submission.status = SubmissionStatus.SUCCESS
                 await submission.save(update_fields=["status", "updated_at"])
                 await record_step(submission.id, "listed")
-            elif submission.platform_id in ("grailed", "spo"):
-                # Both are manual_fallback batch platforms handled by their own
-                # pollers (grailed_poller / spo_poller); nothing to do per-listing.
+            elif submission.platform_id in ("grailed", "spo", "ebay"):
+                # manual_fallback batch platforms handled by their own pollers
+                # (grailed_poller / spo_poller); nothing to do per-listing.
+                #
+                # ebay is listed here before it has a poller on purpose. It is disabled
+                # (absent from app_settings.platforms) so no rows should exist, but the
+                # `else` below hard-fails any unrecognised platform, which would turn an
+                # accidental enable into a wall of "Unknown platform: ebay" failures
+                # instead of rows parked harmlessly in queued.
                 pass
             else:
                 logger.warning(

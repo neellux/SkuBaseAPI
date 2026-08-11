@@ -199,12 +199,32 @@ GRAILED_DEFAULT_SETTINGS = {
     "min_batch_size": 100,
 }
 
+# eBay submits in batches like grailed and spo, so manual_fallback parks its rows in
+# `queued` for a poller rather than dispatching them inline.
+#
+# All three mapping gates are on, unlike spo and grailed. A platform is skipped by the gate
+# chain entirely unless at least one require_* flag is truthy
+# (listing_options_service.check_unmapped_mappings), so these are what make eBay participate.
+#
+# Note this does NOT enable eBay. Enablement is membership in app_settings.platforms, which
+# these defaults never touch.
+EBAY_DEFAULT_SETTINGS = {
+    "manual_fallback": True,
+    "min_batch_size": 100,
+    "allow_resubmit": True,
+    "requires_images": True,
+    "require_type_mapping": True,
+    "require_color_mapping": True,
+    "require_brand_mapping": True,
+}
+
 
 def _hydrate_platform_settings(platform_settings: dict) -> dict:
     merged = dict(platform_settings or {})
     for platform_id, defaults in (
         ("spo", SPO_DEFAULT_SETTINGS),
         ("grailed", GRAILED_DEFAULT_SETTINGS),
+        ("ebay", EBAY_DEFAULT_SETTINGS),
     ):
         platform = dict(merged.get(platform_id) or {})
         for key, default_value in defaults.items():

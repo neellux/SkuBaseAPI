@@ -14,6 +14,7 @@ from routes.listing_routes import router as listing_router
 from routes.product_routes import router as product_router
 from routes.settings_routes import router as settings_router
 from routes.submissions_routes import router as submissions_router
+from routes.ebay_routes import router as ebay_router
 from routes.internal_platform_routes import router as internal_platform_router
 from routes.template_routes import router as template_router
 from listingoptions.routes.table_routes import router as lo_table_router
@@ -91,6 +92,7 @@ app.include_router(settings_router)
 app.include_router(submissions_router)
 # Authenticated app only, never api_app: /api is excluded from AuthMiddleware.
 app.include_router(internal_platform_router)
+app.include_router(ebay_router)
 app.include_router(product_router)
 app.include_router(image_router)
 
