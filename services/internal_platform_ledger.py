@@ -354,13 +354,44 @@ async def finish(
 
 
 async def mark_listed(state: InternalPlatformState, source_gid: str) -> None:
+    # ineligible_since is cleared with the strikes: a product being tagged qualifies right
+    # now, so any clock left over from a previous spell out of the band is stale. Leaving
+    # it would let the pre-delivery untag fire on the next scan against a soak that
+    # elapsed days ago, untagging a product moments after tagging it.
     state.source_product_gid = source_gid
     state.listed_at = _now()
     state.current_status = "pending_normalization"
     state.delist_strikes = 0
+    state.ineligible_since = None
     await state.save(update_fields=[
-        "source_product_gid", "listed_at", "current_status", "delist_strikes", "updated_at",
+        "source_product_gid", "listed_at", "current_status", "delist_strikes",
+        "ineligible_since", "updated_at",
     ])
+
+
+async def adopt_dest_gid(platform_id: str, parent_sku: str, dest_gid: str) -> int:
+    """Record that Syncio has delivered this product after all. Returns rows written.
+
+    Written by the pre-delivery untag's destination check, which is the one place that
+    looks for a delivered product OUTSIDE the destination poller's tag scan. Setting the
+    GID is what hands the row back to the normal, guarded delist path: it stops satisfying
+    is_awaiting_sync(), so the cheap untag-only route can no longer claim it.
+
+    Keyed rather than taking a loaded row, and guarded on `dest_product_gid IS NULL`, so
+    it can only ever fill a blank. The destination poller is the authority on this column
+    and may have written the real GID between the scan and this call; overwriting that
+    with a GID found by SKU lookup would be a downgrade.
+    """
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(
+        "UPDATE internal_platform_state "
+        "   SET dest_product_gid = $3, updated_at = now() "
+        " WHERE internal_platform_id = $1 AND parent_sku = $2 "
+        "   AND dest_product_gid IS NULL "
+        "RETURNING parent_sku",
+        [platform_id, parent_sku, dest_gid],
+    )
+    return len(rows)
 
 
 async def mark_normalized_many(platform_id: str, parent_skus: Sequence[str]) -> int:
@@ -442,9 +473,14 @@ async def mark_delisted(state: InternalPlatformState) -> None:
     state.listed_at = None
     state.delisted_at = _now()
     state.delist_strikes = 0
+    # Same reasoning as listed_at above, for the other clock. The row is no longer tagged,
+    # so it is no longer failing qualification WHILE TAGGED, which is the only thing
+    # ineligible_since means. Carrying it forward would arm the pre-delivery untag against
+    # the next tag before that tag has had a chance to be wrong.
+    state.ineligible_since = None
     await state.save(update_fields=[
         "current_status", "dest_product_gid", "listed_at", "delisted_at",
-        "delist_strikes", "updated_at",
+        "delist_strikes", "ineligible_since", "updated_at",
     ])
 
 
@@ -568,6 +604,37 @@ async def apply_delist_strikes(platform_id: str, bump: Sequence[str],
         "   AND (s.parent_sku = ANY($2::text[]) OR s.parent_sku = ANY($3::text[])) "
         "RETURNING parent_sku",
         [platform_id, list(bump), list(clear)],
+    )
+    return len(rows)
+
+
+async def apply_ineligible_since(platform_id: str, start: Sequence[str],
+                                 clear: Sequence[str]) -> int:
+    """Start and stop the pre-delivery untag clock for a whole cycle, in one statement.
+
+    Modelled on apply_delist_strikes, and batched for the same reason: this decides an
+    action, so a cycle either judges every product it scanned or none of them.
+
+    The start side is `coalesce(ineligible_since, now())`, NOT `now()`. The caller diffs
+    against the state it loaded and only sends rows whose value should change, but two
+    overlapping scans can both decide to start the same clock, and a plain now() would
+    reset it every cycle - the soak would then never elapse and the untag would never fire.
+    Written in SQL rather than trusted to the diff so the property holds whatever the
+    caller does.
+    """
+    if not start and not clear:
+        return 0
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(
+        "UPDATE internal_platform_state s "
+        "   SET ineligible_since = CASE WHEN s.parent_sku = ANY($2::text[]) "
+        "                               THEN coalesce(s.ineligible_since, now()) "
+        "                               ELSE NULL END, "
+        "       updated_at = now() "
+        " WHERE s.internal_platform_id = $1 "
+        "   AND (s.parent_sku = ANY($2::text[]) OR s.parent_sku = ANY($3::text[])) "
+        "RETURNING parent_sku",
+        [platform_id, list(start), list(clear)],
     )
     return len(rows)
 

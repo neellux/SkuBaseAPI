@@ -15,7 +15,7 @@ product and would silently turn skip-unchanged into a 100% write rate.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Mapping, Sequence
@@ -424,14 +424,19 @@ class ScheduledActions:
     """What a scheduled pass is permitted to execute."""
     tag: bool
     delist: bool
+    # Untag a product Syncio has not delivered yet. Deliberately NOT folded into `delist`:
+    # that flag permits a productDelete on Shop The Sample, this one cannot reach a
+    # destination store at all. See auto_untag_awaiting_sync in the source poller.
+    untag_awaiting: bool = False
 
     @property
     def any(self) -> bool:
-        return self.tag or self.delist
+        return self.tag or self.delist or self.untag_awaiting
 
 
 def plan_scheduled_actions(*, auto_submit: bool, auto_delist: bool,
-                           execute_deletes: bool, delists: bool) -> ScheduledActions:
+                           execute_deletes: bool, delists: bool,
+                           auto_untag_awaiting_sync: bool = False) -> ScheduledActions:
     """Which halves of a scheduled pass may write. Pure, so the flags are testable.
 
     auto_submit and auto_delist are INDEPENDENT, and this function exists because they
@@ -444,10 +449,16 @@ def plan_scheduled_actions(*, auto_submit: bool, auto_delist: bool,
     `execute` is deliberately NOT an input. It gates every write from the pass, scheduled
     or manual, and folding it in here would let a caller satisfy this function and still
     need a second check - one switch, one place.
+
+    untag_awaiting depends on neither `delists` nor execute_deletes. It is a source-side
+    untag of a product that has no destination product to delete, so gating it on the
+    delete switches would mean an operator could only get it by also arming the
+    irreversible half - which is the opposite of what it is for.
     """
     return ScheduledActions(
         tag=auto_submit,
         delist=delists and auto_delist and execute_deletes,
+        untag_awaiting=auto_untag_awaiting_sync,
     )
 
 
@@ -487,6 +498,63 @@ def needs_delisting(p: SourceProduct, trigger_tag: str, allow: Allowlists,
         qualifies(p, allow, rule, taxonomy=taxonomy),
         delist_on_no_inventory=delist_on_no_inventory,
     )
+
+
+def is_awaiting_sync(listed_at: datetime | None, dest_product_gid: str | None) -> bool:
+    """Tagged on the source, not yet delivered by Syncio.
+
+    The one definition. It matches ledger.awaiting_sync()'s SQL exactly - `listed_at IS
+    NOT NULL AND dest_product_gid IS NULL` - and deliberately does not look at
+    current_status, for the reason recorded on mark_delisted(): status and delivery drift
+    apart, and on 2026-08-03 reading one for the other reported 155 freshly deleted
+    products as waiting on Syncio.
+    """
+    return listed_at is not None and dest_product_gid is None
+
+
+def pre_delivery_untag_due(
+    *,
+    verdict: FilterVerdict,
+    listed_at: datetime | None,
+    dest_product_gid: str | None,
+    ineligible_since: datetime | None,
+    now: datetime,
+    soak_minutes: int,
+) -> bool:
+    """Should this tagged-but-undelivered product come back off the source now?
+
+    Syncio takes 1 to 3 days to copy a tagged product across. A product that sells out or
+    drifts out of the price band inside that window is delivered anyway and lands on Shop
+    The Sample already unqualified. Untagging before delivery is what prevents that.
+
+    Deliberately NOT routed through is_delist_candidate(). That function exempts
+    no_inventory, because delisting a product already LIVE on STS means untagging the
+    source, letting Syncio tear the listing down, and rebuilding it days later when stock
+    returns - 43% of the live footprint was at zero stock when that was measured. None of
+    that applies here: there is no destination product yet, so there is nothing to tear
+    down and nothing to rebuild. Selling out is grounds on this path and is not on that
+    one, and the two must not share a predicate.
+
+    Reversible in a way the delist path is not: the whole action is one tagsRemove. When
+    the product qualifies again the next scan returns it to ready_for_listing.
+
+    The soak is in MINUTES against a stored timestamp, not in cycles against a counter.
+    delist_strikes is bumped only by the daily pass so its unit stays days; this decision
+    runs on the five-minute scan, and a timestamp also survives a poller restart, a missed
+    cycle, and a change to interval_seconds. 0 disables the soak, matching the convention
+    every cap in this module uses.
+    """
+    if verdict.qualified:
+        return False
+    if not is_awaiting_sync(listed_at, dest_product_gid):
+        return False
+    if soak_minutes <= 0:
+        return True
+    if ineligible_since is None:
+        # First failing scan starts the clock. Never act on the same pass that set it, or
+        # the soak is a no-op for every product whose row has not been written yet.
+        return False
+    return (now - ineligible_since) >= timedelta(minutes=soak_minutes)
 
 
 def delist_cause(p: SourceProduct, allow: Allowlists,
@@ -643,6 +711,13 @@ class SafetyCaps:
     max_units_zeroed_per_cycle: int = 400
     min_candidate_set_size: int = 50
     max_candidate_set_shrink_pct: float = 50.0
+    # Pre-delivery untags in one scan. This is the main numeric guard on that path, and it
+    # matters most because the trigger set is EVERY rejection reason, taxonomy gaps
+    # included: dropping one type mapping from listing options makes every product of that
+    # type fail qualification at once. check_taxonomy_health() catches a collapsed
+    # taxonomy, this catches a single mapping deleted by hand. 0 disables, like every cap
+    # here.
+    max_pre_delivery_untags_per_cycle: int = 25
     # Stock-reconciliation blast radius. Distinct from max_units_zeroed_per_cycle, which
     # counts Shopify inventory-level writes on the destination; this counts STATE ROWS whose
     # stored stock the scan is about to correct downward because their SKUs are no longer on
@@ -678,6 +753,7 @@ def check_caps(
     units_zeroed: int,
     footprint: int,
     caps: SafetyCaps,
+    pre_delivery_untag_count: int = 0,
 ) -> str | None:
     """Return a breach message, or None if the cycle may proceed.
 
@@ -712,6 +788,12 @@ def check_caps(
         return (
             f"max_sold_out_deletes_per_cycle: {sold_out_delete_count} > "
             f"{caps.max_sold_out_deletes_per_cycle}"
+        )
+    if (caps.max_pre_delivery_untags_per_cycle > 0
+            and pre_delivery_untag_count > caps.max_pre_delivery_untags_per_cycle):
+        return (
+            f"max_pre_delivery_untags_per_cycle: {pre_delivery_untag_count} > "
+            f"{caps.max_pre_delivery_untags_per_cycle}"
         )
     if (caps.max_variant_writes_per_cycle > 0
             and variant_writes > caps.max_variant_writes_per_cycle):

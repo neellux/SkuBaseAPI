@@ -16,6 +16,16 @@ TWO CADENCES, deliberately:
                a two-day soak to ten minutes and multiply the per-cycle delete caps by
                288. Nothing about the sell-out case needs sub-daily latency.
 
+One case does need sub-daily latency, and it runs on the SCAN pass instead: a product
+tagged on 1nventory but not yet delivered by Syncio, which sells out or drifts out of the
+price band inside Syncio's 1-to-3-day window. The daily path cannot reach it in time -
+two soak days plus a human Delist click is longer than the window it is racing - and by
+the time it fires the product is already live on Shop The Sample at zero stock or at the
+wrong price. Untagging before delivery is a source-side tagsRemove with no destination
+product to delete, so it carries none of the delist path's irreversibility and gets its
+own flag (`auto_untag_awaiting_sync`), its own clock (`ineligible_since`, in minutes) and
+its own cap. See pre_delivery_untag_due() in internal_platform_rules.
+
 BLOCKED: the source store currently grants read_products only. Every write here raises
 ShopifyScopeError until write_products is granted and the app reinstalled. The planning
 half runs fine today and produces a reviewable dry-run report.
@@ -65,9 +75,11 @@ from services.internal_platform_rules import (
     check_candidate_set,
     check_caps,
     delist_cause,
+    is_awaiting_sync,
     is_delist_candidate,
     is_tagged,
     plan_scheduled_actions,
+    pre_delivery_untag_due,
     qualifies,
 )
 from services.shopify_admin import Product, ShopifyAdmin
@@ -111,7 +123,14 @@ class SourceReport:
     qualifying: int = 0
     to_tag: list[tuple[str, str, str]] = field(default_factory=list)      # sku, gid, why
     to_delist: list[tuple[str, str, str]] = field(default_factory=list)   # sku, gid, cause
+    # Tagged, awaiting Syncio, stopped qualifying, soak elapsed: untag before delivery.
+    # (sku, gid, cause, skus) - the variant SKUs ride along because the destination check
+    # runs after the scan loop, by which point the Shopify product is out of scope.
+    to_untag_awaiting: list[tuple[str, str, str, tuple[str, ...]]] = field(
+        default_factory=list)
     soaking: int = 0
+    # Awaiting Syncio and failing, but the untag soak has not elapsed yet.
+    pre_delivery_soaking: int = 0
     # Tagged, out of stock, and deliberately NOT delisted because stock is transient.
     # Counted so a large number is visible rather than looking like nothing happened.
     stock_held: int = 0
@@ -122,6 +141,13 @@ class SourceReport:
     tagged: int = 0
     untagged: int = 0
     deleted: int = 0
+    # Untagged before Syncio delivered. Counted apart from `deleted` because no
+    # productDelete happened - reporting these as deletions would make a reversible
+    # source-side action indistinguishable from the irreversible one.
+    pre_delivery_untagged: int = 0
+    # Found on the destination after all, so handed back to the reviewed delist path
+    # instead of being untagged.
+    pre_delivery_arrived: int = 0
     failed: int = 0
     aborted: str | None = None
 
@@ -132,10 +158,14 @@ class SourceReport:
             f"reconciled={self.reconciled} zeroed={self.zeroed} "
             f"qualifying={self.qualifying} "
             f"to_tag={len(self.to_tag)} to_delist={len(self.to_delist)} "
-            f"soaking={self.soaking} stock_held={self.stock_held} "
+            f"to_untag_awaiting={len(self.to_untag_awaiting)} "
+            f"soaking={self.soaking} pre_delivery_soaking={self.pre_delivery_soaking} "
+            f"stock_held={self.stock_held} "
             f"held_back={self.held_back} "
             f"variants={self.variants_submitted} tagged={self.tagged} untagged={self.untagged} "
-            f"deleted={self.deleted} failed={self.failed}"
+            f"deleted={self.deleted} "
+            f"pre_delivery_untagged={self.pre_delivery_untagged} "
+            f"pre_delivery_arrived={self.pre_delivery_arrived} failed={self.failed}"
             + (f" ABORTED={self.aborted}" if self.aborted else "")
         )
 
@@ -188,6 +218,29 @@ class InternalPlatformSourcePoller:
             cfg.get("delist_on_no_inventory", False)
         )
 
+        # Untag a product Syncio has not delivered yet, once it stops qualifying. Its own
+        # flag rather than a mode of auto_delist, because the two authorise different
+        # things: auto_delist permits a productDelete on Shop The Sample, this permits one
+        # tagsRemove on 1nventory against a product that has no destination product at all.
+        # Folding them together would mean an operator could only get the reversible
+        # behaviour by also arming the irreversible one.
+        #
+        # Note this ignores delist_on_no_inventory, deliberately. That flag is false
+        # because tearing down a LIVE listing over transient stock costs a rebuild; before
+        # delivery there is nothing to tear down. See pre_delivery_untag_due().
+        self.auto_untag_awaiting_sync: bool = bool(
+            cfg.get("auto_untag_awaiting_sync", False)
+        )
+        # How long a tagged product must fail qualification before it is untagged, in
+        # MINUTES against a stored timestamp rather than in cycles against a counter: this
+        # runs on the five-minute scan, and a timestamp survives a restart, a missed cycle
+        # and a change to interval_seconds. Sized to ride out a momentary stock dip during
+        # a transfer or a mid-bulk-edit price while still acting a day or more ahead of
+        # Syncio. 0 = untag on the first failing scan.
+        self.awaiting_sync_untag_soak_minutes: int = int(
+            cfg.get("awaiting_sync_untag_soak_minutes", 60)
+        )
+
         # Correct stored stock against what the scan actually saw, including zeroing rows
         # whose SKUs are gone from Shopify. ON by default: without it a row whose parent key
         # stopped resolving freezes forever, which is how nine phantom units survived on the
@@ -212,6 +265,8 @@ class InternalPlatformSourcePoller:
             min_candidate_set_size=int(cfg.get("min_candidate_set_size", 50)),
             max_candidate_set_shrink_pct=float(cfg.get("max_candidate_set_shrink_pct", 50.0)),
             max_rows_zeroed_per_cycle=int(cfg.get("max_rows_zeroed_per_cycle", 50)),
+            max_pre_delivery_untags_per_cycle=int(
+                cfg.get("max_pre_delivery_untags_per_cycle", 25)),
         )
 
         self.allowlists = Allowlists(
@@ -659,6 +714,12 @@ class InternalPlatformSourcePoller:
         desired_status: dict[str, tuple[str, str | None, int]] = {}
         to_bump: list[str] = []      # soak counter +1
         to_clear: list[str] = []     # soak counter reset to 0
+        to_start_inelig: list[str] = []   # pre-delivery untag clock: start
+        to_clear_inelig: list[str] = []   # pre-delivery untag clock: stop
+
+        # One timestamp for the whole cycle. Reading the clock per product would let two
+        # products scanned a minute apart resolve the same soak differently.
+        now = datetime.now(timezone.utc)
 
         for sp, product in candidates:
             verdict = qualifies(sp, self.allowlists, DEFAULT_PRICING, taxonomy=taxonomy)
@@ -666,6 +727,7 @@ class InternalPlatformSourcePoller:
             parent = sp.parent_sku or ""
             state = state_map.get(parent)
             soak_reached = False
+            queued_for_delist = False
 
             # A tagged product that failed ONLY on stock is not a delist candidate while
             # delist_on_no_inventory is false, and must be treated exactly like a
@@ -695,6 +757,7 @@ class InternalPlatformSourcePoller:
                     else:
                         soak_reached = True
                     if soak_reached:
+                        queued_for_delist = True
                         report.to_delist.append(
                             (parent or "?", sp.gid,
                              delist_cause(sp, self.allowlists, DEFAULT_PRICING, taxonomy=taxonomy))
@@ -704,6 +767,44 @@ class InternalPlatformSourcePoller:
                     report.stock_held += 1
                 if state is not None and state.delist_strikes:
                     to_clear.append(parent)
+
+            # Pre-delivery untag, and the clock that drives it. A SEPARATE check rather
+            # than another arm of the chain above, which routes on `delistable`: a
+            # sold-out product lands in its third branch and a price failure in its
+            # second, so one new arm could only ever catch one of the two cases this
+            # exists for. Both are in scope here - see pre_delivery_untag_due().
+            #
+            # The clock is maintained for every TAGGED row, not only the ones awaiting
+            # Syncio, so "how long has this been failing" is also readable for products
+            # already live. It costs nothing extra: only genuine changes are collected.
+            #
+            # queued_for_delist excludes anything the branch above already queued. On the
+            # DAILY pass both can select the same product - it is tagged, failing, past
+            # its soak AND undelivered - and _apply_delists would then run twice on one
+            # parent: untag, mark_delisted, then untag again on a product that no longer
+            # carries the tag, settling a second time and double-counting the cycle.
+            # The delist queue wins because it is the reviewed one.
+            if parent and tagged and state is not None and not queued_for_delist:
+                if verdict.qualified:
+                    if state.ineligible_since is not None:
+                        to_clear_inelig.append(parent)
+                else:
+                    if state.ineligible_since is None:
+                        to_start_inelig.append(parent)
+                    if pre_delivery_untag_due(
+                        verdict=verdict,
+                        listed_at=state.listed_at,
+                        dest_product_gid=state.dest_product_gid,
+                        ineligible_since=state.ineligible_since,
+                        now=now,
+                        soak_minutes=self.awaiting_sync_untag_soak_minutes,
+                    ):
+                        report.to_untag_awaiting.append((
+                            parent, sp.gid, verdict.rejected_by or "unknown",
+                            tuple(s for s in product.variant_skus if s),
+                        ))
+                    elif is_awaiting_sync(state.listed_at, state.dest_product_gid):
+                        report.pre_delivery_soaking += 1
 
             if not parent:
                 continue
@@ -732,6 +833,12 @@ class InternalPlatformSourcePoller:
             n = await ledger.apply_delist_strikes(self.platform_id, to_bump, to_clear)
             logger.info("%s: soak counters - %d bumped, %d cleared (%d rows)",
                         self.name, len(to_bump), len(to_clear), n)
+
+        if to_start_inelig or to_clear_inelig:
+            n = await ledger.apply_ineligible_since(
+                self.platform_id, to_start_inelig, to_clear_inelig)
+            logger.info("%s: ineligibility clocks - %d started, %d cleared (%d rows)",
+                        self.name, len(to_start_inelig), len(to_clear_inelig), n)
 
         if desired_status:
             n = await ledger.apply_scan_statuses(self.platform_id, desired_status)
@@ -806,12 +913,19 @@ class InternalPlatformSourcePoller:
         # before anyone presses Delist. The candidate-set guard above still aborts on an
         # incomplete source read, so a partial scan cannot flood that queue in the first
         # place.
+        #
+        # The pre-delivery untag cap IS applied, and is the exception to the paragraph
+        # above for a reason: that path has no pending_delisting queue and no button in
+        # front of it, so review cannot be what bounds it. Its trigger set is also every
+        # rejection reason, taxonomy gaps included, which means one type mapping deleted
+        # from listing options can make a whole product type fail qualification at once.
         footprint = await ledger.footprint(self.platform_id)
         breach = check_caps(
             action_count=len(report.to_tag),
             delete_count=0, sold_out_delete_count=0,
             variant_writes=0, units_zeroed=0,
             footprint=footprint, caps=self.caps,
+            pre_delivery_untag_count=len(report.to_untag_awaiting),
         )
         if breach:
             logger.error("%s: CAP BREACH, zero writes: %s", self.name, breach)
@@ -825,13 +939,16 @@ class InternalPlatformSourcePoller:
         allowed = plan_scheduled_actions(
             auto_submit=self.auto_submit, auto_delist=self.auto_delist,
             execute_deletes=self.execute_deletes, delists=delists,
+            auto_untag_awaiting_sync=self.auto_untag_awaiting_sync,
         )
         may_tag, may_delist = allowed.tag, allowed.delist
 
         if not allowed.any:
-            logger.info("%s: auto_submit=%s auto_delist=%s execute_deletes=%s - planning "
-                        "only, the buttons execute. %s", self.name, self.auto_submit,
-                        self.auto_delist, self.execute_deletes, report.summary())
+            logger.info("%s: auto_submit=%s auto_delist=%s execute_deletes=%s "
+                        "auto_untag_awaiting_sync=%s - planning only, the buttons execute. "
+                        "%s", self.name, self.auto_submit, self.auto_delist,
+                        self.execute_deletes, self.auto_untag_awaiting_sync,
+                        report.summary())
             return report
 
         # `execute` gates every write from this pass, scheduled or not.
@@ -855,6 +972,17 @@ class InternalPlatformSourcePoller:
                         "executes them (auto_delist=%s, execute_deletes=%s)",
                         self.name, len(report.to_delist),
                         self.auto_delist, self.execute_deletes)
+
+        if allowed.untag_awaiting and report.to_untag_awaiting:
+            confirmed = await self._confirm_undelivered(
+                platform, report, report.to_untag_awaiting)
+            if confirmed:
+                await self._apply_delists(platform, admin, report, confirmed,
+                                          pre_delivery=True)
+        elif report.to_untag_awaiting:
+            logger.info("%s: %d products awaiting Syncio no longer qualify; not untagging "
+                        "(auto_untag_awaiting_sync=false)",
+                        self.name, len(report.to_untag_awaiting))
 
         logger.info("%s: %s pass done, %s",
                     self.name, "delist" if delists else "scan", report.summary())
@@ -1004,9 +1132,66 @@ class InternalPlatformSourcePoller:
             finally:
                 await ledger.release(state)
 
+    async def _confirm_undelivered(
+        self, platform: Any, report: SourceReport,
+        items: list[tuple[str, str, str, tuple[str, ...]]],
+    ) -> list[tuple[str, str, str]]:
+        """Drop anything Syncio has already delivered. Returns what is safe to untag.
+
+        THE hazard on this path. `dest_product_gid IS NULL` means "we have not SEEN it on
+        Shop The Sample", not "it is not there": the destination poller runs on its own
+        five-minute cycle behind a watermark, so Syncio can have created the product
+        minutes before this scan decided to untag it.
+
+        Untagging then is not merely premature, it is unrecoverable in one specific way.
+        The destination poller only ever finds products through
+        products_by_tag(trigger_tag). If the trigger tag does not survive on the delivered
+        product, nothing in this pipeline will ever look at it again: it stays on STS
+        forever, uncorrected, with no state row claiming it and no sweep that can see it.
+
+        So ask the destination directly, by variant SKU. find_product_by_variant_sku is
+        the same identity check used before a create - exact, and unaffected by retitling.
+
+        Fails CLOSED. An unreadable destination reads as "cannot confirm this is
+        undelivered", never as "it is not there"; the candidate simply waits for the next
+        cycle, and its soak clock keeps running underneath it.
+        """
+        dest_client = await get_shopify_client(platform.dest_store)
+        dest_admin = ShopifyAdmin(dest_client)
+
+        confirmed: list[tuple[str, str, str]] = []
+        for parent_sku, source_gid, cause, skus in items:
+            if not skus:
+                logger.warning("%s: %s has no variant SKUs to check against the "
+                               "destination; refusing to untag", self.name, parent_sku)
+                continue
+            try:
+                # Three is enough. The check asks "does ANY variant of this product exist
+                # on the destination", and Syncio delivers a product whole, so a product
+                # present under none of its first three SKUs is not present.
+                node = await dest_admin.find_product_by_variant_sku(skus[:3])
+            except Exception as exc:                                     # noqa: BLE001
+                logger.error("%s: destination lookup failed for %s, refusing to untag: %s",
+                             self.name, parent_sku, exc)
+                continue
+            if node is None:
+                confirmed.append((parent_sku, source_gid, cause))
+                continue
+
+            # Delivered after all. Record the GID so the row stops satisfying
+            # is_awaiting_sync(): this is now an ordinary live product, and removing it
+            # has to go through the soak, the ownership guards and the Delist button like
+            # any other. Nothing is untagged here.
+            await ledger.adopt_dest_gid(self.platform_id, parent_sku, node["id"])
+            report.pre_delivery_arrived += 1
+            logger.info("%s: %s is already on the destination as %s; adopted it and left "
+                        "the source tagged", self.name, parent_sku, node["id"])
+        return confirmed
+
     async def _apply_delists(self, platform: Any, admin: ShopifyAdmin,
                              report: SourceReport,
-                             items: list[tuple[str, str, str]]) -> None:
+                             items: list[tuple[str, str, str]],
+                             *, pre_delivery: bool = False) -> None:
         """Untag source, confirm, then delete destination. Ordering is mandatory.
 
         Deleting while the source is still tagged causes Syncio to recreate the
@@ -1016,6 +1201,13 @@ class InternalPlatformSourcePoller:
         report so the manual path can supply the pending_delisting set from the database
         while the scheduled path supplies what it just computed - one implementation of
         the ordering either way.
+
+        `pre_delivery` marks the third caller: the scan pass untagging a product Syncio
+        has not delivered. Reused rather than given its own routine on purpose - the
+        claim/record/untag/re-read/settle sequence is the part that must not be
+        reimplemented, and reuse is also what makes the delivery race safe, because a
+        product that arrived between _confirm_undelivered and this claim is caught by the
+        re-read below instead of being untagged on a stale reading.
         """
         dest_client = await get_shopify_client(platform.dest_store)
         dest_admin = ShopifyAdmin(dest_client)
@@ -1025,10 +1217,24 @@ class InternalPlatformSourcePoller:
             if state is None:
                 continue
             try:
+                if pre_delivery and state.dest_product_gid:
+                    # claim() re-reads the row, so this is fresher than the destination
+                    # check that queued this item. Syncio delivered in between: not our
+                    # case any more. Release it untouched and let the reviewed delist path
+                    # have it. This is what keeps auto_untag_awaiting_sync's promise that
+                    # it can never reach a productDelete - the flag authorises one
+                    # tagsRemove against a product with no destination product, and the
+                    # moment that stops being true it stops acting.
+                    logger.info("%s: %s was delivered between the destination check and "
+                                "the untag; leaving it to the delist path", self.name,
+                                parent_sku)
+                    report.pre_delivery_arrived += 1
+                    continue
                 untag_row = await ledger.record(
                     platform_id=self.platform_id, parent_sku=parent_sku,
                     action=Act.UNTAG, status=St.PENDING, source_gid=source_gid,
-                    payload={"tag": platform.trigger_tag, "cause": cause},
+                    payload={"tag": platform.trigger_tag, "cause": cause,
+                             "pre_delivery": pre_delivery},
                 )
                 await admin.remove_tags(source_gid, [platform.trigger_tag])
 
@@ -1053,7 +1259,14 @@ class InternalPlatformSourcePoller:
                 if not dest_gid:
                     # Never delivered by Syncio. Untagging IS the whole delist.
                     await ledger.mark_delisted(state)
-                    report.deleted += 1
+                    # Counted apart on the pre-delivery path. No productDelete happened
+                    # and none was possible, so reporting it as a deletion would make the
+                    # reversible action indistinguishable from the irreversible one in
+                    # every log line and every cycle count.
+                    if pre_delivery:
+                        report.pre_delivery_untagged += 1
+                    else:
+                        report.deleted += 1
                     continue
 
                 dest_product = await dest_admin.get_product(dest_gid)

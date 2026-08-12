@@ -606,6 +606,13 @@ class InternalPlatformState(Model):
         "soak threshold, so a transient bad read cannot trigger deletes",
     )
 
+    ineligible_since = fields.DatetimeField(
+        null=True,
+        description="When a tagged product last started failing qualification. Drives the "
+        "pre-delivery untag, which runs on the five-minute scan; delist_strikes cannot "
+        "carry it because only the DAILY pass may bump that counter",
+    )
+
     # Shopify-derived facts, refreshed by the source scan on every pass. Denormalised
     # here rather than joined at read time: the database is remote at ~0.57s a round trip
     # and the Products endpoint was just optimised by removing round trips.
