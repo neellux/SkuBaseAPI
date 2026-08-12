@@ -136,6 +136,23 @@ def decode_json(value, default):
 class EbayAspectService:
 
     @staticmethod
+    async def is_enabled(settings: Optional[Any] = None) -> bool:
+        """Whether eBay is an ENABLED platform, meaning membership in app_settings.platforms.
+
+        NOT the same question as "is eBay configured". platform_settings carries an eBay
+        block on every database whether or not it is enabled, because
+        _hydrate_platform_settings merges EBAY_DEFAULT_SETTINGS into the response
+        unconditionally. Anything deciding whether to show or compute eBay work has to ask
+        this, not that.
+
+        `settings` lets a caller that has already loaded AppSettings pass it in, the same
+        way active_mappings does, so the schema path does not pay for a second read.
+        """
+        if settings is None:
+            settings = await AppSettings.first()
+        return "ebay" in ((settings.platforms if settings else None) or [])
+
+    @staticmethod
     async def active_mappings(ebay_settings: Optional[Dict[str, Any]] = None) -> set:
         """Which per-platform mappings are actually collected for eBay.
 

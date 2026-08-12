@@ -90,6 +90,11 @@ class ListingService:
         if not product_type:
             return [], {}
         try:
+            # Same gate as the form path. Without it the model is asked to fill aspects for
+            # a platform that is switched off, and its answers land in listings.data where
+            # nothing later distinguishes them from values an operator chose.
+            if not await ebay_aspect_service.is_enabled():
+                return [], {}
             category_id = await ebay_aspect_service.resolve_listing_category(
                 product_type, category_id
             )
@@ -458,7 +463,7 @@ class ListingService:
                     ebay_type = prefilled_data.get("product_type")
                     ebay_categories = (
                         await ebay_aspect_service.get_categories_for_type(ebay_type)
-                        if ebay_type
+                        if ebay_type and await ebay_aspect_service.is_enabled()
                         else []
                     )
                     # The category is decided in THIS call, not a follow-up turn. The type
@@ -771,16 +776,27 @@ class ListingService:
     ) -> List[Dict[str, Any]]:
         """eBay aspects to render on the listing form, as template-shaped field dicts.
 
-        Whether they are JSON Schema `required` hangs on eBay being an ENABLED platform.
-        The submit button is disabled while any validation error stands
-        (ListingView.jsx:5203), and that check does not know which platform a field belongs
-        to, so marking an eBay aspect required while eBay is switched off would block
-        submission to SPO and Grailed over a field nothing consumes yet. Enabling eBay
-        turns the requirement on with no further change here.
+        Nothing is returned at all while eBay is a disabled platform, the category selector
+        included. An earlier version rendered the section unrequired so values could be
+        authored ahead of enabling, but a section for a platform that cannot be submitted
+        to is a dead end on the busiest screen in the app, and the selector on its own is
+        worse: it invites a choice that decides nothing.
+
+        Once eBay IS enabled the aspects become JSON Schema `required`. The submit button
+        is disabled while any validation error stands (ListingView.jsx:5203), and that
+        check does not know which platform a field belongs to, so marking an eBay aspect
+        required while eBay is switched off would block submission to SPO and Grailed over
+        a field nothing consumes yet.
         """
         if not product_type:
             return []
         try:
+            # First, and before any eBay query: on a database where eBay is off this
+            # returns after one read instead of three, and that read is shared with the
+            # mapping lookup below.
+            settings = await AppSettings.first()
+            if not await ebay_aspect_service.is_enabled(settings):
+                return []
             # Resolved, not trusted: an id that is not this type's is ignored in favour of
             # the default, so a hand-edited query string cannot render aspects for a
             # category the submit path will never send.
@@ -790,17 +806,13 @@ class ListingService:
             if not category_id:
                 return []
             candidates = await ebay_aspect_service.get_categories_for_type(product_type)
-            # One AppSettings read for both answers: whether eBay is enabled, and which
-            # mappings it collects.
-            settings = await AppSettings.first()
-            enabled = (settings.platforms if settings else None) or []
             ebay_settings = (
                 (settings.platform_settings if settings else None) or {}
             ).get("ebay") or {}
             aspects = await ebay_aspect_service.get_form_aspects_for_category(
                 product_type,
                 category_id,
-                mark_required="ebay" in enabled,
+                mark_required=True,
                 ebay_settings=ebay_settings,
             )
             return [

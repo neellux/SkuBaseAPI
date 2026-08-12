@@ -267,10 +267,14 @@ async def get_listing(listing_id: str = Query(..., description="Listing ID")):
 
     # Bundled with the listing rather than left to a follow-up call: the category decides
     # which schema to fetch, so a separate request would serialize in front of it.
+    #
+    # Empty while eBay is disabled, matching _get_ebay_form_aspects. The listing form is
+    # the only consumer and it renders no eBay section then, so computing candidates here
+    # would be two round trips per listing open for something nothing displays.
     product_type = (listing.data or {}).get("product_type")
     listing_dict["ebay_categories"] = (
         await ebay_aspect_service.get_categories_for_type(product_type)
-        if product_type
+        if product_type and await ebay_aspect_service.is_enabled()
         else []
     )
 
