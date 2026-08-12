@@ -53,6 +53,17 @@ GCS_ROOT = "https://storage.googleapis.com/lux_products"
 # Present on every product, from the AppScript's DEFAULT_TAGS.
 DEFAULT_TAGS: tuple[str, ...] = ("couponcollection", "channelenable-all", "shop375")
 
+# parent_products.company_code for EssxNYC, confirmed against SellerCloud's own /Companies
+# list on 2026-08-12 (249 = "EssxNYC"; 250 = "ShopEvergreene (1NVENTORY)", the store this
+# platform writes to, which is a different company entirely).
+#
+# The company code is the ONLY signal used. The "ESSX/" SKU prefix looks like it should
+# work and does not: across active parents, 5,883 of company 249 carry the prefix but 2,420
+# do not, and 544 prefixed SKUs sit under company 182. Either test alone mislabels
+# thousands of products.
+ESSX_COMPANY_CODE = 249
+ESSX_TAG = "ESSX SKU"
+
 # Wholesale Type -> category tag, transcribed from the AppScript's Tags sheet (col A/B).
 # The wholesale vocabulary is closed: exactly these five values across 232 of 233 types,
 # verified in production 2026-08-11.
@@ -205,6 +216,18 @@ class OneInventoryService:
             "item_weight_oz": float(weight) if weight is not None else None,
         }
 
+    async def _is_essx(self, parent_sku: str) -> bool:
+        """True when the parent belongs to EssxNYC, read from parent_products.company_code.
+
+        The products database, not SkuBase's own. Never inferred from the SKU string.
+        """
+        conn = connections.get("product_db")
+        rows = await conn.execute_query_dict(
+            "SELECT company_code FROM parent_products WHERE sku = $1 LIMIT 1",
+            [parent_sku],
+        )
+        return bool(rows) and rows[0]["company_code"] == ESSX_COMPANY_CODE
+
     async def _load_size_order(self, sizing_scheme: str | None) -> dict[str, int]:
         """size -> position, so the variant rail is not alphabetical.
 
@@ -246,8 +269,12 @@ class OneInventoryService:
 
     # -- assembly ----------------------------------------------------------
 
-    def build_tags(self, gender: str | None, wholesale: str | None) -> list[str]:
-        """Three constants plus the derived pair. An unresolved tag is OMITTED.
+    def build_tags(
+        self, gender: str | None, wholesale: str | None, is_essx: bool = False
+    ) -> list[str]:
+        """Three constants plus the derived pair, and ESSX SKU for EssxNYC parents.
+
+        An unresolved tag is OMITTED.
 
         Never raises. This inverts the STS behaviour, where an underivable gender skips
         the product entirely on the grounds that a half-tagged product lands in the wrong
@@ -260,6 +287,8 @@ class OneInventoryService:
         category = CATEGORY_TAGS.get(wholesale or "")
         if category:
             tags.append(category)
+        if is_essx:
+            tags.append(ESSX_TAG)
         return tags
 
     def build_variants(
@@ -412,7 +441,11 @@ class OneInventoryService:
             data.get("list_price"), weight_oz,
         )
 
-        tags = self.build_tags(taxonomy.get("gender"), taxonomy.get("wholesale"))
+        tags = self.build_tags(
+            taxonomy.get("gender"),
+            taxonomy.get("wholesale"),
+            is_essx=await self._is_essx(product_id),
+        )
 
         stage = "identity"
         client = await get_shopify_client(STORE)
