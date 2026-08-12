@@ -407,12 +407,26 @@ class ListingOptionsService:
         }
 
     async def check_unmapped_sizes(
-        self, sizing_scheme: str, sizes: list, platforms: list, sizing_type: str = None
+        self,
+        sizing_scheme: str,
+        sizes: list,
+        platforms: list,
+        sizing_type: str = None,
+        platform_settings: dict | None = None,
     ) -> list:
         conn = connections.get("default")
+        platform_settings = platform_settings or {}
         result = []
         for platform_id in platforms:
             if platform_id == "sellercloud":
+                continue
+            # Opt-out for platforms that take the raw child size rather than a mapped
+            # one. Defaults True so Grailed and SPO keep gating exactly as before; only a
+            # platform that explicitly sets it false is skipped. 1nventory sets it false:
+            # its Shopify size option IS the raw child size, so there is no size mapping
+            # to satisfy and without this every submit would 422 on unmapped_sizes.
+            settings = platform_settings.get(platform_id) or {}
+            if not settings.get("require_size_mapping", True):
                 continue
             mapped = await conn.execute_query_dict(
                 """

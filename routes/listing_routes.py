@@ -38,6 +38,7 @@ from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
 from services.product_info_service import ProductInfoService
 from services.product_resolver import SkuResolutionError, resolve_parent
+from services.oneinventory_service import oneinventory_service
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
 from tortoise import Tortoise
@@ -599,7 +600,11 @@ async def submit_listing(
                     sizing_type = type_result[0]["sizing_types"]
 
             unmapped = await listing_options_service.check_unmapped_sizes(
-                sizing_scheme, child_sizes, size_platforms, sizing_type
+                sizing_scheme,
+                child_sizes,
+                size_platforms,
+                sizing_type,
+                platform_settings=platform_settings,
             )
             if unmapped:
                 raise HTTPException(
@@ -826,6 +831,25 @@ async def _run_submissions_background(
                     submission_id, "failed", stage="submit", reason=str(e)[:300]
                 )
 
+    async def _submit_to_1inventory(submission_id: int):
+        # Deliberately thin. The submission-row handling lives in the service so this and
+        # submission_poller._submit_to_platform produce identical rows; see
+        # oneinventory_service.run_submission for why that matters.
+        submission = await ListingSubmission.get(id=submission_id)
+        listing_model = await Listing.get_or_none(id=listing_id)
+        if not listing_model:
+            submission.status = "failed"
+            submission.error = "Listing not found"
+            submission.error_display = "Failed to submit"
+            await submission.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
+            await record_step(
+                submission_id, "failed", stage="submit", reason="listing not found"
+            )
+            return
+        await oneinventory_service.run_submission(submission, listing_model)
+
     settings = await AppSettings.first()
     platform_settings = (
         settings.platform_settings if settings and settings.platform_settings else {}
@@ -840,6 +864,8 @@ async def _run_submissions_background(
             submission_tasks.append(_submit_to_sellercloud(sid))
         elif platform_id == "grailed":
             submission_tasks.append(_submit_to_grailed(sid))
+        elif platform_id == "1nventory":
+            submission_tasks.append(_submit_to_1inventory(sid))
 
     if submission_tasks:
         await asyncio.gather(*submission_tasks, return_exceptions=True)

@@ -12,6 +12,7 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services.base_poller import BasePoller
+from services.oneinventory_service import oneinventory_service
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
 from tortoise.transactions import in_transaction
@@ -155,6 +156,16 @@ class SubmissionPoller(BasePoller):
                 submission.status = SubmissionStatus.SUCCESS
                 await submission.save(update_fields=["status", "updated_at"])
                 await record_step(submission.id, "listed")
+            elif submission.platform_id == "1nventory":
+                # This is the PRIMARY path for 1inventory, not a fallback. Its
+                # requires_images setting parks the row QUEUED until photo_upload_poller
+                # flips upload_status to 'uploaded', which is the normal flow for a
+                # freshly photographed listing. Without this branch the `else` below
+                # would fail every one of them as "Unknown platform".
+                #
+                # run_submission owns the status/step/external_id writes, so a row from
+                # here is indistinguishable from one submitted inline by listing_routes.
+                await oneinventory_service.run_submission(submission, listing)
             elif submission.platform_id in ("grailed", "spo", "ebay"):
                 # manual_fallback batch platforms handled by their own pollers
                 # (grailed_poller / spo_poller); nothing to do per-listing.

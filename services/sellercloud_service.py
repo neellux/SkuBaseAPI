@@ -728,6 +728,87 @@ class SellerCloudService:
             return {"success": True}
         return orjson.loads(response.content)
 
+    async def get_children_pricing(
+        self, child_skus: List[str]
+    ) -> Dict[str, Dict[str, Any]]:
+        """SitePrice / SiteCost / ListPrice per child, straight off /Catalog.
+
+        Safe to read while a SellerCloud submit is in flight for the same listing.
+        Children are created by product_service during product and child creation, not by
+        submit (create_product is called only from product_service), so these records
+        already exist and a parallel read cannot lose a race. The one price field submit
+        rewrites is ListPrice, which is why the caller takes compare-at from the form
+        rather than from here.
+
+        A SKU missing from SellerCloud is returned as an empty dict rather than omitted,
+        so the caller can tell "not found" from "not asked for".
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        for sku in child_skus:
+            item = await self.get_catalog_item(sku, only_required_fields=False)
+            if not item:
+                out[sku] = {}
+                continue
+            out[sku] = {
+                "SitePrice": item.get("SitePrice"),
+                "SiteCost": item.get("SiteCost"),
+                "ListPrice": item.get("ListPrice"),
+            }
+        return out
+
+    async def set_website_ids(
+        self,
+        child_sku: str,
+        website_product_id: str,
+        website_variant_id: str,
+        website_price: Any,
+    ) -> Dict[str, Any]:
+        """Push the Shopify product id, variant id and price onto a SellerCloud child.
+
+        This is what the AppScript does through a bulk catalog import a full cycle later
+        (getImportSkus.js selects variants present in Shopify but absent from the
+        SellerCloud export, which cannot be true until after a human has imported them).
+        Doing it here means the ids land inside the submit.
+
+        Three things about this endpoint were learned the hard way on 2026-08-11:
+
+        1. It MUST be /Catalog/AdvancedInfo. /Catalog/BasicInfo returns HTTP 200 and
+           silently discards these fields - its model accepts fifteen named properties and
+           none of them is a website field. A 200 from this API is not evidence of a write.
+        2. The body MUST be the {"ProductID", "Fields": [{"Name", "Value"}]} shape. A flat
+           object is a bare 500, not a validation error.
+        3. WebSitePrice carries a capital S on the WRITE side. The read side spells the
+           same value WebsitePrice.
+
+        No read-back is needed: the response self-reports each field's transition, and an
+        unknown field name comes back UpdatedSucessfully=false. That key really is missing
+        a 'c' on SellerCloud's side.
+        """
+        payload = {
+            "ProductID": child_sku,
+            "Fields": [
+                {"Name": "WebsiteProductID", "Value": str(website_product_id)},
+                {"Name": "WebsiteProductIDVariantID", "Value": str(website_variant_id)},
+                {"Name": "WebSitePrice", "Value": str(website_price)},
+            ],
+        }
+        response = await self._make_request(
+            "PUT", "/Catalog/AdvancedInfo", data=payload
+        )
+        body = orjson.loads(response.content) if response.content else {}
+        return {
+            "ok": bool(body.get("UpdatedSucessfully")),
+            "error": body.get("ErrorMessage") or "",
+            "fields": {
+                f.get("Name"): {
+                    "from": f.get("OriginalValue"),
+                    "to": f.get("NewValue"),
+                    "error": f.get("ErrorMessage") or "",
+                }
+                for f in body.get("Fields", [])
+            },
+        }
+
     async def get_product_fields(self) -> List[Dict[str, Any]]:
         try:
             data = await self.get(

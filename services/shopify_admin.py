@@ -649,6 +649,218 @@ class ShopifyAdmin:
                     )
         return results
 
+    # -- listing creation (the 1nventory submission platform) --------------
+    #
+    # These serve services/onenventory_service.py, which creates products from a SkuBase
+    # listing. Everything above this line belongs to the consignment pipeline and edits
+    # products someone else created; this section is the only place that creates one.
+    #
+    # Three details below are not guesses. They were established by introspection and live
+    # runs against api_version 2026-01 and each one silently breaks the flow if changed:
+    #
+    #   - Publishable exposes availablePublicationsCount and resourcePublicationsCount,
+    #     both PLURAL. The singular spellings are rejected BEFORE execution, so a create
+    #     succeeds and the publish never runs, leaving an ACTIVE but invisible product.
+    #   - productCreate does not accept variants. They go through
+    #     productVariantsBulkCreate with REMOVE_STANDALONE_VARIANT, which drops the
+    #     default variant Shopify auto-creates.
+    #   - productCreate sets status but does NOT put the product on a sales channel.
+    #     Without publish_to_online_store the product exists, is active, and no shopper
+    #     can see it.
+
+    async def find_product_by_variant_sku(
+        self, skus: Sequence[str]
+    ) -> dict[str, Any] | None:
+        """First product owning any of these variant SKUs, or None.
+
+        The identity check before a create. Deliberately NOT by handle: the AppScript's
+        handle is built from a CUT title (brand stripped, trimmed at " size" and "$", run
+        through a find-and-replace sheet), so a handle rebuilt from SkuBase form data
+        misses the ~14,400 products already on the store and duplicates every one of them.
+        A variant SKU is exact and survives retitling.
+        """
+        for sku in skus:
+            data = await self.client.execute(
+                """
+                query($q: String!) {
+                  products(first: 5, query: $q) {
+                    nodes {
+                      id handle title status
+                      variants(first: 100) { nodes { id sku } }
+                    }
+                  }
+                }
+                """,
+                {"q": f"sku:{escape_query_value(sku)}"},
+                operation=f"product.findBySku[{self.store_id}]",
+            )
+            nodes = (data.get("products") or {}).get("nodes") or []
+            if nodes:
+                return nodes[0]
+        return None
+
+    async def create_product(
+        self, product: Mapping[str, Any], media: Sequence[Mapping[str, Any]] = ()
+    ) -> dict[str, Any]:
+        """productCreate. Returns the created product node.
+
+        `product` carries tags on CREATE only, which is safe: there is nothing to
+        destroy on a product that did not exist a moment ago. Never pass tags to
+        productUpdate - see the prohibition at the top of this module.
+        """
+        data = await self.client.execute(
+            """
+            mutation($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
+              productCreate(product: $product, media: $media) {
+                product { id handle title status }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"product": dict(product), "media": [dict(m) for m in media]},
+            operation=f"productCreate[{self.store_id}]",
+            mutation_name="productCreate",
+            is_write=True,
+        )
+        return (data.get("productCreate") or {}).get("product") or {}
+
+    async def create_variants(
+        self, product_gid: str, variants: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """productVariantsBulkCreate. REMOVE_STANDALONE_VARIANT drops Shopify's default.
+
+        Used for the initial variant set and, on an additive update, for sizes that are
+        missing. It never removes a variant: one holding live stock must survive a
+        resubmit whose listing no longer lists that size.
+        """
+        if not variants:
+            return []
+        data = await self.client.execute(
+            """
+            mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+              productVariantsBulkCreate(productId: $productId, variants: $variants,
+                                        strategy: REMOVE_STANDALONE_VARIANT) {
+                productVariants { id sku price compareAtPrice }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"productId": product_gid, "variants": [dict(v) for v in variants]},
+            operation=f"productVariantsBulkCreate[{self.store_id}]",
+            mutation_name="productVariantsBulkCreate",
+            is_write=True,
+        )
+        return (data.get("productVariantsBulkCreate") or {}).get("productVariants") or []
+
+    async def update_variants(
+        self, product_gid: str, variants: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """productVariantsBulkUpdate for variants that already exist.
+
+        Callers pass inventoryItem fields (cost, weight, requiresShipping). Inventory
+        QUANTITY is never among them: the app holds no write_inventory scope, so an
+        attempt would fail at the credential rather than silently zero live stock.
+        """
+        if not variants:
+            return []
+        data = await self.client.execute(
+            """
+            mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+              productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                productVariants {
+                  id sku
+                  inventoryItem { measurement { weight { value unit } } }
+                }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"productId": product_gid, "variants": [dict(v) for v in variants]},
+            operation=f"productVariantsBulkUpdate[{self.store_id}]",
+            mutation_name="productVariantsBulkUpdate",
+            is_write=True,
+        )
+        return (data.get("productVariantsBulkUpdate") or {}).get("productVariants") or []
+
+    async def update_product_details(
+        self, gid: str, fields: Mapping[str, Any]
+    ) -> None:
+        """productUpdate for descriptive fields on an existing product.
+
+        `fields` is filtered against an allowlist rather than trusted, because
+        productUpdate accepts `tags` and that field is replace-mode. Measured against 250
+        live products, a replace would destroy tags on 78% of them. Here the specific
+        casualty would be SHOPTHESAMPLE: strip it mid-flight and the consignment pipeline
+        deletes the product from Shop The Sample. Tags go through add_tags only.
+        """
+        allowed = {"title", "descriptionHtml", "vendor", "productType", "category",
+                   "handle", "status"}
+        rejected = set(fields) - allowed
+        if rejected:
+            raise ValueError(
+                f"update_product_details refuses {sorted(rejected)}; "
+                "tags are replace-mode and must go through add_tags"
+            )
+        payload = {k: v for k, v in fields.items() if v not in (None, "")}
+        if not payload:
+            return
+        await self.client.execute(
+            """
+            mutation($product: ProductUpdateInput!) {
+              productUpdate(product: $product) {
+                product { id }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"product": {"id": gid, **payload}},
+            operation=f"productUpdate.details[{self.store_id}]",
+            mutation_name="productUpdate",
+            is_write=True,
+        )
+
+    async def publish_to_online_store(self, gid: str) -> tuple[int, int]:
+        """publishablePublish onto the Online Store publication.
+
+        Returns (on, available). productCreate leaves a product on NO sales channel, so
+        without this it is active and invisible. Resolved by name rather than hardcoding
+        the id, so it survives a store reconfiguration.
+        """
+        data = await self.client.execute(
+            "query { publications(first: 50) { nodes { id name } } }",
+            {},
+            operation=f"publications[{self.store_id}]",
+        )
+        nodes = (data.get("publications") or {}).get("nodes") or []
+        online = next((p for p in nodes if p["name"] == "Online Store"), None)
+        if not online:
+            logger.warning("%s: no 'Online Store' publication; product left unpublished",
+                           self.store_id)
+            return (0, len(nodes))
+
+        data = await self.client.execute(
+            """
+            mutation($id: ID!, $input: [PublicationInput!]!) {
+              publishablePublish(id: $id, input: $input) {
+                publishable {
+                  availablePublicationsCount { count }
+                  resourcePublicationsCount { count }
+                }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"id": gid, "input": [{"publicationId": online["id"]}]},
+            operation=f"publishablePublish[{self.store_id}]",
+            mutation_name="publishablePublish",
+            is_write=True,
+        )
+        state = (data.get("publishablePublish") or {}).get("publishable") or {}
+        return (
+            (state.get("resourcePublicationsCount") or {}).get("count", 0),
+            (state.get("availablePublicationsCount") or {}).get("count", 0),
+        )
+
     # -- delete (BLOCKED on Phase 5; irreversible) -------------------------
 
     async def delete_product(self, gid: str) -> bool:
