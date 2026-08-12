@@ -76,6 +76,35 @@ class DatabaseService:
         return f"{DatabaseService.TABLE_PREFIX}{name}"
 
     @staticmethod
+    def _inherit_platform_meta_sql(
+        quoted_table: str, platform_ref: str, value_ref: str
+    ) -> str:
+        """SQL expression for the platform_meta a newly inserted row should carry.
+
+        platform_meta describes the platform VALUE, not the mapping. Every row holding the
+        path "Collectibles > Tobacciana > Lighters > Other Collectible Lighters" carries
+        {"category_id": "595"} whichever Lux type it is linked to, so a new row takes it
+        from any sibling row for the same (platform_id, platform_value) instead of having
+        it threaded down from the API. Callers stay unchanged and rows written before this
+        existed heal the next time the value is touched.
+
+        eBay's loader writes one vocabulary row per category path and nothing removes that
+        row while a mapping for the same path exists, so the sibling is reliably there. The
+        seven other platforms never set platform_meta, so for them this is always NULL,
+        which is what they already store.
+
+        Only safe where no DELETE for the same platform_value runs first.
+        sync_default_list_internal_values deletes before it re-inserts, so it reads the
+        value into a parameter beforehand rather than using this.
+        """
+        return (
+            f"(SELECT meta_source.platform_meta FROM {quoted_table} meta_source "
+            f"WHERE meta_source.platform_id = {platform_ref} "
+            f"AND meta_source.platform_value = {value_ref} "
+            f"AND meta_source.platform_meta IS NOT NULL LIMIT 1)"
+        )
+
+    @staticmethod
     def get_sql_type(column_type: str) -> str:
         type_mapping = {
             "text": "TEXT",
@@ -1522,8 +1551,9 @@ class DatabaseService:
 
             sql = f"""
                 INSERT INTO {quoted_mapping_table_name}
-                (primary_id, platform_value, platform_id, primary_table_column)
-                VALUES ($1, $2, $3, $4)
+                (primary_id, platform_value, platform_id, primary_table_column, platform_meta)
+                VALUES ($1, $2, $3, $4,
+                        {DatabaseService._inherit_platform_meta_sql(quoted_mapping_table_name, "$3", "$2")})
                 RETURNING id
             """
 
@@ -1785,7 +1815,11 @@ class DatabaseService:
                 valid_platform_ids = {str(p["id"]) for p in valid_platforms_result}
 
             if list_type == "default":
-                columns = "(primary_id, platform_value, platform_id, primary_table_column)"
+                columns = (
+                    "(primary_id, platform_value, platform_id, primary_table_column, platform_meta)"
+                )
+                # Bound parameters per row. platform_meta is an expression, not a parameter,
+                # so it is deliberately not counted here.
                 num_columns = 4
             elif list_type == "sizing":
                 columns = "(sizing_scheme, platform_value, platform, value)"
@@ -1871,8 +1905,16 @@ class DatabaseService:
                 value_placeholders = []
                 param_idx = 1
                 for _ in range(num_rows):
-                    placeholders = f"({', '.join([f'${i}' for i in range(param_idx, param_idx + num_columns)])})"
-                    value_placeholders.append(placeholders)
+                    row_refs = [f"${i}" for i in range(param_idx, param_idx + num_columns)]
+                    if list_type == "default":
+                        # row_refs is (primary_id, platform_value, platform_id,
+                        # primary_table_column), so [2] is the platform and [1] the value.
+                        row_refs.append(
+                            DatabaseService._inherit_platform_meta_sql(
+                                quoted_mapping_table_name, row_refs[2], row_refs[1]
+                            )
+                        )
+                    value_placeholders.append(f"({', '.join(row_refs)})")
                     param_idx += num_columns
 
                 sql = f"""
@@ -2095,9 +2137,16 @@ class DatabaseService:
 
             if existing_entry_list:
                 existing_entry_id = existing_entry_list[0]["id"]
+                # This branch relinks the vocabulary row itself, which already carries the
+                # right platform_meta. The COALESCE is only there to heal a row created
+                # before the inserts below carried it; a bare column name in SET reads the
+                # row's existing value, so a populated one is never overwritten.
                 update_sql = f"""
                     UPDATE {quoted_mapping_table_name}
-                    SET primary_id = $1, primary_table_column = $2, updated_at = NOW()
+                    SET primary_id = $1, primary_table_column = $2, updated_at = NOW(),
+                        platform_meta = COALESCE(
+                            platform_meta,
+                            {DatabaseService._inherit_platform_meta_sql(quoted_mapping_table_name, "$4", "$5")})
                     WHERE id = $3
                 """
                 await Tortoise.get_connection("default").execute_query(
@@ -2106,6 +2155,8 @@ class DatabaseService:
                         record_id_from_main_table,
                         primary_business_column_name,
                         existing_entry_id,
+                        platform_id,
+                        platform_value,
                     ],
                 )
                 logger.info(
@@ -2115,8 +2166,11 @@ class DatabaseService:
             else:
                 insert_sql = f"""
                     INSERT INTO {quoted_mapping_table_name}
-                    (primary_id, platform_value, platform_id, primary_table_column, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, NOW(), NOW())
+                    (primary_id, platform_value, platform_id, primary_table_column, platform_meta,
+                     created_at, updated_at)
+                    VALUES ($1, $2, $3, $4,
+                            {DatabaseService._inherit_platform_meta_sql(quoted_mapping_table_name, "$3", "$2")},
+                            NOW(), NOW())
                     RETURNING id
                 """
                 params_insert = [
@@ -2326,24 +2380,35 @@ class DatabaseService:
                 if inserts_to_perform:
                     insert_sql_start = f"""
                         INSERT INTO {quoted_mapping_table_name}
-                        (primary_id, platform_value, platform_id, primary_table_column, created_at, updated_at)
+                        (primary_id, platform_value, platform_id, primary_table_column, platform_meta,
+                         created_at, updated_at)
                         VALUES """
 
                     value_placeholders = []
                     insert_params = []
                     param_idx = 1
                     for pk_id, p_val, p_id, pbc_name in inserts_to_perform:
-                        placeholders = f"(${param_idx}, ${param_idx + 1}, ${param_idx + 2}, ${param_idx + 3}, NOW(), NOW())"
+                        inherited_meta = DatabaseService._inherit_platform_meta_sql(
+                            quoted_mapping_table_name, f"${param_idx + 2}", f"${param_idx + 1}"
+                        )
+                        placeholders = (
+                            f"(${param_idx}, ${param_idx + 1}, ${param_idx + 2}, ${param_idx + 3}, "
+                            f"{inherited_meta}, NOW(), NOW())"
+                        )
                         value_placeholders.append(placeholders)
                         insert_params.extend([pk_id, p_val, p_id, pbc_name])
                         param_idx += 4
 
                     if value_placeholders:
+                        # On conflict the row's platform_value is being replaced, so its
+                        # meta has to follow the new value. COALESCE would keep the meta of
+                        # the value that just went away.
                         full_insert_sql = (
                             insert_sql_start
                             + ", ".join(value_placeholders)
                             + " ON CONFLICT (primary_id, platform_id, primary_table_column) DO UPDATE SET "
-                            "platform_value = EXCLUDED.platform_value, updated_at = NOW()"
+                            "platform_value = EXCLUDED.platform_value, "
+                            "platform_meta = EXCLUDED.platform_meta, updated_at = NOW()"
                         )
                         await conn.execute_query(full_insert_sql, insert_params)
                         inserted_count = len(inserts_to_perform)
@@ -2423,6 +2488,20 @@ class DatabaseService:
                 "Edit the existing entry to change its mappings."
             )
 
+        # platform_meta belongs to the platform VALUE, not to any one mapping, so it has to
+        # survive the delete-then-reinsert this function performs when a value loses its
+        # last mapping. Read it once here, while every row still exists, and pass it back
+        # into each INSERT below. The subquery form used elsewhere cannot be used in this
+        # function: by the time some of those inserts run there is no sibling row left to
+        # read it from. Comes back as a JSON string, so every use casts to ::jsonb.
+        meta_rows = await conn.execute_query_dict(
+            f"SELECT platform_meta FROM {quoted_mapping_table} "
+            f"WHERE platform_id = $1 AND platform_value = $2 AND platform_meta IS NOT NULL "
+            f"LIMIT 1",
+            [platform_id, platform_value],
+        )
+        value_meta = meta_rows[0]["platform_meta"] if meta_rows else None
+
         if is_sizes:
             pids_new = set(internal_values) if internal_values else set()
             # Sizes rows always use the literal 'size' as primary_table_column and
@@ -2464,6 +2543,19 @@ class DatabaseService:
             old_pv_records = await conn.execute_query_dict(sql_find_old_pvs, find_params)
             old_pvs_affected = {r["platform_value"] for r in old_pv_records}
 
+            # Same reason as value_meta above, for the OTHER values this force is about to
+            # take rows away from. Read before the DELETE, used by the vocabulary
+            # re-inserts after it.
+            old_meta_records = await conn.execute_query_dict(
+                f"SELECT DISTINCT ON (platform_value) platform_value, platform_meta "
+                f"FROM {quoted_mapping_table} "
+                f"WHERE platform_id = $1 AND platform_value = ANY($2) "
+                f"AND platform_meta IS NOT NULL "
+                f"ORDER BY platform_value",
+                [platform_id, list(old_pvs_affected)],
+            )
+            old_metas = {r["platform_value"]: r["platform_meta"] for r in old_meta_records}
+
             delete_placeholders = ", ".join([f"${i + 2}" for i in range(len(pids_list))])
             del_where = f"platform_id = $1 AND primary_id IN ({delete_placeholders})"
             del_params = [platform_id] + pids_list
@@ -2482,19 +2574,27 @@ class DatabaseService:
                 if not has_any_row:
                     if is_sizes:
                         sql_insert_null = f"""
-                            INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, sizing_type)
-                            VALUES (NULL, $1, $2, $3, $4)
+                            INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, sizing_type, platform_meta)
+                            VALUES (NULL, $1, $2, $3, $4, $5::jsonb)
                         """
                         await conn.execute_query(
-                            sql_insert_null, [pv_old, platform_id, primary_col, sizing_type]
+                            sql_insert_null,
+                            [
+                                pv_old,
+                                platform_id,
+                                primary_col,
+                                sizing_type,
+                                old_metas.get(pv_old),
+                            ],
                         )
                     else:
                         sql_insert_null = f"""
-                            INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column)
-                            VALUES (NULL, $1, $2, $3)
+                            INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, platform_meta)
+                            VALUES (NULL, $1, $2, $3, $4::jsonb)
                         """
                         await conn.execute_query(
-                            sql_insert_null, [pv_old, platform_id, primary_col]
+                            sql_insert_null,
+                            [pv_old, platform_id, primary_col, old_metas.get(pv_old)],
                         )
 
         if is_sizes:
@@ -2536,24 +2636,26 @@ class DatabaseService:
             num_rows = len(pids_to_add)
             insert_params = []
             if is_sizes:
-                cols = "(primary_id, platform_value, platform_id, primary_table_column, sizing_type)"
+                cols = "(primary_id, platform_value, platform_id, primary_table_column, sizing_type, platform_meta)"
                 for pid in pids_to_add:
                     insert_params.extend(
-                        [pid, platform_value, platform_id, primary_col, sizing_type]
+                        [pid, platform_value, platform_id, primary_col, sizing_type, value_meta]
                     )
                 placeholders = ", ".join(
                     [
-                        f"(${(i * 5) + 1}, ${(i * 5) + 2}, ${(i * 5) + 3}, ${(i * 5) + 4}, ${(i * 5) + 5})"
+                        f"(${(i * 6) + 1}, ${(i * 6) + 2}, ${(i * 6) + 3}, ${(i * 6) + 4}, ${(i * 6) + 5}, ${(i * 6) + 6}::jsonb)"
                         for i in range(num_rows)
                     ]
                 )
             else:
-                cols = "(primary_id, platform_value, platform_id, primary_table_column)"
+                cols = "(primary_id, platform_value, platform_id, primary_table_column, platform_meta)"
                 for pid in pids_to_add:
-                    insert_params.extend([pid, platform_value, platform_id, primary_col])
+                    insert_params.extend(
+                        [pid, platform_value, platform_id, primary_col, value_meta]
+                    )
                 placeholders = ", ".join(
                     [
-                        f"(${(i * 4) + 1}, ${(i * 4) + 2}, ${(i * 4) + 3}, ${(i * 4) + 4})"
+                        f"(${(i * 5) + 1}, ${(i * 5) + 2}, ${(i * 5) + 3}, ${(i * 5) + 4}, ${(i * 5) + 5}::jsonb)"
                         for i in range(num_rows)
                     ]
                 )
@@ -2570,11 +2672,12 @@ class DatabaseService:
                 )
                 if not has_any:
                     sql_insert_null = f"""
-                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, sizing_type)
-                        VALUES (NULL, $1, $2, $3, $4)
+                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, sizing_type, platform_meta)
+                        VALUES (NULL, $1, $2, $3, $4, $5::jsonb)
                     """
                     await conn.execute_query(
-                        sql_insert_null, [platform_value, platform_id, primary_col, sizing_type]
+                        sql_insert_null,
+                        [platform_value, platform_id, primary_col, sizing_type, value_meta],
                     )
                     added_count += 1
             else:
@@ -2586,12 +2689,15 @@ class DatabaseService:
                     sql_delete_all = f"DELETE FROM {quoted_mapping_table} WHERE platform_id = $1 AND platform_value = $2"
                     await conn.execute_query(sql_delete_all, [platform_id, platform_value])
 
+                    # value_meta was read at the top of this function precisely because the
+                    # DELETE above has just removed every row it could have come from.
                     sql_insert_null = f"""
-                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column)
-                        VALUES (NULL, $1, $2, $3)
+                        INSERT INTO {quoted_mapping_table} (primary_id, platform_value, platform_id, primary_table_column, platform_meta)
+                        VALUES (NULL, $1, $2, $3, $4::jsonb)
                     """
                     await conn.execute_query(
-                        sql_insert_null, [platform_value, platform_id, primary_col]
+                        sql_insert_null,
+                        [platform_value, platform_id, primary_col, value_meta],
                     )
                     added_count += 1
 
