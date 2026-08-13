@@ -3,7 +3,7 @@ import orjson
 import logging
 from typing import List
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 
 from services.image_service import image_service
 
@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/products/images", tags=["product-images"])
 
 MAX_FILE_SIZE = 30 * 1024 * 1024
+
+# Washtags are an internal photo-studio artifact rather than catalog imagery.
+# The image gallery manages them and asks for them explicitly; every other
+# caller (the Manage Products strip) only gets them when the requesting user
+# holds this role.
+DEV_ROLE = "lux_skubase_dev"
 
 
 def _parse_json(data: str, field: str):
@@ -22,9 +28,15 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 @router.get("")
-async def get_product_images(product_id: str = Query(..., min_length=1)):
+async def get_product_images(
+    request: Request,
+    product_id: str = Query(..., min_length=1),
+    include_washtags: bool = Query(False),
+):
     try:
         result = await image_service.get_product_images(product_id)
+        if not include_washtags and DEV_ROLE not in request.state.user.get("roles", []):
+            result = {**result, "washtags": [], "washtag_count": 0}
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
