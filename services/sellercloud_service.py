@@ -743,17 +743,43 @@ class SellerCloudService:
         A SKU missing from SellerCloud is returned as an empty dict rather than omitted,
         so the caller can tell "not found" from "not asked for".
         """
-        out: Dict[str, Dict[str, Any]] = {}
+        out: Dict[str, Dict[str, Any]] = {sku: {} for sku in child_skus}
+        if not child_skus:
+            return out
+
+        # ONE search on the parent, not one per child. _search_catalog is a keyword search,
+        # and a parent SKU keyword returns every child under it: measured 6 children in 3.0s
+        # against 6 separate searches costing ~18s. That was the single biggest cost in a
+        # bulk listing run.
+        #
+        # The per-child fallback below still exists because the keyword search is not a
+        # guarantee: a child whose SKU does not contain the parent string (a reassigned or
+        # hand-edited SKU) will not come back, and silently pricing it at nothing would
+        # create a product at 0.
+        parent = child_skus[0].rsplit("/", 1)[0] if "/" in child_skus[0] else child_skus[0]
+        wanted = {s.lower(): s for s in child_skus}
+        try:
+            for item in await self._search_catalog(parent):
+                sku = wanted.get((item.get("ID") or "").lower())
+                if sku:
+                    out[sku] = {
+                        "SitePrice": item.get("SitePrice"),
+                        "SiteCost": item.get("SiteCost"),
+                        "ListPrice": item.get("ListPrice"),
+                    }
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Parent-keyword price search failed for {parent}: {e}")
+
         for sku in child_skus:
-            item = await self.get_catalog_item(sku, only_required_fields=False)
-            if not item:
-                out[sku] = {}
+            if out[sku]:
                 continue
-            out[sku] = {
-                "SitePrice": item.get("SitePrice"),
-                "SiteCost": item.get("SiteCost"),
-                "ListPrice": item.get("ListPrice"),
-            }
+            item = await self.get_catalog_item(sku, only_required_fields=False)
+            if item:
+                out[sku] = {
+                    "SitePrice": item.get("SitePrice"),
+                    "SiteCost": item.get("SiteCost"),
+                    "ListPrice": item.get("ListPrice"),
+                }
         return out
 
     async def set_website_ids(

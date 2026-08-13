@@ -32,6 +32,7 @@ minutes. Everything above is what keeps the two writers from fighting.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Mapping, Sequence
 
@@ -256,20 +257,27 @@ class OneInventoryService:
         rather than filtered afterwards. _fullsize is tried first because that is the
         variant the existing 1nventory catalog uses.
         """
-        found: list[str] = []
-        async with httpx.AsyncClient(timeout=15) as client:
-            for index in range(1, limit + 1):
+        # All slots probed CONCURRENTLY. Serially this was up to 16 round trips of pure
+        # latency per product (8 slots x 2 suffixes) and the largest single cost in the
+        # bulk path after the SellerCloud reads.
+        #
+        # The trade is that a serial loop could stop at the first gap, while this probes
+        # every slot. That is the safer behaviour anyway: it finds image 5 when image 4 is
+        # missing, where the serial version stopped and shipped a product with three
+        # photos.
+        async def probe(index: int) -> str | None:
+            async with httpx.AsyncClient(timeout=15) as client:
                 for suffix in ("fullsize", "1500"):
                     url = f"{GCS_ROOT}/{parent_sku}/{index}_{suffix}.jpg"
                     try:
                         if (await client.head(url)).status_code == 200:
-                            found.append(url)
-                            break
+                            return url
                     except httpx.HTTPError:
                         continue
-                else:
-                    break
-        return found
+            return None
+
+        results = await asyncio.gather(*(probe(i) for i in range(1, limit + 1)))
+        return [url for url in results if url]
 
     # -- assembly ----------------------------------------------------------
 
@@ -389,8 +397,16 @@ class OneInventoryService:
         listing_id: str,
         product_id: str,
         form_data: Mapping[str, Any],
+        set_category: bool = True,
     ) -> dict[str, Any]:
         """Create or additively update the product, publish it, and write ids back.
+
+        set_category=False omits Shopify's structured `category` entirely, for callers that
+        are deliberately deferring it. Used by the bulk backfill, which runs while almost no
+        product type has a 1nventory mapping yet: setting the field for the handful that do
+        and leaving it blank for the rest would make the catalog inconsistent in a way that
+        is harder to find later than simply not setting it at all. The submit path from the
+        UI always passes True, and `require_type_mapping` guarantees a value is there.
 
         Returns {product_gid, variant_gids, created, published, writeback}. Raises
         OneInventorySubmitError for anything an operator should read.
@@ -472,7 +488,9 @@ class OneInventoryService:
             # the 233 listing-options types carry that prefix.
             "productType": product_type or "",
             # Shopify's STRUCTURED category, a separate field from productType above.
-            "category": taxonomy.get("taxonomy_gid"),
+            # None is filtered out by both _create and update_product_details, so an
+            # omitted category leaves the field untouched rather than clearing it.
+            "category": taxonomy.get("taxonomy_gid") if set_category else None,
         }
 
         # EssxNYC products are handled differently on BOTH branches. An existing one is
@@ -521,10 +539,17 @@ class OneInventoryService:
         stage = "writeback"
         result["writeback"] = await self._write_back(result)
 
+        # Read the counts back off `result`, NOT from locals. The leave-alone branch never
+        # runs the publish, so `on`/`available` are unbound there and referencing them
+        # raised UnboundLocalError AFTER the product and the write-back had both already
+        # succeeded - a submission recorded as failed for work that was actually done.
+        published = result.get("published") or {}
         logger.info(
-            "1nventory: listing %s -> %s (created=%s, %d variants, published %d/%d)",
+            "1nventory: listing %s -> %s (created=%s, %s%d variants, published %s/%s)",
             listing_id, result["product_gid"], result["created"],
-            len(result["variant_gids"]), on, available,
+            f"{result['skipped']}, " if result.get("skipped") else "",
+            len(result["variant_gids"]),
+            published.get("on", "-"), published.get("available", "-"),
         )
         return result
 
@@ -645,7 +670,9 @@ class OneInventoryService:
 
     # -- the single entry point both dispatch paths use --------------------
 
-    async def run_submission(self, submission: Any, listing: Any) -> None:
+    async def run_submission(
+        self, submission: Any, listing: Any, *, set_category: bool = True
+    ) -> None:
         """Submit, then move the submission row. Never raises.
 
         THE reason this exists rather than living in the callers: there are two dispatch
@@ -670,6 +697,7 @@ class OneInventoryService:
                 listing_id=str(listing.id),
                 product_id=listing.product_id,
                 form_data=listing.data or {},
+                set_category=set_category,
             )
         except OneInventorySubmitError as exc:
             logger.error("1inventory submission failed at %s: %s", exc.stage, exc.detail)

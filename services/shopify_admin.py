@@ -679,25 +679,29 @@ class ShopifyAdmin:
         misses the ~14,400 products already on the store and duplicates every one of them.
         A variant SKU is exact and survives retitling.
         """
-        for sku in skus:
-            data = await self.client.execute(
-                """
-                query($q: String!) {
-                  products(first: 5, query: $q) {
-                    nodes {
-                      id handle title status
-                      variants(first: 100) { nodes { id sku } }
-                    }
-                  }
+        if not skus:
+            return None
+
+        # ONE query with an OR of every child SKU, not one per SKU. The loop version paid
+        # its maximum cost precisely when the answer was "not on Shopify" - it had to try
+        # every SKU to conclude nothing - which is the common case in a bulk backfill.
+        query = " OR ".join(f"sku:{escape_query_value(s)}" for s in skus)
+        data = await self.client.execute(
+            """
+            query($q: String!) {
+              products(first: 5, query: $q) {
+                nodes {
+                  id handle title status
+                  variants(first: 100) { nodes { id sku } }
                 }
-                """,
-                {"q": f"sku:{escape_query_value(sku)}"},
-                operation=f"product.findBySku[{self.store_id}]",
-            )
-            nodes = (data.get("products") or {}).get("nodes") or []
-            if nodes:
-                return nodes[0]
-        return None
+              }
+            }
+            """,
+            {"q": query},
+            operation=f"product.findBySku[{self.store_id}]",
+        )
+        nodes = (data.get("products") or {}).get("nodes") or []
+        return nodes[0] if nodes else None
 
     async def create_product(
         self, product: Mapping[str, Any], media: Sequence[Mapping[str, Any]] = ()
