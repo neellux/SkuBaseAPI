@@ -585,6 +585,20 @@ class InternalPlatformState(Model):
     source_product_gid = fields.TextField(null=True)
     dest_product_gid = fields.TextField(null=True)
 
+    # Storefront addressing, for the platform links on the product page.
+    #
+    # The handle builds the URL; `online` records whether Shopify actually serves it.
+    # They are separate because on the SOURCE store they disagree for most of the
+    # catalog: a sold-out product is unpublished from the Online Store channel, so its
+    # handle still exists but the page 404s. Measured 2026-08-13, 2,523 of 14,985 source
+    # products are online (16.8%) against 99% on the destination store.
+    #
+    # Stored rather than fetched per view, so the product page needs no Shopify call.
+    source_handle = fields.TextField(null=True)
+    source_online = fields.BooleanField(null=True)
+    dest_handle = fields.TextField(null=True)
+    dest_online = fields.BooleanField(null=True)
+
     current_status = fields.CharField(max_length=30, default="pending")
 
     inflight_action = fields.CharField(

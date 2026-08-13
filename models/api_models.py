@@ -849,6 +849,29 @@ class CountriesResponse(BaseModel):
     error: Optional[str] = None
 
 
+class PlatformLink(BaseModel):
+
+    platform_id: str = Field(..., description="listingoptions_platforms.id, for the icon")
+    name: str
+    url: str = Field(..., description="Storefront product URL")
+    online: bool = Field(
+        ...,
+        description=(
+            "False when the product is not currently served by that storefront, which on "
+            "1nventory means sold out and unpublished, so the URL returns 404. The link is "
+            "still returned; the UI marks it."
+        ),
+    )
+
+
+class PlatformLinksResponse(BaseModel):
+
+    success: bool
+    parent_sku: Optional[str] = None
+    links: List[PlatformLink] = []
+    error: Optional[str] = None
+
+
 class CreateSkuSize(BaseModel):
 
     size: str = Field(..., min_length=1, description="Size value")

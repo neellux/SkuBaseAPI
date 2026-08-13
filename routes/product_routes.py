@@ -3,6 +3,8 @@ from typing import Optional
 
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+from services.listing_options_service import listing_options_service
+from services.product_resolver import SkuResolutionError, resolve_parent
 from tortoise import Tortoise
 from models.db_models import Template
 from models.api_models import (
@@ -13,6 +15,8 @@ from models.api_models import (
     CostPriceResponse,
     CheckBrandMpnResponse,
     CountriesResponse,
+    PlatformLink,
+    PlatformLinksResponse,
     CreateSkuRequest,
     CreateSkuResponse,
     BulkAddSizesRequest,
@@ -467,6 +471,86 @@ async def get_product_details(sku: str = Query(..., description="Product SKU (pa
     except Exception as e:
         logger.error(f"Error getting product details: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# Storefront origins per store key. Not derivable from the store id: the source store is
+# `high-end-merchandise` on Shopify but serves as 1nventory.com, and the destination store
+# is `xuh30f-dr` serving shopthesample.com. Both confirmed live 2026-08-13 by reading
+# onlineStoreUrl off each store.
+STOREFRONT_ORIGINS = {
+    "high-end-merchandise": "https://1nventory.com",
+    "xuh30f-dr": "https://shopthesample.com",
+}
+
+
+@router.get("/platform_links", response_model=PlatformLinksResponse)
+async def get_product_platform_links(
+    sku: str = Query(..., description="Product SKU (parent or child)"),
+):
+    """Storefront links for the platforms this product is on.
+
+    Read from internal_platform_state, the mirror the consignment source poller refreshes
+    every five minutes, so a product listed in the last few minutes may not appear yet.
+
+    Separate from /products/details on purpose. That endpoint runs on the products
+    database while this reads the skubase one, and these links are supplementary: a slow
+    or failed lookup here must not delay or break the product page.
+    """
+    try:
+        try:
+            parent_sku = await resolve_parent(sku)
+        except SkuResolutionError:
+            return PlatformLinksResponse(success=True, parent_sku=None, links=[])
+
+        conn = Tortoise.get_connection("default")
+        rows = await conn.execute_query_dict(
+            """
+            SELECT s.current_status,
+                   s.source_handle, s.source_online,
+                   s.dest_handle,   s.dest_online,
+                   s.dest_product_gid,
+                   p.source_store,  p.dest_store
+              FROM internal_platform_state s
+              JOIN internal_platforms p ON p.id = s.internal_platform_id
+             WHERE s.parent_sku = $1
+             LIMIT 1
+            """,
+            [parent_sku],
+        )
+        if not rows:
+            return PlatformLinksResponse(success=True, parent_sku=parent_sku, links=[])
+
+        row = rows[0]
+        links = []
+
+        meta = await listing_options_service.get_platforms()
+        names = {p["id"]: p.get("name") or p["id"] for p in meta}
+
+        def add(platform_id: str, store_key: str, handle: str | None, online) -> None:
+            origin = STOREFRONT_ORIGINS.get(store_key)
+            if not handle or not origin:
+                return
+            links.append({
+                "platform_id": platform_id,
+                "name": names.get(platform_id, platform_id),
+                "url": f"{origin}/products/{handle}",
+                "online": bool(online),
+            })
+
+        add("1nventory", row["source_store"], row["source_handle"], row["source_online"])
+
+        # Shop The Sample only when the pipeline says the product is actually listed
+        # there. 44 rows carry a dest_product_gid whose product has since been deleted by
+        # the delist path, and current_status is what distinguishes them.
+        if row["current_status"] == "listed" and row["dest_product_gid"]:
+            add("shopthesample", row["dest_store"], row["dest_handle"], row["dest_online"])
+
+        return PlatformLinksResponse(success=True, parent_sku=parent_sku, links=links)
+
+    except Exception as e:
+        logger.error(f"Error getting platform links for {sku}: {e}", exc_info=True)
+        # Degrade to no links rather than failing: these are supplementary.
+        return PlatformLinksResponse(success=True, parent_sku=None, links=[])
 
 
 @router.get("/reassign/bulk/preview")

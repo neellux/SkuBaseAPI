@@ -685,6 +685,11 @@ class InternalPlatformSourcePoller:
                 source_compare_at=compare,
                 sts_price=pricing.price if pricing.ok else None,
                 variants=variant_rows,
+                # Free: both come off the product this scan already read, and both are
+                # scalars Shopify does not charge for (measured 2026-08-13, a 250-product
+                # page costs actualQueryCost 68 with and without them).
+                source_handle=product.handle,
+                source_online=product.online_store_url is not None,
             )
             existing = state_map.get(parent)
             if existing is None or want.differs_from(existing):

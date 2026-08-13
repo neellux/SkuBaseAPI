@@ -255,6 +255,37 @@ class InternalPlatformDestPoller(BasePoller):
             report.aborted = "no-registered-parents"
             return report
 
+        # Destination storefront addressing, refreshed for every owned product in ONE
+        # write, mirroring refresh_product_facts on the source side.
+        #
+        # Deliberately not threaded through the four places that set dest_product_gid
+        # (ledger.release, ledger.claim_dest_gid, the normalize path here). Those fire on
+        # different transitions, so a handle written by only some of them would be
+        # populated or stale depending on which path last touched the row. This runs every
+        # cycle over the products the scan actually returned, which is the only place that
+        # sees the current handle for all of them.
+        #
+        # Outside the execute gate: it corrects our own state, it writes nothing to
+        # Shopify, and the same reasoning already applies to refresh_product_facts.
+        # Gated on assess_ownership, the same four-way check _plan_product uses, not on
+        # bare parent resolution. A destination product that merely resolves to a
+        # registered parent is not necessarily ours; recording its handle against that
+        # parent would point the product page at Shop The Sample's own listing.
+        dest_facts: dict[str, tuple[str | None, bool]] = {}
+        for product in scanned_products:
+            own = assess_ownership(
+                product.variant_skus, product.tags,
+                platform.trigger_tag, product.syncio_source_gid,
+                registered, reassigned,
+            )
+            if own.ours and own.parent_sku:
+                dest_facts[own.parent_sku] = (
+                    product.handle, product.online_store_url is not None
+                )
+        if dest_facts:
+            n = await ledger.refresh_dest_facts(self.platform_id, dest_facts)
+            logger.info("%s: refreshed destination handles on %d row(s)", self.name, n)
+
         for product in scanned_products:
             self._plan_product(platform, product, state_map, taxonomy,
                                registered, reassigned, report)

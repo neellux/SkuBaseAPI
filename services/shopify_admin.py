@@ -145,6 +145,11 @@ class Product:
     variants: tuple[Variant, ...]
     syncio_source_gid: str | None
     image_url: str | None = None
+    handle: str | None = None
+    # None when the product is not live on the storefront (DRAFT, or unpublished from the
+    # Online Store channel). Callers should treat None as "not visible to shoppers" rather
+    # than "unknown".
+    online_store_url: str | None = None
 
     @property
     def total_inventory(self) -> int:
@@ -180,8 +185,17 @@ class Product:
 # enabled on the metafield DEFINITION, which Syncio owns, and a query filtering on a
 # non-filterable metafield SILENTLY RETURNS UNFILTERED RESULTS rather than erroring.
 # Here that would mean treating the entire catalog as matched.
+#
+# handle and onlineStoreUrl are both SCALARS, so unlike featuredImage they are free:
+# measured on the live store 2026-08-13, a 250-product page costs requestedQueryCost 255 /
+# actualQueryCost 68 with and without them. That matters because this fragment drives the
+# source scan's 58-page sweep every five minutes.
+#
+# onlineStoreUrl is null whenever the product is not live on the storefront, DRAFT
+# included. That null is the signal, not a gap: it is Shopify's own answer to "can a
+# shopper see this", which is exactly what the product-page links need.
 _PRODUCT_FIELDS = """
-      id title vendor productType status tags updatedAt
+      id handle onlineStoreUrl title vendor productType status tags updatedAt
       featuredImage { url }
       metafield(namespace: "syncio", key: "source_product_id") { value }
       variants(first: 100) {
@@ -240,6 +254,8 @@ def parse_product(node: Mapping[str, Any]) -> Product:
         variants=variants,
         syncio_source_gid=(node.get("metafield") or {}).get("value"),
         image_url=(node.get("featuredImage") or {}).get("url"),
+        handle=node.get("handle"),
+        online_store_url=node.get("onlineStoreUrl"),
     )
 
 

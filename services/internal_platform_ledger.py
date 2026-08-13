@@ -692,11 +692,22 @@ class ProductFacts:
     source_compare_at: Decimal | None
     sts_price: Decimal | None
     variants: tuple[dict, ...] = ()
+    # Storefront addressing. source_online is False for a sold-out product, which on this
+    # store means unpublished from the Online Store channel and therefore a 404.
+    source_handle: str | None = None
+    source_online: bool | None = None
 
     def differs_from(self, row: InternalPlatformState) -> bool:
-        """True when this row would actually change. Keeps steady-state writes near zero."""
+        """True when this row would actually change. Keeps steady-state writes near zero.
+
+        source_handle and source_online belong here, not just in the column list: without
+        them a product going out of stock would keep a stale source_online=True forever,
+        because nothing else about it changed enough to trigger a write.
+        """
         return (
             row.source_product_gid != self.source_gid
+            or row.source_handle != self.source_handle
+            or row.source_online != self.source_online
             or row.title != self.title
             or row.image_url != self.image_url
             or row.product_type != self.product_type
@@ -711,7 +722,8 @@ class ProductFacts:
 
 _FACT_COLUMNS = ("internal_platform_id", "parent_sku", "source_product_gid", "title",
                  "image_url", "product_type", "inventory", "variant_count",
-                 "source_price", "source_compare_at", "sts_price", "variants")
+                 "source_price", "source_compare_at", "sts_price", "variants",
+                 "source_handle", "source_online")
 
 
 async def refresh_product_facts(
@@ -748,7 +760,8 @@ async def refresh_product_facts(
             params.extend([platform_id, parent_sku, f.source_gid, f.title, f.image_url,
                            f.product_type, f.inventory, f.variant_count,
                            f.source_price, f.source_compare_at, f.sts_price,
-                           json.dumps([dict(v) for v in f.variants])])
+                           json.dumps([dict(v) for v in f.variants]),
+                           f.source_handle, f.source_online])
         await conn.execute_query(
             f"INSERT INTO internal_platform_state ({', '.join(_FACT_COLUMNS)}) "
             f"VALUES {', '.join(values)} "
@@ -763,8 +776,52 @@ async def refresh_product_facts(
             "  source_compare_at  = EXCLUDED.source_compare_at, "
             "  sts_price          = EXCLUDED.sts_price, "
             "  variants           = EXCLUDED.variants, "
+            "  source_handle      = EXCLUDED.source_handle, "
+            "  source_online      = EXCLUDED.source_online, "
             "  updated_at         = CURRENT_TIMESTAMP",
             params,
+        )
+        written += len(chunk)
+    return written
+
+
+async def refresh_dest_facts(
+    platform_id: str, facts: Mapping[str, tuple[str | None, bool]]
+) -> int:
+    """Store each owned destination product's handle and storefront availability.
+
+    `facts` is parent_sku -> (handle, online). The destination mirror of
+    refresh_product_facts, and separate from it for the same reason: these are
+    Shopify-derived observations, not pipeline decisions, so they are safe to write on
+    every cycle regardless of what status the row is in.
+
+    UPDATE, never INSERT. A row must already exist, created by the source scan, because a
+    destination product with no source row is by definition not ours and the ownership
+    check upstream has already excluded it. Inserting here would manufacture rows keyed on
+    a parent the source side has never seen.
+
+    Deliberately does NOT touch dest_product_gid. That column tracks the pipeline's claim
+    on a product and is owned by the listing and release paths; this only records where
+    the product currently lives on the storefront.
+    """
+    if not facts:
+        return 0
+    conn = connections.get("default")
+    items = list(facts.items())
+    written = 0
+    for i in range(0, len(items), 500):
+        chunk = items[i:i + 500]
+        await conn.execute_query(
+            "UPDATE internal_platform_state s"
+            "   SET dest_handle = v.handle,"
+            "       dest_online = v.online,"
+            "       updated_at  = now() "
+            "  FROM unnest($2::text[], $3::text[], $4::bool[]) AS v(sku, handle, online) "
+            " WHERE s.internal_platform_id = $1 AND s.parent_sku = v.sku"
+            "   AND (s.dest_handle IS DISTINCT FROM v.handle"
+            "        OR s.dest_online IS DISTINCT FROM v.online)",
+            [platform_id, [k for k, _ in chunk],
+             [h for _, (h, _) in chunk], [o for _, (_, o) in chunk]],
         )
         written += len(chunk)
     return written
