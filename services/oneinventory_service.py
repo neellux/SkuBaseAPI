@@ -89,6 +89,10 @@ GENDER_TAGS: Mapping[str, tuple[str, ...]] = {
 # Hardcoded rather than settings: a setting implies someone might reasonably change it.
 # published_scope is the exception and lives in platform_settings.
 PRODUCT_STATUS = "ACTIVE"
+# EssxNYC products are created for review rather than for sale. A DRAFT is invisible to
+# shoppers whatever its channel associations say, so this is the safe half of the ESSX
+# handling; the other half is that an ESSX product already on 1nventory is never touched.
+DRAFT_STATUS = "DRAFT"
 OPTION_NAME = "Size"
 INVENTORY_POLICY = "DENY"
 
@@ -441,10 +445,9 @@ class OneInventoryService:
             data.get("list_price"), weight_oz,
         )
 
+        is_essx = await self._is_essx(product_id)
         tags = self.build_tags(
-            taxonomy.get("gender"),
-            taxonomy.get("wholesale"),
-            is_essx=await self._is_essx(product_id),
+            taxonomy.get("gender"), taxonomy.get("wholesale"), is_essx=is_essx
         )
 
         stage = "identity"
@@ -472,7 +475,28 @@ class OneInventoryService:
             "category": taxonomy.get("taxonomy_gid"),
         }
 
-        if existing:
+        # EssxNYC products are handled differently on BOTH branches. An existing one is
+        # left exactly as it is, and a new one is created as a draft for a human to review
+        # before it can reach a shopper.
+        if existing and is_essx:
+            stage = "skip"
+            result = {
+                "product_gid": existing["id"],
+                "handle": existing.get("handle"),
+                "variant_gids": {
+                    n["sku"]: n["id"]
+                    for n in (existing.get("variants") or {}).get("nodes") or []
+                    if n.get("sku")
+                },
+                "variant_prices": {},
+                "created": False,
+                "skipped": "essx_exists",
+            }
+            logger.info(
+                "1inventory: %s is ESSX and already on 1nventory (%s); leaving it "
+                "untouched", product_id, existing["id"],
+            )
+        elif existing:
             stage = "update"
             result = await self._update(admin, existing, product_fields, tags, variants)
         else:
@@ -480,11 +504,19 @@ class OneInventoryService:
             result = await self._create(
                 admin, product_fields, tags, variants, size_values, images,
                 handle=build_handle(brand, title, product_id),
+                status=DRAFT_STATUS if is_essx else PRODUCT_STATUS,
             )
 
-        stage = "publish"
-        on, available = await admin.publish_to_online_store(result["product_gid"])
-        result["published"] = {"on": on, "available": available}
+        # Publishing an ESSX draft is deliberate, and matches what the Shopify admin does
+        # when a human creates a product: the channel association exists but a DRAFT is
+        # invisible to shoppers, so flipping it to ACTIVE later is one click rather than
+        # two. Skipped entirely on the leave-alone branch, where nothing may change.
+        if result.get("skipped"):
+            result["published"] = None
+        else:
+            stage = "publish"
+            on, available = await admin.publish_to_online_store(result["product_gid"])
+            result["published"] = {"on": on, "available": available}
 
         stage = "writeback"
         result["writeback"] = await self._write_back(result)
@@ -506,11 +538,12 @@ class OneInventoryService:
         images: Sequence[str],
         *,
         handle: str,
+        status: str = PRODUCT_STATUS,
     ) -> dict[str, Any]:
         product_input = {
             **{k: v for k, v in product_fields.items() if v},
             "handle": handle,
-            "status": PRODUCT_STATUS,
+            "status": status,
             # Safe on CREATE only: there is nothing to destroy on a product that did not
             # exist. productUpdate{tags} is replace-mode and is refused by shopify_admin.
             "tags": list(tags),
@@ -528,6 +561,7 @@ class OneInventoryService:
             "variant_gids": {v["sku"]: v["id"] for v in made if v.get("sku")},
             "variant_prices": {v["sku"]: v.get("price") for v in made if v.get("sku")},
             "created": True,
+            "status": status,
         }
 
     async def _update(
@@ -676,6 +710,8 @@ class OneInventoryService:
             submission.id, "listed",
             meta={
                 "created": result.get("created"),
+                "status": result.get("status"),
+                "skipped": result.get("skipped"),
                 "published": result.get("published"),
                 "writeback_ok": len(writeback.get("ok") or []),
                 "writeback_failed": len(writeback.get("failed") or []),
