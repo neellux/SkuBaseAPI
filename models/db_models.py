@@ -189,6 +189,13 @@ class Listing(Model):
         null=True,
         description="Title at creation, before the title template rewrites it; write-once",
     )
+    title_auto_update = fields.BooleanField(
+        default=True,
+        description=(
+            "Whether the title still tracks the title template. Cleared the first time an "
+            "operator takes the field over, so the edit survives a reload"
+        ),
+    )
     submitted = fields.BooleanField(
         default=False, description="Whether the listing has been submitted"
     )

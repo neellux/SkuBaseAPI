@@ -652,6 +652,12 @@ class ListingService:
             if request.submitted_by is not None:
                 listing.submitted_by = request.submitted_by
 
+            # Sent alongside `data` by the listing form, never on its own, so the flag and
+            # the hand-edited title it protects land in the same write. Split across two
+            # requests they would race, and the loser would be the edit.
+            if request.title_auto_update is not None:
+                listing.title_auto_update = request.title_auto_update
+
             await listing.save()
 
             return await ListingService._to_response(listing)
@@ -1156,6 +1162,7 @@ class ListingService:
             ai_description=listing.ai_description,
             original_description=listing.original_description,
             original_title=listing.original_title,
+            title_auto_update=listing.title_auto_update,
             submitted=listing.submitted,
             submitted_at=listing.submitted_at,
             submitted_by=listing.submitted_by,

@@ -253,6 +253,9 @@ class UpdateListingRequest(BaseModel):
     ai_description: Optional[str] = Field(None, description="AI generated description")
     submitted: Optional[bool] = Field(None, description="Submission status")
     submitted_by: Optional[str] = Field(None, description="User ID who submitted this listing")
+    title_auto_update: Optional[bool] = Field(
+        None, description="Whether the title still tracks the title template"
+    )
 
 
 class SubmitListingRequest(BaseModel):
@@ -300,6 +303,14 @@ class ListingResponse(BaseModel):
     )
     original_title: Optional[str] = Field(
         None, description="Title at creation, before the title template rewrote it"
+    )
+    title_auto_update: bool = Field(
+        True,
+        description=(
+            "Whether the title still tracks the title template. False once an operator has "
+            "taken the field over, which is what stops the template overwriting their edit "
+            "the next time the listing is opened."
+        ),
     )
     submitted: bool = Field(..., description="Whether listing is submitted")
     submitted_at: Optional[datetime] = Field(None, description="Submission timestamp")
