@@ -473,21 +473,25 @@ async def get_product_details(sku: str = Query(..., description="Product SKU (pa
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-# Storefront origins per store key. Not derivable from the store id: the source store is
-# `high-end-merchandise` on Shopify but serves as 1nventory.com, and the destination store
-# is `xuh30f-dr` serving shopthesample.com. Both confirmed live 2026-08-13 by reading
-# onlineStoreUrl off each store.
-STOREFRONT_ORIGINS = {
-    "high-end-merchandise": "https://1nventory.com",
-    "xuh30f-dr": "https://shopthesample.com",
-}
+# The store keys are the Shopify store handles as-is (`high-end-merchandise` for the
+# source, `xuh30f-dr` for the destination), which is what admin.shopify.com addresses by,
+# so the admin URL needs no lookup table. The storefront origins those stores serve under
+# are not derivable from them (1nventory.com and shopthesample.com respectively, confirmed
+# live 2026-08-13 by reading onlineStoreUrl off each store) - relevant again only if these
+# links ever point back at the customer-facing pages.
+def _shopify_admin_url(store: str | None, gid: str | None) -> str | None:
+    """admin.shopify.com product URL. Mirrors `shopifyAdminUrl` in the UI's
+    InternalPlatforms page: the numeric id is the last segment of the GID."""
+    if not store or not gid:
+        return None
+    return f"https://admin.shopify.com/store/{store}/products/{str(gid).split('/')[-1]}"
 
 
 @router.get("/platform_links", response_model=PlatformLinksResponse)
 async def get_product_platform_links(
     sku: str = Query(..., description="Product SKU (parent or child)"),
 ):
-    """Storefront links for the platforms this product is on.
+    """Shopify admin links for the platforms this product is on.
 
     Read from internal_platform_state, the mirror the consignment source poller refreshes
     every five minutes, so a product listed in the last few minutes may not appear yet.
@@ -506,10 +510,9 @@ async def get_product_platform_links(
         rows = await conn.execute_query_dict(
             """
             SELECT s.current_status,
-                   s.source_handle, s.source_online,
-                   s.dest_handle,   s.dest_online,
-                   s.dest_product_gid,
-                   p.source_store,  p.dest_store
+                   s.source_online, s.dest_online,
+                   s.source_product_gid, s.dest_product_gid,
+                   p.source_store,       p.dest_store
               FROM internal_platform_state s
               JOIN internal_platforms p ON p.id = s.internal_platform_id
              WHERE s.parent_sku = $1
@@ -526,24 +529,34 @@ async def get_product_platform_links(
         meta = await listing_options_service.get_platforms()
         names = {p["id"]: p.get("name") or p["id"] for p in meta}
 
-        def add(platform_id: str, store_key: str, handle: str | None, online) -> None:
-            origin = STOREFRONT_ORIGINS.get(store_key)
-            if not handle or not origin:
+        def add(platform_id: str, store_key: str, gid: str | None, online) -> None:
+            url = _shopify_admin_url(store_key, gid)
+            if not url:
                 return
             links.append({
                 "platform_id": platform_id,
                 "name": names.get(platform_id, platform_id),
-                "url": f"{origin}/products/{handle}",
+                "url": url,
                 "online": bool(online),
             })
 
-        add("1nventory", row["source_store"], row["source_handle"], row["source_online"])
+        add(
+            "1nventory",
+            row["source_store"],
+            row["source_product_gid"],
+            row["source_online"],
+        )
 
         # Shop The Sample only when the pipeline says the product is actually listed
         # there. 44 rows carry a dest_product_gid whose product has since been deleted by
         # the delist path, and current_status is what distinguishes them.
         if row["current_status"] == "listed" and row["dest_product_gid"]:
-            add("shopthesample", row["dest_store"], row["dest_handle"], row["dest_online"])
+            add(
+                "shopthesample",
+                row["dest_store"],
+                row["dest_product_gid"],
+                row["dest_online"],
+            )
 
         return PlatformLinksResponse(success=True, parent_sku=parent_sku, links=links)
 

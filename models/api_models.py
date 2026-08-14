@@ -853,13 +853,13 @@ class PlatformLink(BaseModel):
 
     platform_id: str = Field(..., description="listingoptions_platforms.id, for the icon")
     name: str
-    url: str = Field(..., description="Storefront product URL")
+    url: str = Field(..., description="Shopify admin product URL")
     online: bool = Field(
         ...,
         description=(
             "False when the product is not currently served by that storefront, which on "
-            "1nventory means sold out and unpublished, so the URL returns 404. The link is "
-            "still returned; the UI marks it."
+            "1nventory means sold out and unpublished. The admin URL still resolves; this "
+            "is a status hint the UI marks the icon with."
         ),
     )
 
