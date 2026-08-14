@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from typing import List, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 from tortoise import transactions
 from tortoise.expressions import Q, Subquery
@@ -14,6 +14,7 @@ from models.api_models import (
     BatchListResponse,
     UpdateBatchRequest,
 )
+from services.batch_value_service import compute_product_values
 from services.listing_service import ListingService
 from services.product_resolver import (
     SkuResolutionError,
@@ -30,6 +31,40 @@ logger = logging.getLogger(__name__)
 # by the update_batch_counts() trigger on listings, so this is equivalent to
 # submitted_listings < total_listings without needing to count anything.
 OPEN_BATCH_STATUSES = ("new", "in_progress")
+
+# Orderings the batch list offers. Both end in -id so offset pagination stays stable for
+# batches sharing a created_at (they are created inside one transaction, so ties are
+# common) - without it the same batch can appear on two pages or on neither.
+#
+# value_desc is the default. total_value is NOT NULL precisely so this ordering works:
+# Postgres puts NULLs first on DESC, which would have parked every unvalued batch at the
+# top of the list.
+BATCH_SORTS = {
+    "value_desc": ("-total_value", "-created_at", "-id"),
+    "created_desc": ("-created_at", "-id"),
+}
+DEFAULT_BATCH_SORT = "value_desc"
+
+
+def _sorts_after(order_by: tuple[str, ...], row: Batch) -> Q:
+    """Rows that sort strictly after `row` under `order_by`, every field of which is DESC.
+
+    Lexicographic tuple comparison, expanded into ORs because Tortoise has no row-value
+    constructor. For ("-a", "-b", "-c") this builds
+
+        a < row.a  OR  (a = row.a AND b < row.b)  OR  (a = row.a AND b = row.b AND c < row.c)
+
+    Derived from the ordering tuple rather than hand-written so the cursor cannot drift out
+    of step with BATCH_SORTS: a walk whose comparison disagrees with its ORDER BY silently
+    skips or repeats rows, which is the bug this shape exists to prevent.
+    """
+    names = [field.lstrip("-") for field in order_by]
+    clauses = []
+    for i, name in enumerate(names):
+        terms = {earlier: getattr(row, earlier) for earlier in names[:i]}
+        terms[f"{name}__lt"] = getattr(row, name)
+        clauses.append(Q(**terms))
+    return Q(*clauses, join_type=Q.OR)
 
 
 class BatchService:
@@ -218,6 +253,8 @@ class BatchService:
                     f"Batch {batch.id} created successfully with {len(successful_listings)} listings"
                 )
 
+            await BatchService._snapshot_value(batch, sorted(set(parents.values())))
+
             return await BatchService._to_response(batch, include_listings=True)
 
         except BatchCreationError:
@@ -225,6 +262,38 @@ class BatchService:
         except Exception as e:
             logger.error(f"Unexpected error creating batch: {e}", exc_info=True)
             raise
+
+    @staticmethod
+    async def _snapshot_value(batch: Batch, parent_skus: List[str]) -> None:
+        """Freeze the batch's merchandise value. Never raises.
+
+        Called AFTER create_batch's transaction commits, not inside it. The photography
+        service posts to /api/create_batch with no pre-validation, so a SellerCloud outage
+        must not roll back a batch that is otherwise complete - it leaves
+        value_computed_at NULL, which is exactly what backfill_batch_values.py picks up on
+        its next run.
+
+        Saves with update_fields because update_batch_counts() rewrites total_listings,
+        submitted_listings and status on this row as each listing is inserted. A bare
+        save() would write the stale in-memory copies straight back over the trigger's
+        work.
+        """
+        try:
+            total, breakdown = await compute_product_values(parent_skus)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"Batch {batch.id} created, but its value snapshot failed; left uncomputed "
+                f"for backfill_batch_values.py to pick up"
+            )
+            return
+
+        batch.total_value = total
+        batch.product_values = breakdown
+        batch.value_computed_at = datetime.now(timezone.utc)
+        await batch.save(
+            update_fields=["total_value", "product_values", "value_computed_at"]
+        )
+        logger.info(f"Batch {batch.id} valued at {total} across {len(breakdown)} products")
 
     @staticmethod
     async def get_batch_by_id(
@@ -251,6 +320,7 @@ class BatchService:
         search: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
+        sort: str = DEFAULT_BATCH_SORT,
     ) -> tuple[List[BatchListResponse], int]:
         try:
             query = Batch.all()
@@ -299,8 +369,11 @@ class BatchService:
 
             total = await query.count()
 
+            order_by = BATCH_SORTS.get(sort, BATCH_SORTS[DEFAULT_BATCH_SORT])
             batches = (
-                await query.offset((page - 1) * page_size).limit(page_size).order_by("-created_at")
+                await query.offset((page - 1) * page_size)
+                .limit(page_size)
+                .order_by(*order_by)
             )
 
             response_batches = []
@@ -317,14 +390,23 @@ class BatchService:
     async def get_next_open_batch(batch_id: int) -> tuple[Optional[BatchResponse], bool]:
         """Next open batch after `batch_id`, in the same order the batch list uses.
 
-        The list is sorted by created_at DESC, so "next" means the closest older
-        batch that is still open. Ordering compares the (created_at, id) pair so
-        batches created inside one transaction keep a stable order instead of
-        being returned arbitrarily.
+        That order is BATCH_SORTS[DEFAULT_BATCH_SORT] - currently total_value DESC,
+        so the arrow walks from the most valuable open batch down. Both the cursor
+        and the ORDER BY come from that one tuple (see _sorts_after), so changing
+        the list default moves this walk with it.
 
-        When the cursor is already past the oldest open batch the walk wraps to
-        the newest one, so the caller only dead-ends when there genuinely is no
-        other open batch. Returns (batch, wrapped); a null batch means none is
+        The comparison is over the whole ordering tuple, not just its first field:
+        total_value ties are common (35 production batches value at 0) and the
+        created_at/id tail is what stops the walk from sticking or looping inside
+        a tie.
+
+        The batch view opens in a new tab (BatchList hands the id to window.open)
+        and carries no sort state, so it cannot mirror a per-user sort choice -
+        it follows the default.
+
+        When the cursor is already past the last open batch the walk wraps to the
+        first one, so the caller only dead-ends when there genuinely is no other
+        open batch. Returns (batch, wrapped); a null batch means none is
         left, while an unknown batch_id raises 404.
 
         Carries the listings, i.e. the same payload as GET /listings/batch/detail,
@@ -338,19 +420,17 @@ class BatchService:
 
         try:
             open_batches = Batch.filter(status__in=OPEN_BATCH_STATUSES).exclude(id=batch_id)
+            order_by = BATCH_SORTS[DEFAULT_BATCH_SORT]
 
             next_batch = (
-                await open_batches.filter(
-                    Q(created_at__lt=current.created_at)
-                    | Q(created_at=current.created_at, id__lt=current.id)
-                )
-                .order_by("-created_at", "-id")
+                await open_batches.filter(_sorts_after(order_by, current))
+                .order_by(*order_by)
                 .first()
             )
             wrapped = False
 
             if not next_batch:
-                next_batch = await open_batches.order_by("-created_at", "-id").first()
+                next_batch = await open_batches.order_by(*order_by).first()
                 wrapped = next_batch is not None
 
             if not next_batch:
@@ -445,6 +525,9 @@ class BatchService:
             total_listings=batch.total_listings,
             submitted_listings=batch.submitted_listings,
             progress_percentage=batch.progress_percentage,
+            total_value=batch.total_value,
+            value_computed_at=batch.value_computed_at,
+            product_values=batch.product_values or {},
             created_at=batch.created_at,
             updated_at=batch.updated_at,
             listings=listings,
@@ -461,5 +544,8 @@ class BatchService:
             total_listings=batch.total_listings,
             submitted_listings=batch.submitted_listings,
             progress_percentage=batch.progress_percentage,
+            total_value=batch.total_value,
+            value_computed_at=batch.value_computed_at,
+            product_values=batch.product_values or {},
             created_at=batch.created_at,
         )

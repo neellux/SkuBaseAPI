@@ -135,6 +135,26 @@ class Batch(Model):
         description="Denormalized per-product per-platform submission status",
     )
 
+    # Frozen merchandise-value snapshot taken once, after create_batch commits. Never
+    # recomputed, and deliberately outside update_batch_counts() - see
+    # migrations/add_batch_total_value.sql. total_value is non-null so it cannot sort
+    # ahead of real values under ORDER BY total_value DESC; value_computed_at is what
+    # separates "not computed" from "worth nothing".
+    total_value = fields.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=0,
+        description="Sum over products of (physical qty x SitePrice) at batch creation",
+    )
+    product_values = fields.JSONField(
+        default=dict,
+        description="Per-parent-SKU breakdown behind total_value",
+    )
+    value_computed_at = fields.DatetimeField(
+        null=True,
+        description="When the value snapshot was taken; null means never computed",
+    )
+
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 

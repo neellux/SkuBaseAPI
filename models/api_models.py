@@ -430,6 +430,21 @@ class BatchResponse(BaseModel):
     submitted_listings: int = Field(..., description="Number of submitted listings")
     photography_batch_id: Optional[int] = Field(None, description="Reference to photography batch")
     progress_percentage: float = Field(..., description="Completion percentage")
+    total_value: Decimal = Field(
+        Decimal(0),
+        description="Merchandise value snapshot at creation (physical qty x SitePrice)",
+    )
+    value_computed_at: Optional[datetime] = Field(
+        None,
+        description="When the value snapshot was taken; null means it has not been computed, "
+        "which is not the same as a batch genuinely worth 0",
+    )
+    product_values: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Per-parent-SKU breakdown behind total_value: "
+        "{sku: {value, qty, children, priced}}. Drives the card's value hover card; "
+        "thumbnails are built client-side from the SKU, so no image data travels here.",
+    )
     created_at: datetime = Field(..., description="Creation timestamp")
     updated_at: datetime = Field(..., description="Last update timestamp")
     listings: List[ListingResponse] = Field(default=[], description="Listings in this batch")
@@ -450,6 +465,21 @@ class BatchListResponse(BaseModel):
     submitted_listings: int = Field(..., description="Number of submitted listings")
     photography_batch_id: Optional[int] = Field(None, description="Reference to photography batch")
     progress_percentage: float = Field(..., description="Completion percentage")
+    total_value: Decimal = Field(
+        Decimal(0),
+        description="Merchandise value snapshot at creation (physical qty x SitePrice)",
+    )
+    value_computed_at: Optional[datetime] = Field(
+        None,
+        description="When the value snapshot was taken; null means it has not been computed, "
+        "which is not the same as a batch genuinely worth 0",
+    )
+    product_values: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Per-parent-SKU breakdown behind total_value: "
+        "{sku: {value, qty, children, priced}}. Drives the card's value hover card; "
+        "thumbnails are built client-side from the SKU, so no image data travels here.",
+    )
     created_at: datetime = Field(..., description="Creation timestamp")
 
     class Config:

@@ -18,6 +18,18 @@ SELLERCLOUD_INTERNAL_CONFIG = config.get("sellercloud_internal", {})
 SC_SYNC_MAX_RETRIES = 3
 SC_SYNC_RETRY_DELAY = 1  # seconds
 
+# The inventory grid behind Inventory > Manage Inventory. One POST returns ~200 columns per
+# SKU - including SitePrice, WebsitePrice, AggregatePhysicalQty and ReservedQty - for every
+# SKU in the filter, which is the only bulk price+qty read available. The public REST
+# /Catalog carries the prices but no quantity at all.
+CATALOG_GRID_ENDPOINT = "/Manage/ManageEntity/GetGridData"
+CATALOG_GRID_KIND = 13
+
+# SellerCloud accepts larger pages but starts timing out; 200 is what the secondary-SKU
+# poller has run daily against production without incident.
+CATALOG_GRID_PAGE_SIZE = 200
+CATALOG_GRID_MAX_PAGES = 50
+
 _TRANSIENT_MESSAGE_MARKERS = (
     "toolbox operation failed",
     "internal server error",
@@ -29,6 +41,52 @@ _TRANSIENT_MESSAGE_MARKERS = (
 class SellercloudPermanentError(Exception):
     """Raised when a SellerCloud operation fails in a way that retries cannot fix.
     str(e) is the user-facing message the UI should display."""
+
+
+def build_catalog_grid_payload(
+    skus: List[str],
+    page: int,
+    per_page: int,
+    min_aggregate_qty: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Body for a Kind=13 GetGridData query over an explicit SKU list.
+
+    ``min_aggregate_qty`` adds the server-side AggregateQty floor. Leave it None to get
+    every SKU back including the empty and oversold ones: a caller valuing inventory needs
+    the zero-stock rows to tell "no stock" apart from "SKU not in SellerCloud", and
+    filtering them out server-side destroys that distinction.
+
+    ActiveStatus is pinned to -1 (any) rather than 1. Callers that care about active-only
+    are expected to have filtered their SKU list already - child_products.is_active in the
+    products DB is the registry SkuBase treats as authoritative, and asking the grid to
+    filter as well would silently drop rows the caller believes it asked about.
+    """
+    filters: List[Dict[str, Any]] = [
+        {"FilterId": "txtGlobalSearch", "FilterPropertyName": "GlobalSearchKeyWord", "FilterSelectedValues": None},
+        {"FilterId": "txtSKU", "FilterPropertyName": "SKU", "FilterSelectedValues": skus},
+        {"FilterId": "lstCompanies", "FilterPropertyName": "CompanyID", "FilterSelectedValues": None},
+        {"FilterId": "txtUPCList", "FilterPropertyName": "UPC", "FilterSelectedValues": None},
+        {"FilterId": "ddlManufacturers", "FilterPropertyName": "ManufacturerNames", "FilterSelectedValues": None},
+        {"FilterId": "ddlActiveStatus", "FilterPropertyName": "ActiveStatus", "FilterSelectedValues": ["-1"]},
+    ]
+    if min_aggregate_qty is not None:
+        filters.append(
+            {"FilterId": "vqAggregateQtyRange", "FilterSelectedValues": [str(min_aggregate_qty), None]}
+        )
+
+    return {
+        "Kind": CATALOG_GRID_KIND,
+        "SelectedFilters": filters,
+        "PageNumber": page,
+        "ResultsPerPage": per_page,
+        "SortColumn": "ID",
+        "SortDirection": True,
+        "IncludeTotals": True,
+        "UtcOffset": 330,
+        "GlobalSearchKeyWord": "",
+        "Key": None,
+        "SavedViewID": None,
+    }
 
 
 def _is_transient_message(msg: Optional[str]) -> bool:
@@ -315,6 +373,69 @@ class SellercloudInternalService:
                 break
             page += 1
         return all_bins
+
+    async def get_catalog_grid_rows(
+        self,
+        skus: List[str],
+        min_aggregate_qty: Optional[int] = None,
+        chunk_size: int = CATALOG_GRID_PAGE_SIZE,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Catalog grid rows for `skus`, keyed by SKU exactly as SellerCloud spells them.
+
+        The bulk alternative to looping get_inventory_preview, which costs 2+ paged calls
+        per SKU. Measured against production: 50 SKUs in one call in 2.7s, and a 26-child
+        batch came back complete in a single request.
+
+        SKUs SellerCloud does not know are simply absent from the result rather than
+        mapped to an empty dict - callers valuing inventory need to distinguish those from
+        a SKU that exists at zero stock, and an empty dict cannot carry that.
+
+        Chunks and pages sequentially on purpose. Neither SellerCloud client has a rate
+        limiter or any 429 handling, so concurrency here would be the first place to find
+        out that the API has one.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        unique = list(dict.fromkeys(s for s in skus if s))
+        if not unique:
+            return out
+
+        for start in range(0, len(unique), chunk_size):
+            chunk = unique[start : start + chunk_size]
+            page = 1
+            seen = 0
+            while True:
+                payload = build_catalog_grid_payload(
+                    chunk, page=page, per_page=CATALOG_GRID_PAGE_SIZE,
+                    min_aggregate_qty=min_aggregate_qty,
+                )
+                body = await self.post(CATALOG_GRID_ENDPOINT, data=payload)
+                data = body.get("Data") or {}
+                rows = data.get("Grid") or []
+
+                for row in rows:
+                    sku = row.get("ID") or row.get("ProductMasterSKU")
+                    if isinstance(sku, str):
+                        out[sku] = row
+                seen += len(rows)
+
+                total = data.get("TotalResults")
+                if isinstance(total, int):
+                    if seen >= total or not rows:
+                        break
+                elif len(rows) < CATALOG_GRID_PAGE_SIZE:
+                    break
+
+                page += 1
+                if page > CATALOG_GRID_MAX_PAGES:
+                    logger.warning(
+                        f"Catalog grid paging bailed at page {page} for a {len(chunk)}-SKU chunk"
+                    )
+                    break
+
+        missing = len(unique) - len(out)
+        if missing:
+            logger.info(f"Catalog grid: {len(out)}/{len(unique)} SKUs returned, {missing} missing")
+        return out
 
     async def get_product_warehouses(self, sku: str) -> Dict[str, Any]:
         params = {

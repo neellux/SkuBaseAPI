@@ -31,7 +31,7 @@ from models.api_models import (
 from exceptions.batch_exceptions import BatchCreationError
 from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
-from services.batch_service import BatchService
+from services.batch_service import DEFAULT_BATCH_SORT, BatchService
 from services.ebay_aspect_service import ebay_aspect_service
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
@@ -1204,6 +1204,11 @@ async def get_batches(
     search: Optional[str] = Query(None, description="Search by product ID"),
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    sort: str = Query(
+        DEFAULT_BATCH_SORT,
+        pattern="^(value_desc|created_desc)$",
+        description="Sort order: value_desc (default) or created_desc",
+    ),
 ):
     date_from_obj = None
     date_to_obj = None
@@ -1229,6 +1234,7 @@ async def get_batches(
         search=search,
         page=page,
         page_size=page_size,
+        sort=sort,
     )
     batches = await add_user_data(data=batches, keys=["assigned_to"], new_keys=["name"])
 
