@@ -1052,11 +1052,39 @@ class UpdateParentProductResponse(BaseModel):
     sellercloud_warning: Optional[str] = None
 
 
+class WashtagSelectionItem(BaseModel):
+    """One washtag the operator chose to carry onto the destination parent.
+
+    `side` rather than a parent SKU: the SKU would duplicate a foreign key already on
+    the assignment row (old_parent_sku / new_parent_sku), and typing it as a literal
+    means a request cannot name a third product at all, rather than being rejected for
+    naming one.
+
+    Deliberately no ge/le or max_length constraints beyond that: the UI's axios
+    interceptor collapses every 422 into the literal string "Invalid request", so
+    business rules are enforced in the service where they can produce a readable
+    message.
+    """
+
+    side: Literal["old", "new"] = Field(
+        ..., description="Which parent of this reassignment the washtag comes from"
+    )
+    index: int = Field(..., description="1-based washtag slot on that parent")
+    md5_hash: Optional[str] = Field(
+        None, description="Hash the picker saw, used to detect source drift"
+    )
+
+
 class ReassignChildRequest(BaseModel):
     child_sku: str = Field(..., description="The child SKU to reassign")
     new_parent_sku: str = Field(..., description="The new parent SKU")
     target_child_sku: str = Field(
         ..., description="The destination child SKU to transfer inventory to"
+    )
+    washtag_selections: Optional[List[WashtagSelectionItem]] = Field(
+        None,
+        description="Ordered washtags the new parent should end up with. "
+        "None means leave washtags alone; [] clears them.",
     )
 
     @validator("new_parent_sku")
@@ -1074,6 +1102,10 @@ class ReassignChildRequest(BaseModel):
 
 class ReassignChildResponse(BaseModel):
     success: bool
+    # None when the operator made no washtag choice. Otherwise the result of the copy,
+    # which is reported separately because it must never turn a successful
+    # reassignment into a failed one.
+    washtag_copy: Optional[Dict[str, Any]] = None
     assignment_id: Optional[int] = None
     job_id: Optional[int] = None
     child_sku: str
@@ -1173,6 +1205,11 @@ class BulkReassignRequest(BaseModel):
     old_parent_sku: str = Field(..., description="Source parent SKU")
     new_parent_sku: str = Field(..., description="Target parent SKU")
     mappings: List[BulkMappingItem] = Field(..., description="List of child mappings")
+    washtag_selections: Optional[List[WashtagSelectionItem]] = Field(
+        None,
+        description="Ordered washtags the new parent should end up with. "
+        "None means leave washtags alone; [] clears them.",
+    )
 
 
 class BulkReassignResponse(BaseModel):

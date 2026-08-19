@@ -375,6 +375,11 @@ async def reassign_child_parent(request: ReassignChildRequest):
             child_sku=request.child_sku,
             new_parent_sku=request.new_parent_sku,
             target_child_sku=request.target_child_sku,
+            washtag_selections=(
+                [w.model_dump() for w in request.washtag_selections]
+                if request.washtag_selections is not None
+                else None
+            ),
         )
 
         if not result.get("success"):
@@ -593,6 +598,11 @@ async def create_bulk_reassignment(request: BulkReassignRequest):
             old_parent_sku=request.old_parent_sku,
             new_parent_sku=request.new_parent_sku,
             mappings=mappings,
+            washtag_selections=(
+                [w.model_dump() for w in request.washtag_selections]
+                if request.washtag_selections is not None
+                else None
+            ),
         )
 
         if not result.get("success"):
