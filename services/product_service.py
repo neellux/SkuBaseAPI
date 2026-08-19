@@ -1372,9 +1372,115 @@ class ProductService:
             logger.error(f"Error updating parent product: {str(e)}", exc_info=True)
             return {"success": False, "error": str(e)}
 
+
+    @staticmethod
+    def _validate_washtag_selections(
+        selections: Optional[List[Dict]], old_parent_sku: str, new_parent_sku: str
+    ) -> Optional[List[Dict]]:
+        """Normalise the operator's washtag choice for storage, or raise ValueError.
+
+        Stores `side` ("old" or "new"), not a parent SKU. The SKU would be a foreign
+        key value into parent_products, duplicated from old_parent_sku / new_parent_sku
+        on this very row, where no constraint can enforce it and a rename would leave
+        it silently stale. A side is resolved against those FK columns at apply time,
+        so the pair can only ever come from the ledger and naming a third product stops
+        being possible rather than merely being rejected.
+
+        `index` stays an ordinal because it addresses a position in
+        productimages.washtag_data in a different database, so nothing there is
+        referenceable anyway; `md5_hash` is the drift guard for it.
+
+        None (no choice) and [] (clear them) are different and both meaningful, so this
+        preserves the distinction rather than collapsing empty to None.
+        """
+        if selections is None:
+            return None
+
+        by_sku = {}
+        if old_parent_sku:
+            by_sku[old_parent_sku] = "old"
+        if new_parent_sku:
+            by_sku[new_parent_sku] = "new"
+
+        normalised = []
+        for sel in selections:
+            get = sel.get if isinstance(sel, dict) else lambda k: getattr(sel, k, None)
+            side = get("side")
+            if side is None:
+                # Accept a SKU from older callers and fold it down to a side.
+                pid = get("product_id")
+                side = by_sku.get(pid)
+                if side is None:
+                    raise ValueError(
+                        f"Washtag selection names {pid}, which is not part of this reassignment"
+                    )
+            elif side not in ("old", "new"):
+                raise ValueError(f"Washtag selection has an unknown side {side!r}")
+            elif side == "old" and not old_parent_sku:
+                raise ValueError("This product has no previous parent to take washtags from")
+
+            normalised.append(
+                {"side": side, "index": get("index"), "md5_hash": get("md5_hash")}
+            )
+        return normalised
+
+    @staticmethod
+    async def _apply_washtag_selections(
+        selections: Optional[List[Dict]], old_parent_sku: str, new_parent_sku: str
+    ) -> Optional[Dict[str, Any]]:
+        """Copy the chosen washtags onto the new parent. Never raises.
+
+        Runs after the reassignment has already succeeded. A GCS or photography-DB
+        problem here must not fail or half-roll-back the SellerCloud job chain, so this
+        follows the same rule as _queue_sellercloud_sync: a logged warning, not a
+        failed operation. The selection is persisted on the assignment row, so a failure
+        stays replayable.
+        """
+        if selections is None:
+            return None
+        try:
+            from services.image_service import image_service
+
+            # Resolve each stored side against this row's own FK columns. image_service
+            # is a generic primitive over real product ids, so the SKU is reconstituted
+            # here rather than persisted; that is the whole point of storing a side.
+            by_side = {"old": old_parent_sku, "new": new_parent_sku}
+            resolved = [
+                {
+                    "product_id": by_side[sel["side"]],
+                    "index": sel["index"],
+                    "md5_hash": sel.get("md5_hash"),
+                }
+                for sel in selections
+            ]
+
+            result = await image_service.replace_washtags(
+                target_product_id=new_parent_sku,
+                selections=resolved,
+                source_parent=old_parent_sku,
+                expected_washtag_updated_at=None,
+                allow_clear=True,
+            )
+            if not result.get("success"):
+                logger.warning(
+                    f"Washtag copy onto {new_parent_sku} failed: {result.get('error')}"
+                )
+            return result
+        except Exception:
+            logger.warning(
+                f"Washtag copy onto {new_parent_sku} raised; the reassignment stands:\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": "Could not update washtags"}
+
+
     @staticmethod
     async def reassign_child_parent(
-        child_sku: str, new_parent_sku: str, target_child_sku: str, created_by: Optional[str] = None
+        child_sku: str,
+        new_parent_sku: str,
+        target_child_sku: str,
+        created_by: Optional[str] = None,
+        washtag_selections: Optional[List[Dict]] = None,
     ) -> Dict[str, Any]:
         try:
             conn = await ProductService._get_connection()
@@ -1398,6 +1504,21 @@ class ProductService:
                 }
 
             old_parent_sku = child_result[0].get("parent_sku")
+
+            # Validate before anything is written: a selection naming a third product
+            # is a bad request, not a half-done reassignment.
+            try:
+                washtags = ProductService._validate_washtag_selections(
+                    washtag_selections, old_parent_sku, new_parent_sku
+                )
+            except ValueError as e:
+                return {
+                    "success": False,
+                    "child_sku": child_sku,
+                    "new_parent_sku": new_parent_sku,
+                    "target_child_sku": target_child_sku,
+                    "message": str(e),
+                }
 
             parent_result = await conn.execute_query_dict(
                 """
@@ -1452,11 +1573,19 @@ class ProductService:
                     new_parent_sku,
                     is_primary_assignment,
                     target_primary_sku,
-                    created_by
-                ) VALUES ($1, $2, $3, FALSE, $4, $5)
+                    created_by,
+                    washtag_selections
+                ) VALUES ($1, $2, $3, FALSE, $4, $5, $6::jsonb)
                 RETURNING id
                 """,
-                [child_sku, old_parent_sku, new_parent_sku, target_child_sku, created_by],
+                [
+                    child_sku,
+                    old_parent_sku,
+                    new_parent_sku,
+                    target_child_sku,
+                    created_by,
+                    orjson.dumps(washtags).decode() if washtags is not None else None,
+                ],
             )
 
             if not assignment_result:
@@ -1587,6 +1716,9 @@ class ProductService:
                     )
 
             if all_success:
+                washtag_copy = await ProductService._apply_washtag_selections(
+                    washtags, old_parent_sku, new_parent_sku
+                )
                 return {
                     "success": True,
                     "assignment_id": assignment_id,
@@ -1595,6 +1727,7 @@ class ProductService:
                     "new_parent_sku": new_parent_sku,
                     "target_child_sku": target_child_sku,
                     "jobs_executed": len(executed_jobs),
+                    "washtag_copy": washtag_copy,
                     "message": f"{child_sku} assigned to {new_parent_sku} successfully",
                 }
             else:
@@ -2334,6 +2467,7 @@ class ProductService:
         new_parent_sku: str,
         mappings: List[Dict[str, str]],
         created_by: Optional[str] = None,
+        washtag_selections: Optional[List[Dict]] = None,
     ) -> Dict[str, Any]:
         try:
             conn = await ProductService._get_connection()
@@ -2341,11 +2475,25 @@ class ProductService:
             if not mappings:
                 return {"success": False, "error": "No mappings provided"}
 
+            try:
+                washtags = ProductService._validate_washtag_selections(
+                    washtag_selections, old_parent_sku, new_parent_sku
+                )
+            except ValueError as e:
+                return {"success": False, "error": str(e)}
+
             bulk_result = await conn.execute_query_dict(
-                """INSERT INTO bulk_reassignments (old_parent_sku, new_parent_sku, total_count, created_by)
-                   VALUES ($1, $2, $3, $4)
+                """INSERT INTO bulk_reassignments
+                       (old_parent_sku, new_parent_sku, total_count, created_by, washtag_selections)
+                   VALUES ($1, $2, $3, $4, $5::jsonb)
                    RETURNING id""",
-                [old_parent_sku, new_parent_sku, len(mappings), created_by],
+                [
+                    old_parent_sku,
+                    new_parent_sku,
+                    len(mappings),
+                    created_by,
+                    orjson.dumps(washtags).decode() if washtags is not None else None,
+                ],
             )
 
             if not bulk_result:
@@ -2560,6 +2708,35 @@ class ProductService:
             logger.error(f"Error getting bulk reassignment status: {e}")
             return {"success": False, "error": "Failed to get bulk reassignment status"}
 
+
+    @staticmethod
+    async def _apply_bulk_washtag_selections(bulk_id: int) -> None:
+        """Apply a bulk reassignment's stored washtag choice, once, at the end.
+
+        Idempotent by way of replace_washtags' own no-op short-circuit, which matters
+        because the UI polls /process and can reach the terminal tick more than once.
+        """
+        try:
+            conn = await ProductService._get_connection()
+            rows = await conn.execute_query_dict(
+                """SELECT old_parent_sku, new_parent_sku, washtag_selections
+                   FROM bulk_reassignments WHERE id = $1""",
+                [bulk_id],
+            )
+            if not rows or rows[0]["washtag_selections"] is None:
+                return
+
+            raw = rows[0]["washtag_selections"]
+            selections = orjson.loads(raw) if isinstance(raw, (str, bytes)) else raw
+            await ProductService._apply_washtag_selections(
+                selections, rows[0]["old_parent_sku"], rows[0]["new_parent_sku"]
+            )
+        except Exception:
+            logger.warning(
+                f"Bulk washtag copy for {bulk_id} raised; the reassignments stand:\n"
+                f"{traceback.format_exc()}"
+            )
+
     @staticmethod
     async def process_next_bulk_assignment(bulk_id: int) -> Dict[str, Any]:
         try:
@@ -2589,6 +2766,12 @@ class ProductService:
                         "status": "in_progress",
                         "message": "Assignment still processing",
                     }
+
+                # Terminal tick: nothing pending and nothing in flight. Reached exactly
+                # once, and on both the completed and the failed outcome, which is what
+                # lets a partially failed bulk still carry the washtags across. Washtags
+                # are parent-level, so this must run here rather than per assignment.
+                await ProductService._apply_bulk_washtag_selections(bulk_id)
 
                 return await ProductService.get_bulk_reassignment_status(bulk_id)
 
