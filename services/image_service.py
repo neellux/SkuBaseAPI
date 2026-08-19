@@ -36,13 +36,20 @@ GCS_CACHE_CONTROL = "public, no-cache"
 MAX_PRODUCT_IMAGES = 8
 MAX_WASHTAG_IMAGES = 3
 MAX_CONCURRENT_RESIZE = 3
+# gcloud-aio defaults to 10s per call and these run while a pooled connection
+# from a 5-connection pool is held, so an unbounded stall starves every other
+# photography_db reader.
+GCS_TIMEOUT_SECONDS = 15
 
 # "/" is allowed because a parent SKU can legitimately contain one: ESSX parents are
 # ESSX/BRAND/SEASON/STYLE/COLOUR, the photography app writes them into
 # productimages.product_id as-is, and GCS already holds blobs under those prefixes.
 # The traversal defence is not this whitelist, it is the explicit checks in
 # validate_product_id below, which stay.
-PRODUCT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-_/]{0,199}$")
+# \A and \Z rather than ^ and $: Python's $ also matches just before a trailing
+# newline, so "SKU-0001\n" passed this check and reached the log lines and the GCS
+# object name below.
+PRODUCT_ID_PATTERN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9\-_/]{0,199}\Z")
 
 # The photography app keys its rows on (product_id, batch_id, image_source), so a
 # product accumulates rows rather than having one, and the two sections have
@@ -694,6 +701,20 @@ class ImageService:
             result = await self._storage.copy(
                 GCS_BUCKET, src_path,
                 GCS_BUCKET, new_name=dest_path,
+                # rewriteTo copies the SOURCE object's metadata when none is given, and
+                # blobs written before the no-cache fix still carry
+                # "max-age=31536000, immutable". Copying one forward would stamp that
+                # onto the destination path, which is the bug GCS_CACHE_CONTROL exists
+                # to prevent, on a URL SellerCloud and every platform also fetch.
+                metadata={
+                    "cache-control": GCS_CACHE_CONTROL,
+                    "content-disposition": "inline",
+                },
+                # A fresh dict per call: gcloud-aio assigns params["rewriteToken"] in
+                # place while draining a multi-part rewrite, so a shared dict leaks a
+                # stale token into the next copy.
+                params={},
+                timeout=GCS_TIMEOUT_SECONDS,
             )
         except Exception as e:
             logger.warning(f"Failed to copy {src_path} -> {dest_path}: {e}")
@@ -704,7 +725,9 @@ class ImageService:
 
     async def _delete_blob(self, blob_path: str):
         try:
-            await self._storage.delete(GCS_BUCKET, blob_path)
+            await self._storage.delete(
+                GCS_BUCKET, blob_path, timeout=GCS_TIMEOUT_SECONDS
+            )
         except Exception as e:
             logger.warning(f"Failed to delete {blob_path}: {e}")
 
