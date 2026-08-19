@@ -7,7 +7,7 @@ import re
 import struct
 import traceback
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TypedDict
 
 from gcloud.aio.storage import Storage
 from tortoise import Tortoise, connections
@@ -117,6 +117,78 @@ def _resolve_rows(rows: List[Any]) -> tuple:
         or image_row
     )
     return image_row, washtag_row
+
+
+class WashtagSelection(TypedDict):
+    """One pick in a washtag replacement: which parent, which slot, what we expect there."""
+
+    product_id: str
+    index: int  # 1-based, matching get_product_images and the washtag_{i}.jpg blob name
+    md5_hash: Optional[str]
+
+
+def _plan_washtag_copy(
+    selections: List[Dict],
+    washtags_by_product: Dict[str, List[Dict]],
+) -> tuple:
+    """Turn an ordered selection into (new washtag_data, source blob paths).
+
+    Pure: no DB, no GCS, so the ordering and provenance rules are checkable without
+    either. Position in `selections` is the destination slot, so the returned lists are
+    parallel and 0-indexed here but 1-indexed as blob names.
+
+    Raises ValueError for an unknown source or an out-of-range index; callers map that
+    to a 400.
+
+    The source entry's `id` is deliberately NOT carried over. It is a foreign key into
+    the photography app's WashTag table, and washtag_ai_processor resolves it with
+    `WashTag.filter(id__in=...).order_by("index")` before rebuilding URLs from the
+    *destination* product_id. Copying it verbatim would point the destination's AI
+    analysis at the source parent's rows and re-order the result by the source's index.
+    "manual" is the shape this file already writes for operator-supplied entries, so
+    every existing consumer already tolerates it; provenance moves to `copied_from`,
+    which nothing dereferences.
+    """
+    new_data: List[Dict] = []
+    blob_paths: List[str] = []
+
+    for slot, sel in enumerate(selections, start=1):
+        pid = sel["product_id"]
+        idx = sel["index"]
+
+        if isinstance(idx, bool) or not isinstance(idx, int):
+            raise ValueError(f"Washtag slot must be a whole number, got {idx!r}")
+
+        source = washtags_by_product.get(pid)
+        if source is None:
+            raise ValueError(f"No washtags found for {pid}")
+        if not 1 <= idx <= len(source):
+            raise ValueError(f"{pid} has no washtag {idx}")
+
+        entry = source[idx - 1]
+        expected = sel.get("md5_hash")
+        actual = entry.get("md5_hash")
+        # Only assert when both sides have a hash. The photography writer leaves it
+        # None when encoding fails, and the April backfill left it null wholesale, so
+        # requiring it would reject legitimate rows.
+        if expected and actual and expected != actual:
+            raise ValueError(f"{pid} washtag {idx} changed since it was loaded")
+
+        new_data.append(
+            {
+                "id": "manual",
+                "shot_type": entry.get("shot_type"),
+                "md5_hash": actual,
+                "copied_from": {
+                    "product_id": pid,
+                    "index": idx,
+                    "washtag_id": entry.get("id"),
+                },
+            }
+        )
+        blob_paths.append(f"{pid}/washtag_{idx}.jpg")
+
+    return new_data, blob_paths
 
 
 def validate_product_id(product_id: str) -> str:
@@ -431,6 +503,297 @@ class ImageService:
             error_msg = f"Error saving product images: {str(e)}\n{traceback.format_exc()}"
             logger.error(error_msg)
             return {"success": False, "error": str(e), "status_code": 500}
+
+    # ── Washtag replacement (reassignment) ────────────────────────────
+
+    async def replace_washtags(
+        self,
+        target_product_id: str,
+        selections: List[Dict],
+        source_parent: Optional[str] = None,
+        expected_washtag_updated_at: Optional[str] = None,
+        allow_clear: bool = False,
+    ) -> Dict[str, Any]:
+        """Replace a parent's washtag set with an ordered pick from any parents.
+
+        Washtags are keyed on the parent SKU, so a reassigned child silently inherits
+        its new parent's set. This is what lets an operator carry the old parent's
+        washtags across at reassign time.
+
+        Sources are read-only; only the target is written, which is why the advisory
+        lock is taken on the target alone. The target's list is REPLACED, so an empty
+        `selections` clears it, which is what `allow_clear` guards.
+        """
+        # This is reached from the reassignment flow rather than from a route, and its
+        # caller treats any raise as an unexpected failure worth a stack trace. A bad
+        # SKU is a plain bad request, so it returns like every other one rather than
+        # escaping as an exception.
+        try:
+            target_product_id = validate_product_id(target_product_id)
+            source_ids = {validate_product_id(s["product_id"]) for s in selections}
+        except ValueError as e:
+            return {"success": False, "error": str(e), "status_code": 400}
+
+        if not selections and not allow_clear:
+            return {
+                "success": False,
+                "error": "Select at least one washtag",
+                "status_code": 400,
+            }
+
+        seen = set()
+        for s in selections:
+            key = (s["product_id"], s["index"])
+            if key in seen:
+                return {
+                    "success": False,
+                    "error": "The same washtag was selected twice",
+                    "status_code": 400,
+                }
+            seen.add(key)
+
+        conn = self._get_conn()
+        lock_key = _product_lock_key(target_product_id)
+
+        try:
+            async with conn._pool.acquire() as raw_conn:
+                acquired = await raw_conn.fetchval(
+                    "SELECT pg_try_advisory_lock($1)", lock_key
+                )
+                if not acquired:
+                    return {
+                        "success": False,
+                        "error": "Washtags are being modified by another process",
+                        "status_code": 409,
+                    }
+                try:
+                    return await self._replace_washtags_locked(
+                        raw_conn,
+                        target_product_id,
+                        sorted(source_ids),
+                        selections,
+                        source_parent,
+                        expected_washtag_updated_at,
+                    )
+                finally:
+                    try:
+                        await raw_conn.fetchval(
+                            "SELECT pg_advisory_unlock($1)", lock_key
+                        )
+                    except Exception as unlock_err:
+                        logger.warning(
+                            f"Failed to release advisory lock for {target_product_id}: {unlock_err}"
+                        )
+        except ValueError as e:
+            return {"success": False, "error": str(e), "status_code": 400}
+        except Exception as e:
+            logger.error(
+                f"Error replacing washtags for {target_product_id}: {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": "Could not update washtags", "status_code": 500}
+
+    async def _replace_washtags_locked(
+        self,
+        raw_conn,
+        target_product_id: str,
+        source_ids: List[str],
+        selections: List[Dict],
+        source_parent: Optional[str],
+        expected_washtag_updated_at: Optional[str],
+    ) -> Dict[str, Any]:
+        # One query for the target and every source. asyncpg connections are not
+        # concurrency-safe, so gathering a query per source on this locked connection
+        # would raise "another operation is in progress". _resolve_rows reads
+        # image_source, image_data and washtag_data, so a trimmed SELECT would KeyError.
+        wanted = sorted({target_product_id, *source_ids})
+        rows = await raw_conn.fetch(
+            """
+            SELECT id, product_id, image_source, image_data, washtag_data,
+                   washtag_count, product_type, updated_at
+            FROM productimages
+            WHERE product_id = ANY($1::text[])
+            ORDER BY updated_at DESC
+            """,
+            wanted,
+        )
+
+        by_product: Dict[str, List] = {pid: [] for pid in wanted}
+        for r in rows:
+            by_product[r["product_id"]].append(r)
+
+        target_rows = by_product[target_product_id]
+        _, washtag_row = _resolve_rows(target_rows)
+
+        db_updated_at = (
+            washtag_row["updated_at"].isoformat()
+            if washtag_row and washtag_row["updated_at"]
+            else None
+        )
+        # Plain != rather than save_product_images' `a and b and a != b`: that form
+        # skips the check entirely when either side is None, and "the destination has
+        # no washtag row yet" is precisely the case this feature exists for, so a row
+        # appearing under us has to be a conflict rather than a silent overwrite.
+        if (expected_washtag_updated_at or None) != db_updated_at:
+            return {
+                "success": False,
+                "error": "Washtags changed elsewhere. Reload and try again.",
+                "status_code": 409,
+            }
+
+        washtags_by_product = {
+            pid: _as_list(_resolve_rows(prows)[1]["washtag_data"]) if prows else []
+            for pid, prows in by_product.items()
+        }
+        new_data, blob_paths = _plan_washtag_copy(selections, washtags_by_product)
+
+        current = _as_list(washtag_row["washtag_data"]) if washtag_row else []
+        old_count = len(current)
+
+        def _identity(entries):
+            return [
+                (e.get("md5_hash"), (e.get("copied_from") or {}).get("product_id"),
+                 (e.get("copied_from") or {}).get("index"))
+                for e in entries
+            ]
+
+        unchanged = _identity(current) == _identity(new_data)
+
+        if not unchanged:
+            ok = await self._copy_washtag_blobs(target_product_id, blob_paths)
+            if not ok:
+                # GCS first, DB last, and abort here rather than committing a row that
+                # claims washtags the bucket does not have. The row still describes the
+                # old state, so a re-run recomputes and converges.
+                return {
+                    "success": False,
+                    "error": "Could not copy washtag images, please retry",
+                    "status_code": 502,
+                }
+
+            record_id = washtag_row["id"] if washtag_row else None
+            if record_id is None:
+                # Only when the product has no productimages row at all. _resolve_rows
+                # falls back washtag_row -> image_row -> rows[0], so any existing row
+                # means we write onto it; creating one here would shadow the row the
+                # photography app owns.
+                record_id = await raw_conn.fetchval(
+                    """
+                    INSERT INTO productimages
+                        (id, product_id, image_source, source_id, product_type,
+                         washtag_data, washtag_count, reassigned_from)
+                    VALUES ($1, $2, 'manual', '', $3, $4::jsonb, $5, $6)
+                    RETURNING id
+                    """,
+                    uuid.uuid4(),
+                    target_product_id,
+                    None,
+                    json.dumps(new_data),
+                    len(new_data),
+                    source_parent,
+                )
+                logger.info(
+                    f"replace_washtags {target_product_id} row={record_id} "
+                    f"before=[] after={json.dumps(new_data)} (new row)"
+                )
+            else:
+                # Pre-image at INFO: once this UPDATE lands the destination's previous
+                # array exists nowhere else, and the log is what made the SPO mapping
+                # wipe recoverable.
+                logger.info(
+                    f"replace_washtags {target_product_id} row={record_id} "
+                    f"before={json.dumps(current)} after={json.dumps(new_data)}"
+                )
+                updated = await raw_conn.execute(
+                    """
+                    UPDATE productimages
+                    SET washtag_data = $1::jsonb,
+                        washtag_count = $2,
+                        reassigned_from = COALESCE($3, reassigned_from),
+                        updated_at = NOW()
+                    WHERE id = $4 AND updated_at = $5
+                    """,
+                    json.dumps(new_data),
+                    len(new_data),
+                    source_parent,
+                    record_id,
+                    washtag_row["updated_at"],
+                )
+                # The photography app writes this row and takes no lock, so the
+                # advisory lock only serialises SkuBase against SkuBase.
+                if updated.endswith(" 0"):
+                    return {
+                        "success": False,
+                        "error": "Washtags changed elsewhere. Reload and try again.",
+                        "status_code": 409,
+                    }
+
+        # Always, including the unchanged path: the DB is not the authority on what the
+        # bucket holds. sellercloud_service blind-probes washtag_1..3 at submission
+        # time, so a ghost blob past the end reaches live listings, and short-circuiting
+        # on a DB-only comparison would freeze that divergence forever.
+        await self._cleanup_washtag_blobs(
+            target_product_id, len(new_data), max(old_count, MAX_WASHTAG_IMAGES)
+        )
+
+        return {"success": True, "washtag_count": len(new_data), "unchanged": unchanged}
+
+    async def _copy_washtag_blobs(self, target_product_id: str, blob_paths: List[str]) -> bool:
+        """Copy sources into the target's washtag slots. True if every copy landed.
+
+        Staging through temp names is only needed when a copy READS a target slot the
+        same operation also WRITES, which can only happen when a source is the target
+        itself and the slot moves. Cross-parent copies cannot collide, and a slot
+        copying to itself is a no-op worth skipping outright. The picker cannot produce
+        the colliding shape, so the staged path is a guard for direct callers.
+        """
+        needs_staging = any(
+            src.startswith(f"{target_product_id}/") and src != f"{target_product_id}/washtag_{slot}.jpg"
+            for slot, src in enumerate(blob_paths, start=1)
+        )
+
+        direct = [
+            (src, f"{target_product_id}/washtag_{slot}.jpg")
+            for slot, src in enumerate(blob_paths, start=1)
+            if src != f"{target_product_id}/washtag_{slot}.jpg"
+        ]
+        if not direct:
+            return True
+
+        if not needs_staging:
+            results = await asyncio.gather(*(self._copy_blob(s, d) for s, d in direct))
+            return all(r is not None for r in results)
+
+        temp_prefix = f"_tmp_{uuid.uuid4().hex[:8]}"
+        staged = [
+            (src, f"{target_product_id}/{temp_prefix}_washtag_{i}.jpg", dest)
+            for i, (src, dest) in enumerate(direct, start=1)
+        ]
+        try:
+            first = await asyncio.gather(*(self._copy_blob(s, t) for s, t, _ in staged))
+            if any(r is None for r in first):
+                # Nothing live has been touched yet, so aborting here is free.
+                return False
+            second = await asyncio.gather(*(self._copy_blob(t, d) for _, t, d in staged))
+            return all(r is not None for r in second)
+        finally:
+            # In a finally, not on the success path: an abort above would otherwise
+            # leave _tmp_ blobs under the product's own prefix, invisible to the
+            # gallery because it reads the DB, and reaped by nothing.
+            await asyncio.gather(
+                *(self._delete_blob(t) for _, t, _ in staged), return_exceptions=True
+            )
+
+    async def _cleanup_washtag_blobs(self, product_id: str, keep: int, upper: int) -> None:
+        """Delete washtag slots above `keep`, up to `upper` inclusive."""
+        if upper <= keep:
+            return
+        await asyncio.gather(
+            *(
+                self._delete_blob(f"{product_id}/washtag_{i}.jpg")
+                for i in range(keep + 1, upper + 1)
+            ),
+            return_exceptions=True,
+        )
 
     # ── SellerCloud hand-off ───────────────────────────────────────────
 
