@@ -32,6 +32,15 @@ Rules:
   In the second, 29 is the waist: it stays in sku and is dropped from mpn.
 - label.sku is the full code exactly as printed, character for character,
   including any size suffix. Do not join, normalise or shorten it.
+- Many tags carry no style code at all. A care label reading only "AMIRI / 100%
+  COTTON / LINING 100% LYOCELL / MADE IN USA / RN 150712 / 7 3/8" gives you a
+  brand, a size and an RN number and nothing more, so mpn, sku, colour_name and
+  title are all empty strings. Never fill a label key from a retailer's page,
+  from the listing's own fields, or from our barcode sticker, not even when you
+  are confident the code is right. Put that code in the verdict instead, where
+  it belongs, and say the evidence was the web. An empty label key is a good
+  answer; a borrowed one is a false claim about the item in hand, and the
+  operator cannot catch it without going and looking at the tag.
 - Not every tag is the manufacturer's. Consignment and resale tags carry a
   handwritten or reprinted name, sometimes a price, and are often simply wrong
   about the product. A tag line like "NWT RHUDE GREEN SWIM TRUNKS SIZE L $395" is

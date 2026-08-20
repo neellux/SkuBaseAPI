@@ -426,6 +426,70 @@ async def read_tag_text(product_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
+# Everything that is not a letter or a digit, so a value the tag prints as
+# "AW23MKB005 100" still matches an mpn joined with an underscore, and
+# "M5056-CMIW424-29" still matches one with the size dropped.
+_NOT_ALNUM = re.compile(r"[^A-Z0-9]+")
+
+# The label keys that are meant to be a transcription and can therefore be
+# checked character by character. is_manufacturer_tag is a judgement, not a
+# quotation, and other_codes is checked element by element.
+_TRANSCRIBED_LABEL_KEYS = ("brand", "title", "mpn", "sku", "colour_name", "upc", "size")
+
+# Below this a needle matches by accident: size "M" is in almost any text.
+_MIN_CHECKABLE = 3
+
+
+def _printed(value: Any, haystack: str) -> bool:
+    needle = _NOT_ALNUM.sub("", str(value or "").upper())
+    if len(needle) < _MIN_CHECKABLE:
+        # Too short to check either way, so it is left as the model gave it.
+        return True
+    return needle in haystack
+
+
+def drop_unprinted_label_values(
+    label: Dict[str, Any], tag_text: Optional[Dict[str, Any]]
+) -> List[str]:
+    """Blank anything in the label block that the tag does not actually print.
+
+    The model fills this block from the web and from the listing's own fields
+    even when the prompt forbids it. AMR-MACC-0176's care label carries a brand,
+    a size and an RN number and no style code whatsoever, and it still returned
+    mpn SS23MAH014_420 (the stockists' code) and sku SS23MAH014_BLUE (ours).
+    The UI renders those rows as "MPN on tag", which turns a borrowed value into
+    a claim about the physical item -- the one claim an operator cannot check
+    without walking to the shelf, and the one they are most entitled to trust.
+
+    Only runs where the transcription exists, which is the only ground truth
+    there is. On the ~6% with no washtagdata row the photographs went to the
+    model instead and there is nothing to check against, so the block stands.
+
+    Returns the keys it cleared, for the log and the diagnostics.
+    """
+    if not tag_text:
+        return []
+    haystack = _NOT_ALNUM.sub(
+        "",
+        " ".join(t.get("text") or "" for t in tag_text.get("tag_texts") or []).upper(),
+    )
+    if not haystack:
+        return []
+
+    dropped = []
+    for key in _TRANSCRIBED_LABEL_KEYS:
+        if label.get(key) and not _printed(label[key], haystack):
+            dropped.append(key)
+            label[key] = ""
+    codes = label.get("other_codes")
+    if isinstance(codes, list):
+        kept = [c for c in codes if _printed(c, haystack)]
+        if len(kept) != len(codes):
+            dropped.append("other_codes")
+            label["other_codes"] = kept
+    return dropped
+
+
 # A code worth searching: mixed letters and digits, long enough not to be a size
 # or a care symbol. Matches PS23MAB005, AW23MKB005, MPVCK966, M5056.
 _CODE_TOKEN = re.compile(r"\b(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{5,}\b")
@@ -1068,7 +1132,15 @@ async def _shape_result(
     """Translate the model's vocabulary into this app's, and attach the extras."""
     from services.product_service import format_mpn
 
-    label = dict(raw.get("label") or {})
+    # Two copies deliberately. The block as the model returned it stays the
+    # better set of search terms even where it is not a transcription: a code it
+    # read off a retailer is exactly what to search that retailer for. It just
+    # must not be shown to an operator as something the tag says.
+    model_label = dict(raw.get("label") or {})
+    label = dict(model_label)
+    unprinted = drop_unprinted_label_values(label, tag_text)
+    if unprinted:
+        logger.info(f"Label values the tag does not print, cleared: {', '.join(unprinted)}")
     if label.get("mpn"):
         # Compared against listings.data.manufacturer_sku under the same rule SKU
         # creation uses, so "AW23MKB005 100" and "AW23MKB005_100" are one value.
@@ -1115,7 +1187,7 @@ async def _shape_result(
             src["url"] = ""
             url = ""
         src["domain"] = domain_of(url)
-        query, search_url = build_search_url(url, search_terms_for(src, label, fields))
+        query, search_url = build_search_url(url, search_terms_for(src, model_label, fields))
         src["search_query"] = query
         src["search_url"] = search_url
     if unresolved:
@@ -1175,6 +1247,7 @@ async def _shape_result(
         "diagnostics": {
             "searches": list(getattr(meta, "web_search_queries", None) or []),
             "tokens": usage["tokens"],
+            "label_dropped": unprinted,
             "country_of_origin": (tag_text or {}).get("country_of_origin"),
         },
     }
