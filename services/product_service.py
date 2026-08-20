@@ -1458,7 +1458,10 @@ class ProductService:
                 target_product_id=new_parent_sku,
                 selections=resolved,
                 source_parent=old_parent_sku,
-                expected_washtag_updated_at=None,
+                # Deliberately not asserting a timestamp: the choice was made before
+                # the reassignment ran, so there is no read here to assert against, and
+                # a stale one would silently drop the copy. The advisory lock and the
+                # guarded UPDATE still protect the row.
                 allow_clear=True,
             )
             if not result.get("success"):

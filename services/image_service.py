@@ -81,6 +81,11 @@ WASHTAG_SOURCE = "batch_creation"
 
 _resize_semaphore = asyncio.Semaphore(MAX_CONCURRENT_RESIZE)
 
+# Distinguishes "the caller is not asserting anything about the current state" from
+# "the caller read no washtag row and is asserting that is still true". Both were None
+# before, which made every destination that already had washtags look like a conflict.
+_UNSET = object()
+
 
 def _as_list(value) -> List[Dict]:
     if not value:
@@ -525,7 +530,7 @@ class ImageService:
         target_product_id: str,
         selections: List[Dict],
         source_parent: Optional[str] = None,
-        expected_washtag_updated_at: Optional[str] = None,
+        expected_washtag_updated_at=_UNSET,
         allow_clear: bool = False,
     ) -> Dict[str, Any]:
         """Replace a parent's washtag set with an ordered pick from any parents.
@@ -644,16 +649,19 @@ class ImageService:
             if washtag_row and washtag_row["updated_at"]
             else None
         )
-        # Plain != rather than save_product_images' `a and b and a != b`: that form
-        # skips the check entirely when either side is None, and "the destination has
-        # no washtag row yet" is precisely the case this feature exists for, so a row
-        # appearing under us has to be a conflict rather than a silent overwrite.
-        if (expected_washtag_updated_at or None) != db_updated_at:
-            return {
-                "success": False,
-                "error": "Washtags changed elsewhere. Reload and try again.",
-                "status_code": 409,
-            }
+        # Only when the caller actually read the state and is asserting it. Plain !=
+        # rather than save_product_images' `a and b and a != b`: that form skips the
+        # check whenever either side is None, and "the destination has no washtag row
+        # yet" is precisely the case this feature exists for, so a row appearing under
+        # us has to be a conflict. The server-side apply has no such read to assert, so
+        # it leaves this unset and relies on the advisory lock plus the guarded UPDATE.
+        if expected_washtag_updated_at is not _UNSET:
+            if (expected_washtag_updated_at or None) != db_updated_at:
+                return {
+                    "success": False,
+                    "error": "Washtags changed elsewhere. Reload and try again.",
+                    "status_code": 409,
+                }
 
         washtags_by_product = {
             pid: _as_list(_resolve_rows(prows)[1]["washtag_data"]) if prows else []
