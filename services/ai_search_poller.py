@@ -48,7 +48,6 @@ class AISearchPoller(BasePoller):
         self.max_attempts: int = cfg.get("max_attempts", 3)
         self.retry_backoff_seconds: int = cfg.get("retry_backoff_seconds", 120)
         self.stale_timeout_minutes: int = cfg.get("stale_timeout_minutes", 15)
-        self.max_runs_per_day: int = cfg.get("max_runs_per_day", 200)
         # One-tick circuit breaker. A single 429 means the window is already
         # contended, and marching straight back in at concurrency 3 is how a soft
         # limit becomes a hard one.
@@ -75,14 +74,6 @@ class AISearchPoller(BasePoller):
         if self._cool_off_next_cycle:
             self._cool_off_next_cycle = False
             logger.warning(f"{self.name}: cooling off one cycle after a rate limit")
-            return
-
-        spent = await queue.runs_in_last_day()
-        if spent >= self.max_runs_per_day:
-            logger.error(
-                f"{self.name}: daily cap reached ({spent}/{self.max_runs_per_day} runs in 24h); "
-                "skipping this cycle. Jobs stay pending, nothing is lost."
-            )
             return
 
         jobs = await queue.claim_batch(self.batch_size)

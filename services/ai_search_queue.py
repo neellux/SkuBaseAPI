@@ -191,18 +191,6 @@ async def requeue_stale(timeout_minutes: int, max_attempts: int) -> int:
     return len(rows)
 
 
-async def runs_in_last_day() -> int:
-    """Grounded prompts billed in the last 24h, for the spend guard."""
-    rows = await _conn().execute_query_dict(
-        """
-        SELECT count(*) AS n FROM listing_ai_search_jobs
-        WHERE completed_at > CURRENT_TIMESTAMP - interval '1 day'
-          AND status IN ('completed', 'failed')
-        """
-    )
-    return rows[0]["n"] if rows else 0
-
-
 async def active_for_listing(listing_id: str) -> Optional[Dict[str, Any]]:
     """The in-flight job for a listing, if any. Drives the UI's pending/running."""
     rows = await _conn().execute_query_dict(
