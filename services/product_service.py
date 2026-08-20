@@ -2870,6 +2870,23 @@ class ProductService:
                         f"Bulk placeholder cleanup failed for {target_child_sku}: {cleanup_err}"
                     )
 
+            # Washtags are parent-level, so they are applied once the whole bulk has
+            # drained rather than per child. It has to happen here, on the call that
+            # emptied the queue, and not in the "nothing pending" branch above: the UI
+            # stops polling /process the moment /status reports completed, and that
+            # happens on this very tick, so that branch is never reached from a browser.
+            # Failed assignments are deliberately not counted as remaining, so a
+            # partially failed bulk still carries the washtags across.
+            remaining = await conn.execute_query_dict(
+                """SELECT 1 FROM parent_child_assignments
+                   WHERE bulk_reassignment_id = $1
+                     AND status IN ('pending', 'in_progress')
+                   LIMIT 1""",
+                [bulk_id],
+            )
+            if not remaining:
+                await ProductService._apply_bulk_washtag_selections(bulk_id)
+
             return {
                 "success": True,
                 "status": "processed",
