@@ -191,6 +191,19 @@ def _plan_washtag_copy(
     return new_data, blob_paths
 
 
+async def _ensure_pool(conn) -> None:
+    """Force Tortoise to build the asyncpg pool before anyone reaches into it.
+
+    Tortoise creates the pool lazily on the first query, so on a freshly started
+    process conn._pool is still None and conn._pool.acquire() raises AttributeError.
+    In the API a read has usually run first, which masks it, and that is what makes it
+    unpleasant: it only bites the first write after a restart, and both write paths
+    below swallow the failure into a logged warning.
+    """
+    if getattr(conn, "_pool", None) is None:
+        await conn.execute_query("SELECT 1")
+
+
 def validate_product_id(product_id: str) -> str:
     """Validate a product id used as a GCS blob prefix and as an advisory lock key.
 
@@ -317,6 +330,7 @@ class ImageService:
         lock_key = _product_lock_key(product_id)
 
         try:
+            await _ensure_pool(conn)
             # Hold a session-scoped advisory lock on a single pooled connection for the
             # entire fetch → validate → GCS → UPDATE flow, so concurrent saves for the
             # same product can't race on GCS or clobber each other's DB writes.
@@ -556,6 +570,7 @@ class ImageService:
         lock_key = _product_lock_key(target_product_id)
 
         try:
+            await _ensure_pool(conn)
             async with conn._pool.acquire() as raw_conn:
                 acquired = await raw_conn.fetchval(
                     "SELECT pg_try_advisory_lock($1)", lock_key
