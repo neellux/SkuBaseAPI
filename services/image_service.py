@@ -1115,6 +1115,13 @@ class ImageService:
                 GCS_BUCKET, blob_path, timeout=GCS_TIMEOUT_SECONDS
             )
         except Exception as e:
+            # The washtag cleanup sweeps every slot above the new count whether or not
+            # a blob is there, so "already absent" is the expected outcome, not a
+            # failure. Logging it at warning would bury the deletes that really did
+            # fail, which are the ones that leave a ghost slot for SellerCloud to find.
+            if getattr(e, "status", None) == 404 or " 404," in f"{e}":
+                logger.debug(f"Nothing to delete at {blob_path}")
+                return
             logger.warning(f"Failed to delete {blob_path}: {e}")
 
     async def _upload_blob(
