@@ -126,7 +126,43 @@ async def create_listing(request_data: CreateListingRequest, request: Request):
         ) from e
     request_data.info_product_id = full_product_id
 
-    listing = await ListingService.create_listing(request_data, created_by)
+    # One listing has no batch to blow a timeout, so its AI search runs inline
+    # with the aspects call and the suggestions are on the form when it opens.
+    listing = await ListingService.create_listing(
+        request_data, created_by, ai_search_inline=True
+    )
+
+    # Belt and braces. The enqueue below is a no-op when the inline search
+    # succeeded -- enqueue_for_listings skips anything already marked done -- and
+    # picks it up when it did not, so a failed inline search still gets a run.
+    # BatchService._enqueue_verification does the same for the batch path.
+    # It belongs here rather than inside ListingService.create_listing because
+    # the batch path calls that from inside its transaction, and a job row
+    # written there would be visible to the poller before the listing it points
+    # at had committed.
+    #
+    # Never raises, same contract as the batch path: a listing must still be
+    # created when the queue is unavailable, and the operator can run the search
+    # by hand from the listing view.
+    try:
+        from services import ai_search_queue
+
+        from services.ai_search_poller import ai_search_poller
+
+        await ai_search_queue.enqueue_for_listings(
+            [(listing.id, listing.info_product_id or listing.product_id)],
+            reason="listing_create",
+        )
+        # Start now rather than on the poller's next tick, so the operator who
+        # opens this listing straight after creating it is waiting only for the
+        # search itself.
+        ai_search_poller.kick()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"Listing {listing.id} created, but queueing its AI search failed; "
+            "it can be run by hand from the listing view"
+        )
+
     return listing
 
 
@@ -299,6 +335,129 @@ async def delete_listing(listing_id: str = Query(..., description="Listing ID"))
     if not success:
         raise HTTPException(status_code=404, detail="Listing not found")
     return {"message": "Listing deleted successfully"}
+
+
+@router.get("/ai_search")
+async def get_listing_ai_search(
+    listing_id: str = Query(..., description="Listing ID"),
+):
+    """The AI search result for a listing, plus whether one is in flight.
+
+    Deliberately its own endpoint rather than a field on ListingResponse. The
+    blob runs to several KB, and ListingResponse is also serialized by
+    GET /listings/batch/detail for up to 50 listings at a time and by the listing
+    list, none of which render it. ListingView already fires /listings/detail and
+    /listings/images together, so this becomes a third leg of that same
+    Promise.all: one more round trip, no extra latency.
+
+    Live state comes from the queue and the stored result only ever holds a
+    terminal status, so the two cannot disagree about whether a run is going.
+    """
+    from services import ai_search_queue
+    from services.ai_search_service import (
+        SURFACED_FIELDS,
+        input_fingerprint,
+        is_configured,
+    )
+
+    listing = await Listing.get_or_none(id=listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+
+    rows = await Tortoise.get_connection("default").execute_query_dict(
+        "SELECT ai_search FROM listings WHERE id = $1", [listing_id]
+    )
+    stored = rows[0]["ai_search"] if rows else None
+    if isinstance(stored, str):
+        try:
+            stored = orjson.loads(stored)
+        except orjson.JSONDecodeError:
+            stored = None
+    if not isinstance(stored, dict):
+        stored = None
+
+    job = await ai_search_queue.active_for_listing(listing_id)
+    if job:
+        status = job["status"]
+        job_payload = {
+            "id": job["id"],
+            "reason": job["reason"],
+            "attempts": job["attempts"],
+            "error": job["error"],
+            "position": await ai_search_queue.queue_position(job["id"]),
+            "queued_at": job["created_at"],
+            "started_at": job["started_at"],
+        }
+    else:
+        status = (stored or {}).get("status") or "none"
+        job_payload = None
+
+    # A verdict formed before the operator's last edit still has value, but the UI
+    # has to be able to say so rather than quietly comparing against a stale value.
+    stale = False
+    if stored and stored.get("input", {}).get("fingerprint"):
+        stale = stored["input"]["fingerprint"] != input_fingerprint(
+            listing.data or {}, stored["input"].get("image_urls") or []
+        )
+
+    fields = {
+        name: verdict
+        for name, verdict in ((stored or {}).get("fields") or {}).items()
+        if name in SURFACED_FIELDS
+    }
+    return {
+        "listing_id": listing_id,
+        "status": status,
+        "configured": is_configured(),
+        "stale": stale,
+        "job": job_payload,
+        "verified_at": (stored or {}).get("verified_at"),
+        "error": (stored or {}).get("error"),
+        "fields": fields,
+        # Hoisted: the tag is frequently the only evidence there is, and the UI
+        # must be able to render it with zero sources.
+        "label": (stored or {}).get("label") or {},
+        "sources": (stored or {}).get("sources") or [],
+        "notes": (stored or {}).get("notes") or "",
+        "conflict_count": sum(1 for v in fields.values() if v.get("status") == "conflict"),
+    }
+
+
+@router.post("/ai_search")
+async def run_listing_ai_search(
+    request: Request,
+    listing_id: str = Query(..., description="Listing ID"),
+):
+    """Queue a fresh verification for one listing and return immediately.
+
+    Returns rather than waiting because the call takes 5-47s. The poller is
+    kicked so the operator waits out the call itself and not the poll interval
+    on top of it.
+    """
+    from services import ai_search_queue
+    from services.ai_search_poller import ai_search_poller
+    from services.ai_search_service import build_search_options, is_configured
+
+    listing = await Listing.get_or_none(id=listing_id)
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    if not is_configured() or not ai_search_poller.enabled:
+        raise HTTPException(status_code=503, detail="AI search is off")
+    if not build_search_options(listing.data or {}):
+        raise HTTPException(status_code=400, detail="Add a brand, MPN or style first")
+
+    job_id = await ai_search_queue.enqueue(
+        listing_id,
+        listing.info_product_id or listing.product_id,
+        reason="manual",
+        requested_by=request.state.user["id"],
+    )
+    ai_search_poller.kick()
+    return {
+        "status": "queued",
+        "job_id": job_id,
+        "position": await ai_search_queue.queue_position(job_id),
+    }
 
 
 @router.get("/submission_status")

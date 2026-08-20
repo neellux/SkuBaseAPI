@@ -45,6 +45,16 @@ BATCH_SORTS = {
 }
 DEFAULT_BATCH_SORT = "value_desc"
 
+# Above this many products, the AI web/tag search is queued for the poller
+# instead of running inline with the aspects call.
+#
+# A search is ~18s and runs 3-wide, so 12 products is 4 waves, ~72s, on top of
+# the SellerCloud prefill and the aspects model. That fits inside the 5-minute
+# timeout PhotoManagementNew now allows with room to spare, while 23 (the
+# largest batch in the last 60 days) would not leave much. Batches are median 6,
+# so most run inline and only the unusually large ones wait for the poller.
+INLINE_AI_SEARCH_MAX = 12
+
 
 def _sorts_after(order_by: tuple[str, ...], row: Batch) -> Q:
     """Rows that sort strictly after `row` under `order_by`, every field of which is DESC.
@@ -128,6 +138,16 @@ class BatchService:
                 ],
             ) from e
 
+        # Small batches get their AI search inline, alongside the aspects call,
+        # so the suggestions are already there when the operator opens the first
+        # listing. Large ones would push the request past the caller's timeout,
+        # so they fall back to the queue.
+        ai_search_inline = len(request.product_ids) <= INLINE_AI_SEARCH_MAX
+        logger.info(
+            f"Batch of {len(request.product_ids)}: AI search will run "
+            f"{'inline with aspects' if ai_search_inline else 'via the queue'}"
+        )
+
         logger.info("Pre-fetching default template for batch processing")
         sellercloud_template = await TemplateService.get_template_by_id("default")
 
@@ -185,6 +205,7 @@ class BatchService:
                                     created_by,
                                     sellercloud_template=sellercloud_template,
                                     mapped_options=mapped_options,
+                                    ai_search_inline=ai_search_inline,
                                 )
 
                                 listing = await Listing.get(id=listing_response.id)
@@ -254,6 +275,7 @@ class BatchService:
                 )
 
             await BatchService._snapshot_value(batch, sorted(set(parents.values())))
+            await BatchService._enqueue_verification(successful_listings)
 
             return await BatchService._to_response(batch, include_listings=True)
 
@@ -294,6 +316,54 @@ class BatchService:
             update_fields=["total_value", "product_values", "value_computed_at"]
         )
         logger.info(f"Batch {batch.id} valued at {total} across {len(breakdown)} products")
+
+    @staticmethod
+    async def _enqueue_verification(listings: List[Listing]) -> None:
+        """Queue AI search for the batch's listings. Never raises.
+
+        Same contract and the same placement as _snapshot_value above, for the
+        same reason: the photography service posts to /api/create_batch with no
+        pre-validation behind a 120s timeout, and a batch that is otherwise
+        complete must not roll back because a queue insert failed. A missed
+        enqueue leaves ai_search NULL, which the operator fixes with the
+        re-run button and backfill_ai_search.py sweeps up.
+
+        Verification itself is NOT run here. A grounded call takes 5-47s, so
+        adding a third inline model call to the two already running per listing
+        would blow the caller's timeout. This is one INSERT, milliseconds.
+
+        The relink path above (an existing draft joined to this batch, which
+        skips AI) is enqueued too. The queue's SQL decides what actually runs:
+        an already-verified draft is skipped, an unverified or failed one is
+        picked up, which makes every batch a free backfill for what it touches.
+        """
+        if not listings:
+            return
+        try:
+            from services import ai_search_queue
+
+            queued = await ai_search_queue.enqueue_for_listings(
+                [(listing.id, listing.info_product_id or listing.product_id) for listing in listings]
+            )
+            if queued:
+                # Start now instead of waiting out the poller's interval. The
+                # search itself takes 17-42s; without this it also waits up to
+                # another 30s first, which is most of the gap between creating a
+                # listing and finding its suggestions already there.
+                #
+                # Not run inline with the aspects call for the same reason it is
+                # not run inline at all: at concurrency 3 a 23-listing batch
+                # would add ~216s to a request PhotoManagementNew abandons at
+                # 120s. Kicking is the cheap half of that win, without the risk.
+                from services.ai_search_poller import ai_search_poller
+
+                ai_search_poller.kick()
+                logger.info(f"Queued AI search for {queued} listing(s)")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Batch created, but queueing AI search failed; listings keep their "
+                "existing ai_search and can be re-run from the listing view"
+            )
 
     @staticmethod
     async def get_batch_by_id(

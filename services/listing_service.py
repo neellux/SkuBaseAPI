@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -21,6 +22,7 @@ from services.product_service import format_mpn
 from services.sellercloud_service import sellercloud_service
 from services.template_render import render_template, resolve_field_template
 from services.template_service import TemplateService
+import orjson
 from tortoise import connections
 
 logger = logging.getLogger(__name__)
@@ -368,16 +370,58 @@ class ListingService:
             )
 
     @staticmethod
+    @staticmethod
+    async def _run_ai_search_inline(
+        request: CreateListingRequest, prefilled_data: Dict[str, Any], enabled: bool
+    ) -> Optional[Dict[str, Any]]:
+        """Run the AI web/tag search now, or return None to leave it to the poller.
+
+        Never raises. A search that fails must not cost a listing, let alone the
+        whole batch it is in: this runs inside create_batch's transaction, where
+        an exception rolls back every listing created so far. The caller falls
+        back to queueing whatever comes back None, so nothing is lost either way.
+        """
+        if not enabled:
+            return None
+        try:
+            from services.ai_search_service import is_configured, run_for_fields
+
+            if not is_configured():
+                return None
+            return await run_for_fields(
+                prefilled_data,
+                product_id=request.info_product_id or request.product_id,
+                parent_product_id=request.product_id,
+                reason="listing_create",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"Inline AI search failed for {request.product_id}; it will be queued instead"
+            )
+            return None
+
+    @staticmethod
     async def create_listing(
         request: CreateListingRequest,
         created_by: str,
         sellercloud_template: Optional[TemplateResponse] = None,
         mapped_options: Optional[Dict[str, List[Any]]] = None,
+        ai_search_inline: bool = False,
     ) -> ListingResponse:
+        """Create one listing, prefilled from SellerCloud and filled in by AI.
+
+        ai_search_inline runs the AI web/tag search alongside the aspects call
+        rather than queueing it for the poller, so the suggestions are already on
+        the listing when the operator opens it. It roughly triples how long this
+        takes (~5s to ~18s), which is why the caller decides: single-listing
+        creation always does it, and a batch only when it is small enough to
+        finish inside the caller's timeout. See BatchService.INLINE_AI_SEARCH_MAX.
+        """
         try:
             ai_response_data = None
             ai_description = None
             original_description = None
+            verification = None
             start_time = time.time()
             product_data = None
 
@@ -500,8 +544,21 @@ class ListingService:
                         # template field to a list column chose that list deliberately.
                         mapped_options = {**ebay_options, **(mapped_options or {})}
 
-                        ai_content = await AIService.generate_ai_content(
-                            product_data, fields_for_ai, mapped_options
+                        # The two model calls go together rather than one after
+                        # the other. They need nothing from each other: aspects
+                        # reads the photographs, the search reads the tag and the
+                        # web, and the fields the search checks (brand, MPN,
+                        # style) are already in prefilled_data from SellerCloud -
+                        # ai_response has never once carried manufacturer_sku or
+                        # brand_color, measured across 3,418 listings. So the
+                        # pair costs max(3.4s, ~18s) instead of their sum.
+                        ai_content, verification = await asyncio.gather(
+                            AIService.generate_ai_content(
+                                product_data, fields_for_ai, mapped_options
+                            ),
+                            ListingService._run_ai_search_inline(
+                                request, prefilled_data, ai_search_inline
+                            ),
                         )
                         ai_response_data = ai_content.get("aspects")
                         ai_description = ai_content.get("description")
@@ -592,6 +649,17 @@ class ListingService:
                 upload_status=upload_status,
                 created_by=created_by,
             )
+
+            if verification:
+                # A targeted UPDATE rather than a column on the model: everywhere
+                # else this value is written by the poller minutes later, and a
+                # bare listing.save() from a stale instance must never be able to
+                # put an old copy back. Inside the same transaction, so a
+                # rolled-back batch takes its verifications with it.
+                await connections.get("default").execute_query(
+                    "UPDATE listings SET ai_search = $2::jsonb WHERE id = $1",
+                    [str(listing.id), orjson.dumps(verification).decode()],
+                )
 
             return await ListingService._to_response(listing)
 
