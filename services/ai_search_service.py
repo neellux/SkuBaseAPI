@@ -873,19 +873,23 @@ def search_terms_for(source: Dict[str, Any], label: Dict[str, Any], fields: Dict
 
 
 def build_search_url(url: str, terms: List[str]) -> Tuple[str, str]:
-    """A site:-scoped Google search for a source, as (query, url).
+    """A domain-scoped Google search for a source, as (query, url).
 
     Every source gets one, not just the dead ones. Grounded answers name the
     right retailer and invent the path, and there is no way to recover the real
     one from the response: the grounding chunks carry only redirect URIs. A
     search scoped to that domain lands the operator on the page the model read,
     which is the same move ListingView's MPN menu already makes.
+
+    inurl: rather than site:, and terms unquoted. site: is the stricter operator
+    and an exact phrase is the stricter match, but strict is not what helps here:
+    the product is known to exist and the job is to land on its page, so a query
+    that returns a near-miss beats one that returns nothing. A retailer that
+    words its title differently from the source we recorded drops out of a
+    quoted search entirely.
     """
     host = domain_of(url)
-    # Quoted only when it contains a space. A bare code stays bare so Google can
-    # still reach a page that hyphenates or spaces it differently.
-    parts = [f'"{t}"' if " " in t else t for t in terms]
-    query = " ".join(([f"site:{host}"] if host else []) + parts).strip()
+    query = " ".join(([f"inurl:{host}"] if host else []) + list(terms)).strip()
     return query, f"https://www.google.com/search?q={quote_plus(query)}"
 
 
