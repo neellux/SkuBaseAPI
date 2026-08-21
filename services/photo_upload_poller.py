@@ -78,19 +78,77 @@ class PhotoUploadPoller(BasePoller):
         if not product_ids:
             return
 
-        # The newest row per candidate, across ALL of its rows.
+        # The newest row per candidate, across ALL of its rows, plus whether an edit has
+        # been delivered for THAT ROW'S BATCH.
+        #
+        # The second half is not optional. PhotoManagementNew writes washtags onto the
+        # batch_creation row (gcs_product_uploader.py: it looks up the batch_creation row
+        # and save()s washtag_data onto it), and save() moves updated_at. So a washtag
+        # upload that lands after the edited photos makes batch_creation the newest row
+        # for a product whose photography is finished. Measured on production: 11 of the
+        # 198 products whose newest row is batch_creation are in exactly that state, and
+        # resetting them would gate 12 listings whose images are fine.
+        #
+        # Asking "is there an upload/manual row for the same batch" separates the two:
+        # a genuine re-shoot opens a NEW batch that has no edit yet, while a washtag write
+        # bumps a batch that already has one. IS NOT DISTINCT FROM, not =, because manual
+        # rows carry batch_id NULL and NULL = NULL is never true.
         verdicts = await photo_conn.execute_query_dict(
             """
-            SELECT DISTINCT ON (product_id) product_id, image_source
-            FROM productimages
-            WHERE product_id = ANY($1::text[])
-            ORDER BY product_id, updated_at DESC
+            WITH newest AS (
+                SELECT DISTINCT ON (product_id) product_id, image_source, batch_id
+                FROM productimages
+                WHERE product_id = ANY($1::text[])
+                ORDER BY product_id, updated_at DESC
+            )
+            SELECT n.product_id, n.image_source,
+                   EXISTS (
+                       SELECT 1 FROM productimages e
+                       WHERE e.product_id = n.product_id
+                         AND e.image_source = ANY($2::text[])
+                         AND e.batch_id IS NOT DISTINCT FROM n.batch_id
+                   ) AS edited_for_batch,
+                   EXISTS (
+                       SELECT 1 FROM productimages e
+                       WHERE e.product_id = n.product_id
+                         AND e.image_source = ANY($2::text[])
+                   ) AS ever_edited
+            FROM newest n
             """,
-            [product_ids],
+            [product_ids, list(READY_SOURCES)],
         )
 
-        ready = [v["product_id"] for v in verdicts if v["image_source"] in READY_SOURCES]
-        shot = [v["product_id"] for v in verdicts if v["image_source"] == SHOT_SOURCE]
+        ready, shot = [], []
+        for v in verdicts:
+            if v["image_source"] in READY_SOURCES:
+                ready.append(v["product_id"])
+            elif v["image_source"] == SHOT_SOURCE:
+                # Reset ONLY the latch case this poller exists to fix: an edit was
+                # delivered at some point, and a LATER shoot has not been edited yet.
+                #
+                # Both guards are load-bearing, and each was added after production data
+                # contradicted the simpler rule:
+                #
+                # edited_for_batch - a washtag upload save()s the batch_creation row and
+                #   moves its updated_at, so "newest row is batch_creation" is true for 11
+                #   products whose photography is finished.
+                #
+                # ever_edited - a product can reach GCS with edited images and have NO
+                #   upload/manual row at all (AMR-MJNS-0136, AMR-WBTM-0041, AMR-WOTW-0036
+                #   are batch_creation-only yet hold 3000x3000 edits). Those were never
+                #   latched, so resetting them would gate a product whose photos are fine
+                #   and that nothing will ever un-gate.
+                if v["ever_edited"] and not v["edited_for_batch"]:
+                    shot.append(v["product_id"])
+                # Otherwise LEAVE IT ALONE - deliberately neither bucket.
+                #
+                # Not `ready`: a product whose only rows are batch_creation has never had
+                # an edit delivered, and releasing it would open the images gate on raw
+                # studio captures. PRP-MTPS-0042 is exactly that shape, and an earlier
+                # draft of this function would have flipped it to 'uploaded'.
+                #
+                # Not `shot`: it was never latched, so there is nothing to undo, and
+                # gating it would strand a listing nothing will ever un-gate.
 
         default_conn = connections.get("default")
 
