@@ -94,12 +94,17 @@ FIELD_TO_LISTING_KEY = {
     "brand_color": "brand_color",
     "color": "standard_color",
     "title": "title",
+    # Derived rather than answered: _material_from_sources builds this verdict
+    # from what the pages published, so nothing arrives under a "material" key.
+    # It stays listed because the fingerprint and the surfaced set are keyed off
+    # these values, and an edit to the material field should still go stale.
+    "material": "material",
     "description": "description",
 }
 
 # What the UI surfaces. Widening this is a one-line change with no migration and
 # no re-run, because every field above is asked for and stored regardless.
-SURFACED_FIELDS = ("manufacturer_sku", "brand_color", "title", "description")
+SURFACED_FIELDS = ("manufacturer_sku", "brand_color", "material", "title", "description")
 
 # description's verified_value is advisory prose ("all features supported", or
 # the contradicted features), never a replacement value, so Apply must be
@@ -116,6 +121,88 @@ except OSError as e:  # pragma: no cover
     logger.error(f"Could not load verification system prompt: {e}")
     SYSTEM_PROMPT = ""
 
+# The second, ungrounded call's own instructions. Deliberately not part of the
+# search prompt: see extract_source_materials.
+try:
+    with open(os.path.join(_PROMPT_DIR, "ai_search_material_prompt.txt")) as f:
+        MATERIAL_PROMPT = f.read()
+except OSError as e:  # pragma: no cover
+    logger.error(f"Could not load the material prompt: {e}")
+    MATERIAL_PROMPT = ""
+
+
+# The shape PhotoManagementNew's washtag pass already produces
+# (utils/washtag_ai_analyzer.py: Material / MaterialComponent / MaterialItem),
+# reused verbatim so the search and the tag reading speak one vocabulary and both
+# go through format_material below. percentage is a string rather than a nullable
+# integer: response_json_schema is happier with it, and "" reads the same as the
+# rest of this schema's "empty string if the page does not state one".
+MATERIAL_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Fibre composition, structured. The field's exact wording is assembled from "
+        "this, so give the parts and not a sentence."
+    ),
+    "properties": {
+        "components": {
+            "type": "array",
+            "description": (
+                "Empty array when the page states no composition. Never calculate a "
+                "percentage that is missing and never name a fibre that is not stated."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "component_name": {
+                        "type": "string",
+                        "description": (
+                            "Lowercase. A single or unlabelled section, and anything the "
+                            "page calls self, main or fabric, is 'shell'; otherwise keep "
+                            "what is printed: lining, trim, filling, body, contrast, rib. "
+                            "Footwear has three: upper, lining, outer sole."
+                        ),
+                    },
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {
+                                    "type": "string",
+                                    "description": (
+                                        "Fibre in lowercase English, translated from whatever "
+                                        "the page prints: coton -> cotton, laine -> wool, "
+                                        "poliammide -> polyamide, elasthanne -> elastane. "
+                                        "Expand ISO codes carrying a percentage: CO cotton, "
+                                        "PL/PES polyester, WO/WV wool, PA/NY polyamide, "
+                                        "EL/EA/SP elastane, VI/CV viscose, LI linen, AC "
+                                        "acrylic, CA acetate, LY/CLY lyocell, MD/CMD modal, "
+                                        "SE silk, RA ramie. Footwear fibres are leather, "
+                                        "coated leather, textile, textiles or synthetics, "
+                                        "other materials. Blends are separate items in the "
+                                        "same component."
+                                    ),
+                                },
+                                "percentage": {
+                                    "type": "string",
+                                    "description": (
+                                        "Digits only, e.g. \"55\", adding up to 100 within a "
+                                        "component. Empty string where the page states none, "
+                                        "which is usual for footwear, bags and accessories "
+                                        "and is a complete answer rather than a partial one."
+                                    ),
+                                },
+                            },
+                            "required": ["name", "percentage"],
+                        },
+                    },
+                },
+                "required": ["component_name", "items"],
+            },
+        }
+    },
+    "required": ["components"],
+}
 
 RESPONSE_SCHEMA = {
     "type": "object",
@@ -186,7 +273,14 @@ RESPONSE_SCHEMA = {
                 "title": {"$ref": "#/$defs/field_verdict"},
                 "description": {"$ref": "#/$defs/field_verdict"},
             },
-            "required": ["mpn", "brand", "brand_color", "color", "title", "description"],
+            "required": [
+                "mpn",
+                "brand",
+                "brand_color",
+                "color",
+                "title",
+                "description",
+            ],
         },
         "label": {
             "type": "object",
@@ -424,6 +518,62 @@ async def read_tag_text(product_id: str) -> Optional[Dict[str, Any]]:
         "country_of_origin": data.get("country_of_origin"),
         "material": data.get("material"),
     }
+
+
+# PhotoManagement stores every fibre and component lowercase; this field is Title
+# Case. "or" stays down because its footwear vocabulary includes "textiles or
+# synthetics", and str.title() would render that "Textiles Or Synthetics".
+_LOWER_IN_TITLE = frozenset({"or", "and"})
+
+
+def _same_text(a: Any, b: Any) -> bool:
+    """Equal ignoring case and whitespace runs, newlines included."""
+    return " ".join(str(a or "").split()).lower() == " ".join(str(b or "").split()).lower()
+
+
+def _title_case(text: str) -> str:
+    return " ".join(
+        word.capitalize() if i == 0 or word.lower() not in _LOWER_IN_TITLE else word.lower()
+        for i, word in enumerate(text.split())
+    )
+
+
+def format_material(composition: Optional[Dict[str, Any]]) -> str:
+    """Render a parsed composition the way this app's material field is written.
+
+    The one place the wording is decided, for the model's answer and for
+    PhotoManagement's washtag parse alike -- they share a schema precisely so
+    they can share this. Leaving the punctuation to the prompt would mean the
+    search's "Shell: 100% Cotton" and the tag pass's could drift a comma apart on
+    the same garment, and there would be nothing to catch it.
+
+    The convention is the one the 3,803 filled listings already use: a single
+    component drops the prefix ("100% Cotton"), several get one prefixed line
+    each. Those newlines are load-bearing -- the SellerCloud and 1nventory
+    description templates split on them to make one <div> per component -- so a
+    collapsed value ships a run-on line to the storefront.
+
+    An empty percentage is not a parse failure: footwear, bags and most
+    accessories publish the fibre with no share at all ("Upper: Leather").
+    """
+    lines = []
+    for component in (composition or {}).get("components") or []:
+        parts = []
+        for item in component.get("items") or []:
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            share = str(item.get("percentage") or "").strip()
+            parts.append(f"{share}% {_title_case(name)}" if share.isdigit() else _title_case(name))
+        if parts:
+            lines.append(
+                (_title_case(str(component.get("component_name") or "").strip()), ", ".join(parts))
+            )
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return lines[0][1]
+    return "\n".join(f"{name}: {value}" if name else value for name, value in lines)
 
 
 # Everything that is not a letter or a digit, so a value the tag prints as
@@ -808,25 +958,40 @@ def _make_client(auth: str):
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def _generate(auth: str, prompt: str, images: List[Tuple[str, bytes]]):
-    """One grounded call. Raises the classified exception types, never raw SDK ones."""
+def _generate(
+    auth: str,
+    prompt: str,
+    images: List[Tuple[str, bytes]],
+    schema: Dict[str, Any],
+    system_instruction: str,
+    grounded: bool = True,
+):
+    """One model call. Raises the classified exception types, never raw SDK ones.
+
+    Parameterised so the material extraction rides the same auth fallback and
+    retry path as the search rather than growing a second copy of it.
+    """
     parts = [types.Part.from_text(text=prompt)]
     for url, content in images:
         mime = "image/png" if url.lower().endswith(".png") else "image/jpeg"
         parts.append(types.Part.from_bytes(data=content, mime_type=mime))
 
     cfg = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=system_instruction,
         temperature=AI_SEARCH_TEMPERATURE,
         # url_context alongside search lets it open the pages it finds rather
         # than answering from snippets. It does not fire reliably, which is why
         # every reported URL is checked afterwards.
-        tools=[
-            types.Tool(google_search=types.GoogleSearch()),
-            types.Tool(url_context=types.UrlContext()),
-        ],
+        tools=(
+            [
+                types.Tool(google_search=types.GoogleSearch()),
+                types.Tool(url_context=types.UrlContext()),
+            ]
+            if grounded
+            else None
+        ),
         response_mime_type="application/json",
-        response_json_schema=RESPONSE_SCHEMA,
+        response_json_schema=schema,
         safety_settings=[
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
@@ -883,10 +1048,13 @@ def response_text(response) -> str:
     return "".join(p.text for p in parts if getattr(p, "text", None))
 
 
-def _usage_and_cost(response, auth: str) -> Dict[str, Any]:
+def _usage_and_cost(response, auth: str, grounded: bool = True) -> Dict[str, Any]:
+    # The grounding fee is per grounded prompt. The material extraction runs no
+    # tools, so it pays tokens only -- fractions of a cent against $0.014.
+    fee = GROUNDING_PRICE.get(auth, GROUNDING_PRICE["vertex"]) if grounded else 0.0
     usage = getattr(response, "usage_metadata", None)
     if not usage:
-        return {"tokens": {}, "cost_usd": GROUNDING_PRICE.get(auth, GROUNDING_PRICE["vertex"])}
+        return {"tokens": {}, "cost_usd": fee}
 
     def count(name: str) -> int:
         return getattr(usage, name, None) or 0
@@ -899,7 +1067,7 @@ def _usage_and_cost(response, auth: str) -> Dict[str, Any]:
     cost = (
         billed_in / 1e6 * PRICE_PER_M_INPUT
         + billed_out / 1e6 * PRICE_PER_M_OUTPUT
-        + GROUNDING_PRICE.get(auth, GROUNDING_PRICE["vertex"])
+        + fee
     )
     return {
         "tokens": {
@@ -1103,7 +1271,9 @@ async def run_for_fields(
         tag_options=tag_options,
         own_markers=markers,
     )
-    auth, response = await asyncio.to_thread(_generate, AI_SEARCH_AUTH, prompt, images)
+    auth, response = await asyncio.to_thread(
+        _generate, AI_SEARCH_AUTH, prompt, images, RESPONSE_SCHEMA, SYSTEM_PROMPT
+    )
 
     text = response_text(response)
     if not text:
@@ -1123,6 +1293,130 @@ async def run_for_fields(
         raw, fields, response, auth, tag_text, [u for u, _ in images], reason,
         requested_by, source_key, tag_options,
     )
+
+
+MATERIAL_EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sources": {
+            "type": "array",
+            "description": "One entry per numbered source that states a composition. Omit the others.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "string",
+                        "description": "The number printed beside that source, as digits",
+                    },
+                    "material_composition": MATERIAL_SCHEMA,
+                },
+                "required": ["index", "material_composition"],
+            },
+        }
+    },
+    "required": ["sources"],
+}
+
+
+async def extract_source_materials(sources: List[Dict[str, Any]], auth: str) -> Dict[str, Any]:
+    """Read the composition out of the descriptions the search already collected.
+
+    A second call rather than a wider first one, and the reason is measured. When
+    the composition was asked for inside the search, the colour reading degraded
+    -- brand_color started coming back as "GLYPH ANTIQUE WHITE" and "CANVAS CARGO
+    VINTAGE", neighbouring words dragged off the washtag. Five nested objects per
+    source is a real change to what the model is producing alongside the fields
+    that regressed, and the benchmark could not separate that from its own noise
+    at the sample sizes on offer. Splitting the work means it does not have to:
+    the search sends byte-identical inputs to what it sent before this feature.
+
+    Cheap enough not to weigh against that. No tools, no images, and only the
+    descriptions already in hand, so it pays tokens and not the $0.014 grounding
+    fee -- well under a tenth of a cent. It also only runs for the ~29% of
+    products whose washtag states no composition.
+
+    Never raises: a listing that keeps its empty material field is exactly where
+    it was, and failing the whole search over it would be a poor trade.
+    """
+    numbered, prompt_rows = [], []
+    for src in sources:
+        description = str(src.get("description") or "").strip()
+        if not description:
+            continue
+        numbered.append(src)
+        prompt_rows.append(
+            f"{len(numbered)}. {src.get('domain') or src.get('source_name') or 'source'}"
+            f" - {src.get('title') or ''}\n   {description}"
+        )
+    if not prompt_rows:
+        return {"tokens": {}, "cost_usd": 0.0}
+
+    prompt = (
+        "Read the fibre composition out of each product page's own text below.\n\n"
+        + "\n\n".join(prompt_rows)
+    )
+    try:
+        used_auth, response = await asyncio.to_thread(
+            _generate, auth, prompt, [], MATERIAL_EXTRACTION_SCHEMA, MATERIAL_PROMPT, False
+        )
+        raw = json.loads(response_text(response) or "{}")
+    except Exception as e:
+        logger.warning(f"Material extraction failed: {type(e).__name__}: {e}")
+        return {"tokens": {}, "cost_usd": 0.0}
+
+    for entry in raw.get("sources") or []:
+        index = str(entry.get("index") or "").strip()
+        if not index.isdigit() or not 1 <= int(index) <= len(numbered):
+            continue
+        numbered[int(index) - 1]["material"] = format_material(entry.get("material_composition"))
+    return _usage_and_cost(response, used_auth, grounded=False)
+
+
+def _material_from_sources(sources: List[Dict[str, Any]], listing_value: Any) -> Dict[str, Any]:
+    """The composition verdict, built from what the pages published.
+
+    Not asked of the model, because asking does not work. It reads each page's
+    composition accurately -- four of five sources came back "Upper: Leather /
+    Lining: Leather, Textile / Outer Sole: Other Materials" on the same boot --
+    but asked for one overall answer it holds back for want of a full percentage
+    breakdown, and reports not_found on a T-shirt whose stockist plainly says
+    cotton. Counting what the pages actually said avoids the judgement call
+    entirely, and it makes the evidence honestly "web": this verdict only exists
+    where the washtag pass found nothing.
+
+    An exact photo match wins over the model's own ordering, since a page for a
+    different colourway of the same style is still the wrong garment to take a
+    lining from.
+    """
+    published = [src for src in sources if src.get("material")]
+    if not published:
+        return {
+            "verified_value": "",
+            "listing_value": listing_value or "",
+            "status": "not_found",
+            "evidence": "none",
+            "applicable": True,
+            "agreeing_sources": 0,
+            "reason": "No source published a composition for this item.",
+        }
+
+    best = next(
+        (src for src in published if src.get("image_match") == "same_product"), published[0]
+    )
+    value = best["material"]
+    agreeing = sum(1 for src in published if _same_text(src["material"], value))
+    return {
+        "verified_value": value,
+        "listing_value": listing_value or "",
+        "status": "confirmed" if _same_text(listing_value, value) else "conflict",
+        "evidence": "web",
+        "applicable": True,
+        "agreeing_sources": agreeing,
+        "reason": (
+            f"{agreeing} of the {len(published)} source(s) publishing a composition say this. "
+            "The tag states none."
+        ),
+    }
 
 
 async def _shape_result(
@@ -1148,6 +1442,10 @@ async def _shape_result(
 
     sources = [dict(src) for src in (raw.get("sources") or [])]
     for src in sources:
+        # Formatted here, never taken as prose: the operator compares a source's
+        # composition against the field's, and they have to be written alike or
+        # the comparison is about punctuation.
+        src["material"] = format_material(src.pop("material_composition", None))
         if src.get("description"):
             src["description"] = str(src["description"])[:MAX_SOURCE_DESCRIPTION]
 
@@ -1207,6 +1505,24 @@ async def _shape_result(
             v["normalized_value"] = format_mpn(str(v["verified_value"]))
         verdicts[listing_key] = v
 
+    # Composition is dropped outright wherever the washtag pass already read one
+    # off this garment: that parse is what fills the field in the first place, so
+    # a stockist's page can only disagree with the item in the box. What is left
+    # is the gap the search exists to close, and it is not small -- 893 of 3,116
+    # photographed products have a washtag row with no composition in it at all
+    # (belts, socks, hats, jewellery, and tags too worn to read), and on those
+    # the field is empty today with nothing else coming to fill it.
+    #
+    # Removed rather than marked, so the field shows no adornment at all. A card
+    # reading "confirmed" on every garment would be an icon that never means
+    # anything, and operators stop reading those.
+    material_usage = {"tokens": {}, "cost_usd": 0.0}
+    if ((tag_text or {}).get("material") or {}).get("components"):
+        verdicts.pop("material", None)
+    else:
+        material_usage = await extract_source_materials(sources, auth)
+        verdicts["material"] = _material_from_sources(sources, fields.get("material"))
+
     if (
         label.get("mpn_normalized")
         and verdicts.get("manufacturer_sku", {}).get("normalized_value")
@@ -1228,7 +1544,7 @@ async def _shape_result(
         "auth": auth,
         "reason": reason,
         "requested_by": requested_by,
-        "cost_usd": usage["cost_usd"],
+        "cost_usd": round(usage["cost_usd"] + material_usage["cost_usd"], 5),
         "error": None,
         "input": {
             "source": source_key,
@@ -1247,6 +1563,7 @@ async def _shape_result(
         "diagnostics": {
             "searches": list(getattr(meta, "web_search_queries", None) or []),
             "tokens": usage["tokens"],
+            "material_tokens": material_usage["tokens"],
             "label_dropped": unprinted,
             "country_of_origin": (tag_text or {}).get("country_of_origin"),
         },
