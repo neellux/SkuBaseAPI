@@ -1425,6 +1425,52 @@ class ProductService:
         return normalised
 
     @staticmethod
+    async def _apply_image_transfer(
+        old_parent_sku: str, new_parent_sku: str, reassignment_ref: str
+    ) -> Optional[Dict[str, Any]]:
+        """Carry the old parent's images across when the new one has none. Never raises.
+
+        Automatic and rule-based, so unlike the washtag choice there is nothing to
+        persist: the rule derives entirely from the two parent SKUs the ledger row
+        already carries. copy_parent_images decides whether anything is owed, and 97 of
+        the last 120 production reassignments are a no-op under it.
+
+        Runs after the reassignment has already succeeded, so a GCS or photography-DB
+        problem is a logged warning rather than a failed reassignment, the same rule
+        _queue_sellercloud_sync follows.
+        """
+        if not old_parent_sku or not new_parent_sku:
+            return None
+        try:
+            from services.image_service import image_service
+
+            result = await image_service.copy_parent_images(
+                target_product_id=new_parent_sku,
+                source_product_id=old_parent_sku,
+                reassignment_ref=reassignment_ref,
+            )
+            if not result.get("success"):
+                logger.warning(
+                    f"Image copy onto {new_parent_sku} failed: {result.get('error')}"
+                )
+            elif result.get("skipped"):
+                logger.info(
+                    f"Image copy onto {new_parent_sku} skipped: {result['skipped']}"
+                )
+            else:
+                logger.info(
+                    f"Copied {result.get('image_count')} image(s) from {old_parent_sku} "
+                    f"to {new_parent_sku} ({reassignment_ref})"
+                )
+            return result
+        except Exception:
+            logger.warning(
+                f"Image copy onto {new_parent_sku} raised; the reassignment stands:\n"
+                f"{traceback.format_exc()}"
+            )
+            return {"success": False, "error": "Could not copy images"}
+
+    @staticmethod
     async def _apply_washtag_selections(
         selections: Optional[List[Dict]], old_parent_sku: str, new_parent_sku: str
     ) -> Optional[Dict[str, Any]]:
@@ -1721,6 +1767,9 @@ class ProductService:
             if all_success:
                 washtag_copy = await ProductService._apply_washtag_selections(
                     washtags, old_parent_sku, new_parent_sku
+                )
+                await ProductService._apply_image_transfer(
+                    old_parent_sku, new_parent_sku, f"reassign-single:{assignment_id}"
                 )
                 return {
                     "success": True,
@@ -2713,6 +2762,35 @@ class ProductService:
 
 
     @staticmethod
+    async def _apply_bulk_image_transfer(bulk_id: int) -> None:
+        """Carry images across for a bulk reassignment, once, at the end.
+
+        Separate from _apply_bulk_washtag_selections rather than folded into it: that
+        one returns early when the operator made no washtag choice, and the image
+        transfer is automatic, so gating it on a washtag selection would silently skip
+        it. Idempotent, because copy_parent_images skips a destination that has images.
+        """
+        try:
+            conn = await ProductService._get_connection()
+            rows = await conn.execute_query_dict(
+                """SELECT old_parent_sku, new_parent_sku
+                   FROM bulk_reassignments WHERE id = $1""",
+                [bulk_id],
+            )
+            if not rows:
+                return
+            await ProductService._apply_image_transfer(
+                rows[0]["old_parent_sku"],
+                rows[0]["new_parent_sku"],
+                f"reassign-bulk:{bulk_id}",
+            )
+        except Exception:
+            logger.warning(
+                f"Bulk image copy for {bulk_id} raised; the reassignments stand:\n"
+                f"{traceback.format_exc()}"
+            )
+
+    @staticmethod
     async def _apply_bulk_washtag_selections(bulk_id: int) -> None:
         """Apply a bulk reassignment's stored washtag choice, once, at the end.
 
@@ -2772,9 +2850,11 @@ class ProductService:
 
                 # Terminal tick: nothing pending and nothing in flight. Reached exactly
                 # once, and on both the completed and the failed outcome, which is what
-                # lets a partially failed bulk still carry the washtags across. Washtags
-                # are parent-level, so this must run here rather than per assignment.
+                # lets a partially failed bulk still carry its media across. Washtags
+                # and images are both parent-level, so this must run here rather than
+                # per assignment.
                 await ProductService._apply_bulk_washtag_selections(bulk_id)
+                await ProductService._apply_bulk_image_transfer(bulk_id)
 
                 return await ProductService.get_bulk_reassignment_status(bulk_id)
 
@@ -2886,6 +2966,7 @@ class ProductService:
             )
             if not remaining:
                 await ProductService._apply_bulk_washtag_selections(bulk_id)
+                await ProductService._apply_bulk_image_transfer(bulk_id)
 
             return {
                 "success": True,

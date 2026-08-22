@@ -196,6 +196,66 @@ def _plan_washtag_copy(
     return new_data, blob_paths
 
 
+# `fullsize` is written with no_compression, so it stores the raw Drive bytes and can
+# legitimately be a png or a webp; every other resolution is re-encoded to jpg. The
+# extension is therefore only knowable by probing, which is what PhotoManagementNew's
+# mirror_gcs_blobs_for_all_resolutions does too.
+IMAGE_COPY_EXTENSIONS = ("jpg", "png", "webp")
+
+# The resolution every gallery consumer actually addresses. sellercloud_service and
+# daily_image_import_poller both build {parent}/{i}_1500.jpg, so an index without this
+# one is not a usable slot however many derivatives it has.
+MAIN_IMAGE_RESOLUTION = "1500"
+
+# Distinguishes "no object under any extension", which is a tolerable gap, from "the
+# copy genuinely failed", which must abort before anything is written to the DB.
+_COPY_FAILED = object()
+
+
+def _is_precondition_failed(exc: Exception) -> bool:
+    """Whether a GCS error means ifGenerationMatch refused: something is already there."""
+    if getattr(exc, "status", None) == 412:
+        return True
+    text = f"{exc}".lstrip()
+    return text.startswith("412,") or " 412," in text
+
+
+def _is_not_found(exc: Exception) -> bool:
+    """Whether a GCS error means the object simply is not there.
+
+    aiohttp raises ClientResponseError, which carries `.status`, so that is the reliable
+    test. The string fallback covers a wrapped or re-raised error, and has to match a
+    message that BEGINS "404," rather than assuming a leading space.
+    """
+    if getattr(exc, "status", None) == 404:
+        return True
+    text = f"{exc}".lstrip()
+    return text.startswith("404,") or " 404," in text
+
+
+def _plan_image_copy(
+    source_product_id: str,
+    target_product_id: str,
+    image_count: int,
+    resolution_names: List[str],
+) -> List[tuple]:
+    """Every (source, target) blob base a full image set copy touches, without extension.
+
+    Pure, so the slot and resolution arithmetic is checkable without a bucket. Bases
+    carry no extension because that is resolved by probing at copy time.
+
+    Slots are 1-based to match the blob naming and `image_data`'s array position.
+    """
+    return [
+        (
+            f"{source_product_id}/{index}_{resolution}",
+            f"{target_product_id}/{index}_{resolution}",
+        )
+        for index in range(1, image_count + 1)
+        for resolution in resolution_names
+    ]
+
+
 async def _ensure_pool(conn) -> None:
     """Force Tortoise to build the asyncpg pool before anyone reaches into it.
 
@@ -818,6 +878,290 @@ class ImageService:
             return_exceptions=True,
         )
 
+    # ── Image transfer on reassignment ───────────────────────────────
+
+    async def copy_parent_images(
+        self,
+        target_product_id: str,
+        source_product_id: str,
+        reassignment_ref: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Give a reassigned destination parent the source parent's images, if it has none.
+
+        Images are keyed on the parent SKU, so children moved to a parent that was never
+        photographed end up with nothing. This applies the rule PhotoManagementNew
+        already encodes at utils/reassignment.py:125,
+
+            image_source_parent = new_parent if has_images else old_parent
+
+        one way only: it writes to the destination and never to the source. The
+        photography version mirrors both ways because at upload time either prefix might
+        be addressed; at reassign time that would overwrite the old parent's own photos.
+
+        `reassignment_ref` lands in source_id so the row records which reassignment
+        produced it. Never raises for an ordinary miss; returns a `skipped` reason.
+        """
+        try:
+            target_product_id = validate_product_id(target_product_id)
+            source_product_id = validate_product_id(source_product_id)
+        except ValueError as e:
+            return {"success": False, "error": str(e), "status_code": 400}
+
+        if target_product_id == source_product_id:
+            return {"success": True, "skipped": "source and destination are the same"}
+
+        conn = self._get_conn()
+        lock_key = _product_lock_key(target_product_id)
+
+        try:
+            await _ensure_pool(conn)
+            async with conn._pool.acquire() as raw_conn:
+                acquired = await raw_conn.fetchval(
+                    "SELECT pg_try_advisory_lock($1)", lock_key
+                )
+                if not acquired:
+                    return {
+                        "success": False,
+                        "error": "Images are being modified by another process",
+                        "status_code": 409,
+                    }
+                try:
+                    return await self._copy_parent_images_locked(
+                        raw_conn, target_product_id, source_product_id, reassignment_ref
+                    )
+                finally:
+                    try:
+                        await raw_conn.fetchval(
+                            "SELECT pg_advisory_unlock($1)", lock_key
+                        )
+                    except Exception as unlock_err:
+                        logger.warning(
+                            f"Failed to release advisory lock for {target_product_id}: {unlock_err}"
+                        )
+        except Exception as e:
+            logger.error(
+                f"Error copying images to {target_product_id}: {e}\n{traceback.format_exc()}"
+            )
+            return {"success": False, "error": "Could not copy images", "status_code": 500}
+
+    async def _copy_parent_images_locked(
+        self,
+        raw_conn,
+        target_product_id: str,
+        source_product_id: str,
+        reassignment_ref: Optional[str],
+    ) -> Dict[str, Any]:
+        rows = await raw_conn.fetch(
+            """
+            SELECT id, product_id, image_source, image_data, washtag_data,
+                   product_images_count, product_resolutions, product_type, updated_at
+            FROM productimages
+            WHERE product_id = ANY($1::text[])
+            ORDER BY updated_at DESC
+            """,
+            [target_product_id, source_product_id],
+        )
+        target_rows = [r for r in rows if r["product_id"] == target_product_id]
+        source_rows = [r for r in rows if r["product_id"] == source_product_id]
+
+        # The destination wins whenever it has anything of its own. Matches
+        # PhotoManagementNew's parent_has_images: ANY row with a published set, whatever
+        # its image_source, so a studio batch_creation set counts and is not overwritten.
+        # _resolve_rows is deliberately not used here; it answers "which row owns the
+        # section", which is a different question from "has this parent been shot".
+        if any(
+            r["product_images_count"] > 0 or _as_list(r["image_data"]) for r in target_rows
+        ):
+            return {"success": True, "skipped": "destination has images"}
+
+        source_image_row = _resolve_rows(source_rows)[0] if source_rows else None
+        source_data = _as_list(source_image_row["image_data"]) if source_image_row else []
+        if not source_data:
+            return {"success": True, "skipped": "source has no images"}
+
+        # The source row's own list, not the live config: a row written before a
+        # resolution was added must not claim one it never had. Falls back to the config
+        # for a row that predates the column being populated.
+        resolutions = list(source_image_row["product_resolutions"] or []) or [
+            r["name"] for r in load_resolutions_config()
+        ]
+
+        landed_count, copied, missing, main_resource = await self._copy_image_blobs(
+            source_product_id, target_product_id, len(source_data), resolutions
+        )
+        if landed_count is None:
+            # GCS before the DB, and abort rather than commit a row claiming images the
+            # bucket does not have. Nothing was written, so a re-run retries cleanly.
+            return {
+                "success": False,
+                "error": "Could not copy images, please retry",
+                "status_code": 502,
+            }
+        if landed_count == 0:
+            # The row claimed images the bucket does not actually hold. Writing a row
+            # here would publish broken URLs, so refuse and say why.
+            return {"success": True, "skipped": "source has no usable image blobs"}
+
+        # The row must describe what landed, not what the source claimed.
+        source_data = source_data[:landed_count]
+
+        # Always a new row, never a reuse. A product legitimately holds several
+        # productimages rows (photography's batch_creation and upload, the washtag
+        # copy's manual row), and _resolve_rows picks each section from the row that
+        # owns it, so adding one is the normal shape rather than a duplicate. Updating
+        # a row we did not create would mutate someone else's record: the April 2026
+        # backfill left 24,424 `manual` rows whose source_id is the product id, and
+        # overwriting one of those loses whatever it recorded.
+        #
+        # image_source stays 'upload' rather than 'manual' because PhotoManagementNew's
+        # /getProductImagesCount filters on image_source='upload', so a 'manual' row
+        # would be invisible to photography's count export. source_id is what says who
+        # wrote it, which is the same split save_product_images already uses.
+        record_id = await raw_conn.fetchval(
+            """
+            INSERT INTO productimages
+                (id, product_id, image_source, source_id, batch_id, product_type,
+                 product_resolutions, image_data, product_images_count,
+                 reassigned_from)
+            VALUES ($1, $2, 'upload', $3, NULL, $4, $5, $6::jsonb, $7, $8)
+            RETURNING id
+            """,
+            uuid.uuid4(),
+            target_product_id,
+            reassignment_ref or "manual",
+            source_image_row["product_type"],
+            resolutions,
+            json.dumps(source_data),
+            len(source_data),
+            source_product_id,
+        )
+
+        logger.info(
+            f"copy_parent_images {source_product_id} -> {target_product_id} "
+            f"row={record_id} images={len(source_data)} "
+            f"copied={copied} missing={missing} ref={reassignment_ref}"
+        )
+
+        # SellerCloud downloads image bytes once and keeps its own copy, so a blob
+        # appearing at a new prefix is invisible to it until something pushes. The
+        # destination had nothing, so `before=None` makes this a "replace" and the
+        # gallery poller (enabled in production) delivers it within minutes instead of
+        # waiting on the nightly backfill, which only runs on days SellerCloud's own
+        # export ran. Never raises.
+        await self._queue_sellercloud_sync(
+            product_id=target_product_id,
+            record_id=record_id,
+            before=None,
+            after=source_data[0],
+            top_shot_resource=main_resource,
+        )
+
+        return {
+            "success": True,
+            "image_count": len(source_data),
+            "blobs_copied": copied,
+            "blobs_missing": missing,
+        }
+
+    async def _copy_image_blobs(
+        self,
+        source_product_id: str,
+        target_product_id: str,
+        image_count: int,
+        resolutions: List[str],
+    ) -> tuple:
+        """Copy a set index by index. (landed_count, copied, missing, main_resource).
+
+        Returns (None, copied, missing) on a hard failure so the caller aborts before
+        writing the row.
+
+        **Truncates at the first index whose main image is absent.** Everything that
+        renders a gallery walks 1..count and builds a URL per index: get_product_images,
+        ai_search_service, and sellercloud_service, which blind-probes
+        {parent}/{i}_1500.jpg for i in 1..8 at submission time. Writing a count higher
+        than what actually landed therefore puts a broken image on a live listing.
+        Truncating is the only way the row and the bucket agree.
+
+        A missing non-main derivative inside an otherwise present index is tolerated and
+        counted: historical products predate the 90 and fullsize resolutions.
+
+        No temp staging: the caller guarantees source and target prefixes differ, so the
+        same-namespace collision _copy_washtag_blobs guards against cannot arise.
+        """
+        main = MAIN_IMAGE_RESOLUTION if MAIN_IMAGE_RESOLUTION in resolutions else None
+        storage_classes = {
+            r["name"]: r.get("storage_class")
+            for r in load_resolutions_config()
+            if r.get("storage_class")
+        }
+
+        copied = missing = 0
+        landed_count = 0
+        main_resource = None
+        for index in range(1, image_count + 1):
+            main_landed = main is None
+            for resolution in resolutions:
+                source_base = f"{source_product_id}/{index}_{resolution}"
+                target_base = f"{target_product_id}/{index}_{resolution}"
+                extension, resource = await self._copy_first_existing(
+                    source_base, target_base, storage_classes.get(resolution)
+                )
+                if extension is _COPY_FAILED:
+                    return None, copied, missing, None
+                if extension is None:
+                    missing += 1
+                    continue
+                copied += 1
+                if resolution == main:
+                    main_landed = True
+                    if index == 1:
+                        # Slot 1's generation is the cache-buster SellerCloud needs.
+                        main_resource = resource
+
+            if not main_landed:
+                logger.warning(
+                    f"{source_product_id} slot {index} has no {main} image; "
+                    f"truncating the copy at {landed_count}"
+                )
+                break
+            landed_count = index
+
+        return landed_count, copied, missing, main_resource
+
+    async def _copy_first_existing(
+        self, source_base: str, target_base: str, storage_class: Optional[str]
+    ) -> tuple:
+        """Copy the first extension that exists. (extension, resource).
+
+        extension is None when nothing is there under any extension, or _COPY_FAILED
+        when the copy genuinely failed.
+
+        fullsize stores raw Drive bytes so it can be a png or a webp; every other
+        resolution is re-encoded to jpg. The extension is only knowable by probing, the
+        same way PhotoManagementNew's mirror does it.
+        """
+        for extension in IMAGE_COPY_EXTENSIONS:
+            try:
+                resource = await self._copy_blob_raw(
+                    f"{source_base}.{extension}",
+                    f"{target_base}.{extension}",
+                    storage_class=storage_class,
+                    if_absent=True,
+                )
+                return extension, resource
+            except Exception as e:
+                if _is_not_found(e):
+                    continue
+                if _is_precondition_failed(e):
+                    # ifGenerationMatch=0 refused because something is already there.
+                    # Only reachable on a re-run after a partial copy, since the caller
+                    # guarantees the destination had no images. Leave it alone.
+                    logger.info(f"{target_base}.{extension} already exists, left as is")
+                    return extension, None
+                logger.warning(f"Failed to copy {source_base}.{extension}: {e}")
+                return _COPY_FAILED, None
+        return None, None
+
     # ── SellerCloud hand-off ───────────────────────────────────────────
 
     async def _queue_sellercloud_sync(
@@ -1080,31 +1424,62 @@ class ImageService:
     async def _copy_blob(self, src_path: str, dest_path: str) -> Optional[Dict]:
         """Returns the destination's object resource, or None if the copy failed.
 
-        gcloud-aio copies through rewriteTo, whose response wraps the new object under
-        "resource" rather than being the object itself.
+        Swallowing variant. The image copy path needs to tell a missing extension apart
+        from a real failure, so it calls _copy_blob_raw and handles 404 itself.
         """
         try:
-            result = await self._storage.copy(
-                GCS_BUCKET, src_path,
-                GCS_BUCKET, new_name=dest_path,
-                # rewriteTo copies the SOURCE object's metadata when none is given, and
-                # blobs written before the no-cache fix still carry
-                # "max-age=31536000, immutable". Copying one forward would stamp that
-                # onto the destination path, which is the bug GCS_CACHE_CONTROL exists
-                # to prevent, on a URL SellerCloud and every platform also fetch.
-                metadata={
-                    "cache-control": GCS_CACHE_CONTROL,
-                    "content-disposition": "inline",
-                },
-                # A fresh dict per call: gcloud-aio assigns params["rewriteToken"] in
-                # place while draining a multi-part rewrite, so a shared dict leaks a
-                # stale token into the next copy.
-                params={},
-                timeout=GCS_TIMEOUT_SECONDS,
-            )
+            return await self._copy_blob_raw(src_path, dest_path)
         except Exception as e:
             logger.warning(f"Failed to copy {src_path} -> {dest_path}: {e}")
             return None
+
+    async def _copy_blob_raw(
+        self,
+        src_path: str,
+        dest_path: str,
+        storage_class: Optional[str] = None,
+        if_absent: bool = False,
+    ) -> Optional[Dict]:
+        """Server-side rewrite, raising on failure.
+
+        gcloud-aio copies through rewriteTo, whose response wraps the new object under
+        "resource" rather than being the object itself. No bytes pass through this
+        process; GCS does the copy itself. Do not "simplify" this into a download and
+        re-upload: that would re-encode fullsize, which deliberately stores the raw
+        Drive bytes.
+
+        `storage_class` because rewrite fills an unspecified class from the bucket
+        default rather than from the source, which would silently downgrade the COLDLINE
+        fullsize variant to STANDARD.
+
+        `if_absent` sets ifGenerationMatch=0, so the copy creates or fails and can never
+        overwrite. That is what makes this operation incapable of destroying an existing
+        photo even if a guard upstream is wrong.
+        """
+        metadata = {
+            "cache-control": GCS_CACHE_CONTROL,
+            "content-disposition": "inline",
+        }
+        if storage_class:
+            metadata["storage-class"] = storage_class
+
+        result = await self._storage.copy(
+            GCS_BUCKET,
+            src_path,
+            GCS_BUCKET,
+            new_name=dest_path,
+            # rewriteTo copies the SOURCE object's metadata when none is given, and
+            # blobs written before the no-cache fix still carry
+            # "max-age=31536000, immutable". Copying one forward would stamp that onto
+            # the destination path, which is the bug GCS_CACHE_CONTROL exists to
+            # prevent, on a URL SellerCloud and every platform also fetch.
+            metadata=metadata,
+            # A fresh dict per call: gcloud-aio assigns params["rewriteToken"] in place
+            # while draining a multi-part rewrite, so a shared dict leaks a stale token
+            # into the next copy.
+            params={"ifGenerationMatch": "0"} if if_absent else {},
+            timeout=GCS_TIMEOUT_SECONDS,
+        )
         if isinstance(result, dict):
             return result.get("resource") or result
         return None
@@ -1119,7 +1494,7 @@ class ImageService:
             # a blob is there, so "already absent" is the expected outcome, not a
             # failure. Logging it at warning would bury the deletes that really did
             # fail, which are the ones that leave a ghost slot for SellerCloud to find.
-            if getattr(e, "status", None) == 404 or " 404," in f"{e}":
+            if _is_not_found(e):
                 logger.debug(f"Nothing to delete at {blob_path}")
                 return
             logger.warning(f"Failed to delete {blob_path}: {e}")
