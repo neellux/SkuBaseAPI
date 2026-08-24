@@ -42,7 +42,11 @@ from tortoise import connections
 from models.db_models import AppSettings
 from services.sellercloud_service import GENDER_MAPPING, sellercloud_service
 from services.shopify_admin import ShopifyAdmin
-from services.shopify_client import get_shopify_client
+from services.shopify_client import (
+    ShopifyError,
+    ShopifySemanticError,
+    get_shopify_client,
+)
 from services.template_render import render_template, resolve_field_template
 
 logger = logging.getLogger(__name__)
@@ -372,6 +376,21 @@ class OneInventoryService:
 
     # -- identity ----------------------------------------------------------
 
+    @staticmethod
+    def _is_missing_product(exc: ShopifySemanticError) -> bool:
+        """Shopify reports a write against a DELETED product as a userError, not a 404.
+
+        HTTP 200, `userErrors: [{field: ["id"], message: "Product does not exist"}]`, which
+        shopify_client turns into ShopifySemanticError. Matching on exc.user_errors rather
+        than str(exc) because multiple userErrors are joined with "; " and the structured
+        list is the only reliable discriminator. Same predicate shape as
+        shopify_admin.delete_product and zero_inventory_at.
+        """
+        return any(
+            "does not exist" in str(e.get("message", "")).lower()
+            for e in exc.user_errors
+        )
+
     async def _mirror_lookup(self, parent_sku: str) -> str | None:
         """internal_platform_state.source_product_gid, a free hit when it is there.
 
@@ -470,15 +489,36 @@ class OneInventoryService:
         client = await get_shopify_client(STORE)
         admin = ShopifyAdmin(client)
 
-        existing = None
-        mirror_gid = await self._mirror_lookup(product_id)
-        if mirror_gid:
-            existing = {"id": mirror_gid, "variants": {"nodes": []}}
-            fetched = await admin.find_product_by_variant_sku(child_skus)
-            if fetched:
-                existing = fetched
-        else:
-            existing = await admin.find_product_by_variant_sku(child_skus)
+        # Shopify's SKU search index is eventually consistent in BOTH directions: it can
+        # still return a product that was deleted minutes ago, and it can miss one that was
+        # created moments ago. The mirror covers the second case; a live fetch covers the
+        # first. Neither is trusted alone.
+        existing = await admin.find_product_by_variant_sku(child_skus)
+        if existing is None:
+            mirror_gid = await self._mirror_lookup(product_id)
+            if mirror_gid:
+                # The search missed. Before letting a stored gid force the update branch,
+                # confirm it still resolves - internal_platform_state keeps a gid forever
+                # and nothing prunes it when the product is deleted, so an unverified seed
+                # is how a dead product keeps failing every resubmit.
+                confirmed = await admin.get_product(mirror_gid)
+                if confirmed:
+                    existing = {
+                        "id": confirmed.gid,
+                        "handle": confirmed.handle,
+                        "variants": {
+                            "nodes": [
+                                {"id": v.gid, "sku": v.sku}
+                                for v in confirmed.variants if v.sku
+                            ]
+                        },
+                    }
+                else:
+                    logger.warning(
+                        "1inventory: %s has a stale mirror gid (%s); the product no "
+                        "longer exists on Shopify, treating as a create",
+                        product_id, mirror_gid,
+                    )
 
         product_fields = {
             "title": title,
@@ -516,7 +556,26 @@ class OneInventoryService:
             )
         elif existing:
             stage = "update"
-            result = await self._update(admin, existing, product_fields, tags, variants)
+            try:
+                result = await self._update(
+                    admin, existing, product_fields, tags, variants
+                )
+            except ShopifySemanticError as exc:
+                if not self._is_missing_product(exc):
+                    raise
+                # The identity check was reading a tombstone. The operator asked for this
+                # product to be listed and it genuinely is not there, so create it rather
+                # than failing - a resubmit would only hit the same stale index again.
+                logger.warning(
+                    "1inventory: %s resolved to %s but Shopify says it does not exist; "
+                    "falling back to create", product_id, existing.get("id"),
+                )
+                stage = "create"
+                result = await self._create(
+                    admin, product_fields, tags, variants, size_values, images,
+                    handle=build_handle(brand, title, product_id),
+                    status=DRAFT_STATUS if is_essx else PRODUCT_STATUS,
+                )
         else:
             stage = "create"
             result = await self._create(
@@ -708,6 +767,22 @@ class OneInventoryService:
                 update_fields=["status", "error", "error_display", "updated_at"]
             )
             await record_step(submission.id, "failed", stage=exc.stage,
+                              reason=str(exc)[:300])
+            return
+        except ShopifyError as exc:
+            # Shopify rejected the write for a reason it named. Surfacing that instead of
+            # the blanket "Failed to submit" is the difference between an operator seeing
+            # "Product does not exist" and seeing nothing actionable at all - the full
+            # traceback still goes to submission.error either way.
+            import traceback
+            logger.error("1inventory submission failed on Shopify: %s", exc, exc_info=True)
+            submission.status = "failed"
+            submission.error = traceback.format_exc()
+            submission.error_display = f"Shopify rejected this: {str(exc)[:180]}"
+            await submission.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
+            await record_step(submission.id, "failed", stage="shopify",
                               reason=str(exc)[:300])
             return
         except Exception as exc:                                        # noqa: BLE001
