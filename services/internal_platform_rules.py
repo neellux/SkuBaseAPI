@@ -304,6 +304,11 @@ class SourceProduct:
     # and prices off every variant - the pre-2026-07-29 behaviour.
     variant_inventory: tuple[int, ...] = ()
     updated_at: str | None = None
+    # Shopify product status on the SOURCE store: ACTIVE / DRAFT / ARCHIVED.
+    # None means "not supplied", which is treated as ACTIVE so a caller that does not
+    # populate it keeps the pre-2026-08-21 behaviour instead of silently rejecting
+    # everything.
+    status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +351,16 @@ def qualifies(
     therefore a delete candidate - i.e. it would have deleted the entire catalog on
     the first run. Tagging state belongs in needs_tagging/needs_delisting only.
     """
+    # A product that is not ACTIVE on 1nventory is not for sale there, so it has no
+    # business being copied onto Shop The Sample. Checked FIRST because it is the most
+    # decisive fact about the product; everything below describes a product that is at
+    # least live at source.
+    #
+    # Treated as transient, like no_inventory: DRAFT is how the ops team parks a product
+    # (bad photos, pricing review) and it gets flipped back. See is_delist_candidate.
+    if p.status is not None and p.status != "ACTIVE":
+        return FilterVerdict(False, "not_active", f"source status {p.status}")
+
     if p.total_inventory < 1:
         return FilterVerdict(False, "no_inventory", f"stock {p.total_inventory}")
 
@@ -463,7 +478,8 @@ def plan_scheduled_actions(*, auto_submit: bool, auto_delist: bool,
 
 
 def is_delist_candidate(verdict: FilterVerdict, *,
-                        delist_on_no_inventory: bool) -> bool:
+                        delist_on_no_inventory: bool,
+                        delist_on_not_active: bool = False) -> bool:
     """Has this tagged product stopped qualifying in a way that warrants delisting?
 
     Selling out is not such a way, by default. Stock comes back - the same parent is
@@ -485,18 +501,28 @@ def is_delist_candidate(verdict: FilterVerdict, *,
         return False
     if verdict.rejected_by == "no_inventory" and not delist_on_no_inventory:
         return False
+    # Same reasoning as no_inventory, and the stakes are higher. Delisting untags the
+    # source AND deletes the destination product, for which Shopify has no undelete. A
+    # DRAFT is usually a deliberate, temporary park - we drafted eight products on
+    # 2026-08-21 purely to hide unedited photos - and deleting their STS listings would
+    # turn a reversible action into an irreversible one. Off by default; flip
+    # delist_on_not_active only if a source draft really should destroy the STS product.
+    if verdict.rejected_by == "not_active" and not delist_on_not_active:
+        return False
     return True
 
 
 def needs_delisting(p: SourceProduct, trigger_tag: str, allow: Allowlists,
                     rule: PricingRule = DEFAULT_PRICING, *,
                     taxonomy: "TypeTaxonomy",
-                    delist_on_no_inventory: bool = True) -> bool:
+                    delist_on_no_inventory: bool = True,
+                    delist_on_not_active: bool = False) -> bool:
     if not is_tagged(p, trigger_tag):
         return False
     return is_delist_candidate(
         qualifies(p, allow, rule, taxonomy=taxonomy),
         delist_on_no_inventory=delist_on_no_inventory,
+        delist_on_not_active=delist_on_not_active,
     )
 
 

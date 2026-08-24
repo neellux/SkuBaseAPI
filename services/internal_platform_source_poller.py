@@ -106,6 +106,7 @@ def to_source_product(p: Product, parent_sku: str | None) -> SourceProduct:
         variant_compare_at=p.variant_compare_at,
         variant_inventory=p.variant_inventory,
         updated_at=p.updated_at,
+        status=p.status,
     )
 
 
