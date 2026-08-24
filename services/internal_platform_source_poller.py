@@ -39,7 +39,9 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
+
+from tortoise import connections
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -65,6 +67,7 @@ from services.internal_platform_rules import (
     check_submit_cooldown,
     compute_price,
     pricing_basis,
+    check_missing_cap,
     check_reconcile_cap,
     check_syncio_capacity,
     derive_scan_status,
@@ -149,6 +152,11 @@ class SourceReport:
     # Found on the destination after all, so handed back to the reviewed delist path
     # instead of being untagged.
     pre_delivery_arrived: int = 0
+    # Rows whose stored Shopify gid a direct existence check proved dead.
+    missing_source_cleared: int = 0
+    missing_dest_cleared: int = 0
+    # Source products untagged so Syncio re-delivers a destination copy that was deleted.
+    missing_retag_untagged: int = 0
     failed: int = 0
     aborted: str | None = None
 
@@ -166,7 +174,10 @@ class SourceReport:
             f"variants={self.variants_submitted} tagged={self.tagged} untagged={self.untagged} "
             f"deleted={self.deleted} "
             f"pre_delivery_untagged={self.pre_delivery_untagged} "
-            f"pre_delivery_arrived={self.pre_delivery_arrived} failed={self.failed}"
+            f"pre_delivery_arrived={self.pre_delivery_arrived} "
+            f"missing_source={self.missing_source_cleared} "
+            f"missing_dest={self.missing_dest_cleared} "
+            f"missing_retag={self.missing_retag_untagged} failed={self.failed}"
             + (f" ABORTED={self.aborted}" if self.aborted else "")
         )
 
@@ -268,6 +279,7 @@ class InternalPlatformSourcePoller:
             max_rows_zeroed_per_cycle=int(cfg.get("max_rows_zeroed_per_cycle", 50)),
             max_pre_delivery_untags_per_cycle=int(
                 cfg.get("max_pre_delivery_untags_per_cycle", 25)),
+            max_rows_cleared_per_cycle=int(cfg.get("max_rows_cleared_per_cycle", 25)),
         )
 
         self.allowlists = Allowlists(
@@ -965,6 +977,12 @@ class InternalPlatformSourcePoller:
         if not writes_enabled():
             enable_writes(f"{self.name} execute=true")
 
+        # Before anything acts on a stored gid, prove the ones we hold still resolve.
+        # Delist-pass only: deletion is a rare manual act, and 68 nodes(ids:) calls a day
+        # is nothing where the same calls every 5 minutes would be ~19.6k/day for no gain.
+        if delists:
+            await self._reconcile_missing(platform, admin, report)
+
         if may_tag:
             await self._apply_tags(platform, admin, report)
         elif report.to_tag:
@@ -1193,6 +1211,138 @@ class InternalPlatformSourcePoller:
             logger.info("%s: %s is already on the destination as %s; adopted it and left "
                         "the source tagged", self.name, parent_sku, node["id"])
         return confirmed
+
+    async def _reconcile_missing(self, platform: Any, admin: ShopifyAdmin,
+                                 report: SourceReport) -> None:
+        """Clear state for products that no longer exist on Shopify, and re-list what can be.
+
+        Absence from a SCAN is ambiguous - deleted, SKU-merged, reassigned, or a truncated
+        read - which is why the rest of this pipeline refuses to act on it
+        (internal_platform_rules, "Nothing iterates the state table"). This asks a different
+        question. Every gid we hold is fetched BY ID, and a null node is positive evidence
+        that one specific product is gone. A short catalog read cannot produce that answer,
+        so the ambiguity the ban exists for does not apply here.
+
+        Two outcomes, and the second one is the reason this is not just a cleanup job:
+
+          source gone   the row is meaningless; clear it and let the next scan rebuild it
+                        if a product for that parent ever comes back
+          dest gone     the source product is alive and probably still qualifies, so the
+                        product SHOULD be on the destination and silently is not. Clearing
+                        the gid is not enough to fix that - see the untag below.
+        """
+        conn = connections.get("default")
+        rows = await conn.execute_query_dict(
+            "SELECT parent_sku, source_product_gid, dest_product_gid "
+            "FROM internal_platform_state "
+            "WHERE internal_platform_id = $1 "
+            "  AND (source_product_gid IS NOT NULL OR dest_product_gid IS NOT NULL)",
+            [self.platform_id],
+        )
+        if not rows:
+            return
+
+        src_gids = sorted({r["source_product_gid"] for r in rows if r["source_product_gid"]})
+        dst_gids = sorted({r["dest_product_gid"] for r in rows if r["dest_product_gid"]})
+
+        # A read failure here must leave the table alone. Treating an errored lookup as
+        # "everything is deleted" is the whole failure mode the cap below also guards.
+        try:
+            dest_admin = ShopifyAdmin(await get_shopify_client(platform.dest_store))
+            alive_src = {p.gid for p in await admin.products_by_ids(src_gids)}
+            alive_dst = {p.gid for p in await dest_admin.products_by_ids(dst_gids)}
+        except ShopifyError as exc:
+            logger.warning("%s: missing-product check could not read Shopify (%s); "
+                           "leaving state untouched", self.name, exc)
+            return
+
+        source_gone = [r["parent_sku"] for r in rows
+                       if r["source_product_gid"]
+                       and r["source_product_gid"] not in alive_src]
+        gone = set(source_gone)
+        # A row whose source is gone is already fully cleared by the first branch, so it
+        # must not also be counted as a dest-only case and queued for a re-list.
+        dest_gone = [r["parent_sku"] for r in rows
+                     if r["parent_sku"] not in gone
+                     and r["dest_product_gid"]
+                     and r["dest_product_gid"] not in alive_dst]
+
+        total = len(source_gone) + len(dest_gone)
+        if not total:
+            return
+
+        breach = check_missing_cap(total, self.caps)
+        if breach:
+            report.gate_message = breach
+            logger.error("%s: MISSING-PRODUCT CAP BREACH - %s", self.name, breach)
+            return
+
+        if not self.execute:
+            logger.info("%s: would clear %d missing products (%d source, %d dest) "
+                        "(dry run)", self.name, total, len(source_gone), len(dest_gone))
+            return
+
+        cleared_src, cleared_dst = await ledger.clear_missing_products(
+            self.platform_id, source_gone, dest_gone)
+        report.missing_source_cleared = cleared_src
+        report.missing_dest_cleared = cleared_dst
+        logger.warning("%s: cleared %d rows whose source product is deleted and %d whose "
+                       "destination product is deleted", self.name, cleared_src, cleared_dst)
+
+        await self._retag_for_redelivery(platform, admin, report, dest_gone)
+
+    async def _retag_for_redelivery(self, platform: Any, admin: ShopifyAdmin,
+                                    report: SourceReport,
+                                    parent_skus: Sequence[str]) -> None:
+        """Untag sources whose destination product was deleted, so Syncio delivers again.
+
+        Clearing dest_product_gid alone does NOT bring the product back, which is the
+        non-obvious part. It puts the row into awaiting-sync, and the existing recovery
+        path there - pre_delivery_untag_due - only fires for products that have STOPPED
+        qualifying. A healthy product would wait forever for a delivery that never comes,
+        because the source is still tagged and Syncio already delivered it once.
+
+        Removing the trigger tag is the only lever we have: the next scan then sees an
+        untagged qualifying product, re-tags it, and Syncio treats that as new work. The
+        re-tag is left to that scan rather than done here so it goes through the normal
+        tagging path, with its caps, its ledger rows and its mark_listed clock.
+
+        This is the one Shopify write in the reconciler. It is capped by the same ceiling
+        that bounded the clear, and it skips anything that is not currently tagged.
+        """
+        if not parent_skus:
+            return
+        rows = await connections.get("default").execute_query_dict(
+            "SELECT parent_sku, source_product_gid FROM internal_platform_state "
+            "WHERE internal_platform_id = $1 AND parent_sku = ANY($2::text[]) "
+            "  AND source_product_gid IS NOT NULL",
+            [self.platform_id, list(parent_skus)],
+        )
+        by_gid = {r["source_product_gid"]: r["parent_sku"] for r in rows}
+        if not by_gid:
+            return
+        try:
+            products = await admin.products_by_ids(sorted(by_gid))
+        except ShopifyError as exc:
+            logger.warning("%s: could not re-read sources for re-delivery (%s)",
+                           self.name, exc)
+            return
+
+        for product in products:
+            if not is_tagged(product, platform.trigger_tag):
+                # Never tagged, or already untagged by an earlier run. Nothing to undo,
+                # and the next scan will tag it if it qualifies.
+                continue
+            try:
+                await admin.remove_tags(product.gid, [platform.trigger_tag])
+            except ShopifyError as exc:
+                logger.warning("%s: could not untag %s for re-delivery (%s)",
+                               self.name, by_gid.get(product.gid), exc)
+                report.failed += 1
+                continue
+            report.missing_retag_untagged += 1
+            logger.warning("%s: %s lost its destination product; untagged the source so "
+                           "the next scan re-lists it", self.name, by_gid.get(product.gid))
 
     async def _apply_delists(self, platform: Any, admin: ShopifyAdmin,
                              report: SourceReport,

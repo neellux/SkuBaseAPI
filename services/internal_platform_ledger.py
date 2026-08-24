@@ -921,6 +921,72 @@ async def reconcile_stock(platform_id: str,
     return written
 
 
+async def clear_missing_products(
+    platform_id: str,
+    source_gone: Sequence[str] = (),
+    dest_gone: Sequence[str] = (),
+) -> tuple[int, int]:
+    """Clear identity for products a direct existence check proved are gone from Shopify.
+
+    `source_gone` / `dest_gone` are parent_skus whose stored gid was asked for BY ID and
+    came back null. That is positive evidence about one product, not inference from a
+    product's absence in a scan, which is why this may touch current_status where
+    reconcile_stock above may not: there is no ambiguity to protect against. A truncated
+    catalog read cannot reach this function at all.
+
+    Both branches clear listed_at alongside the gid, and that is not optional - see
+    mark_delisted() for the incident. "Awaiting Syncio" is defined purely as
+    `listed_at IS NOT NULL AND dest_product_gid IS NULL`, so clearing only the gid leaves
+    the row indistinguishable from a product still waiting on delivery, with a listed_at
+    weeks old that clears the four-day staleness cutoff instantly. ineligible_since goes
+    for the same reason: the row is about to stop being tagged, so it is no longer failing
+    qualification WHILE TAGGED, which is the only thing that clock means.
+
+    Status goes to 'pending' rather than 'delisted'. 'delisted' means this pipeline
+    deliberately removed the product; here something outside it did, and the product should
+    be re-evaluated from scratch on the next scan. 'pending' is the table default and
+    already carries exactly that meaning.
+    """
+    conn = connections.get("default")
+    cleared_source = cleared_dest = 0
+
+    if source_gone:
+        # The source product is gone, so the destination copy of it is meaningless too.
+        result, _ = await conn.execute_query(
+            "UPDATE internal_platform_state SET "
+            "  source_product_gid = NULL, "
+            "  dest_product_gid   = NULL, "
+            "  listed_at          = NULL, "
+            "  ineligible_since   = NULL, "
+            "  delist_strikes     = 0, "
+            "  current_status     = 'pending', "
+            "  skip_reason        = NULL, "
+            "  updated_at         = CURRENT_TIMESTAMP "
+            "WHERE internal_platform_id = $1 AND parent_sku = ANY($2::text[])",
+            [platform_id, list(source_gone)],
+        )
+        cleared_source = result or 0
+
+    if dest_gone:
+        # The source product is still there; only the destination copy vanished. Its gid
+        # and delivery clock go, so the next scan sees an untagged qualifying product and
+        # re-lists it. source_product_gid is deliberately left alone - it is still valid.
+        result, _ = await conn.execute_query(
+            "UPDATE internal_platform_state SET "
+            "  dest_product_gid = NULL, "
+            "  listed_at        = NULL, "
+            "  ineligible_since = NULL, "
+            "  delist_strikes   = 0, "
+            "  current_status   = 'pending', "
+            "  updated_at       = CURRENT_TIMESTAMP "
+            "WHERE internal_platform_id = $1 AND parent_sku = ANY($2::text[])",
+            [platform_id, list(dest_gone)],
+        )
+        cleared_dest = result or 0
+
+    return cleared_source, cleared_dest
+
+
 async def footprint(platform_id: str) -> int:
     """Distinct destination products we own. The denominator for percentage caps.
 

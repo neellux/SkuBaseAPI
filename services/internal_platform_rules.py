@@ -750,6 +750,33 @@ class SafetyCaps:
     # Shopify. Reconciliation is the one place the pipeline treats absence as signal, so it
     # gets its own ceiling rather than sharing one. 0 disables, like every cap here.
     max_rows_zeroed_per_cycle: int = 50
+    # Blast radius for the missing-product reconciler. Counts STATE ROWS whose stored
+    # Shopify gid a direct existence check just proved dead. Deliberately far lower than
+    # max_rows_zeroed_per_cycle: deletion is a manual act and the observed rate is single
+    # digits per week, so anything larger is a broken read until a human says otherwise.
+    # 0 disables, like every cap here.
+    max_rows_cleared_per_cycle: int = 25
+
+
+def check_missing_cap(rows_cleared: int, caps: SafetyCaps) -> str | None:
+    """Breach message if the missing-product reconciler wants to clear too many rows.
+
+    Same reasoning as check_reconcile_cap, one step further along: that one corrects stock,
+    this one clears identity (gids, listed_at) and resets status. A Shopify outage that
+    somehow answered a nodes(ids:) query with nulls would look exactly like a mass
+    deletion, and clearing thousands of rows on that reading is the SPO mapping wipe again.
+
+    Unlike the scan-absence path this cap guards, the input here is POSITIVE evidence - a
+    specific gid was asked for by id and came back null - so a truncated catalog read
+    cannot reach it at all. The cap covers the remaining case: the answer was wrong.
+    """
+    if caps.max_rows_cleared_per_cycle > 0 and rows_cleared > caps.max_rows_cleared_per_cycle:
+        return (
+            f"max_rows_cleared_per_cycle: {rows_cleared} > "
+            f"{caps.max_rows_cleared_per_cycle}; refusing to clear missing products "
+            "this cycle"
+        )
+    return None
 
 
 def check_reconcile_cap(rows_zeroed: int, caps: SafetyCaps) -> str | None:
