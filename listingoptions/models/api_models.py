@@ -418,6 +418,12 @@ class SizingSchemeDetailResponse(BaseModel):
     sizing_types: Optional[List[str]] = Field(
         None, description="List of applicable types for this sizing scheme."
     )
+    goat_code: Optional[str] = Field(
+        None, description="GOAT size chart identifier for this scheme."
+    )
+    region_code: Optional[str] = Field(
+        None, description="Region this scheme's sizes are expressed in (US, EU, UK, JP)."
+    )
 
 
 class AllSizingSchemesResponse(BaseModel):
@@ -439,6 +445,17 @@ class UpdateSizeOrderRequest(BaseModel):
     )
     sizing_types: Optional[List[str]] = Field(
         None, description="Updated list of applicable types for this sizing scheme."
+    )
+    # Optional and deliberately unvalidated: the 43 pre-existing schemes have no GOAT data and
+    # editing one must not be blocked. A field omitted here keeps whatever the scheme already has;
+    # a field sent blank is stored as NULL, which is how an operator clears one. max_length is not
+    # optional - without it an over-long value reaches Tortoise, whose ValidationError is not a
+    # ValueError subclass and so returns a 500 with raw ORM text instead of a readable 400.
+    goat_code: Optional[str] = Field(
+        None, max_length=100, description="GOAT size chart identifier for this scheme."
+    )
+    region_code: Optional[str] = Field(
+        None, max_length=20, description="Region this scheme's sizes are expressed in."
     )
 
     @validator("sizes")
@@ -462,6 +479,17 @@ class FullSizingSchemeCreate(BaseModel):
     )
     sizing_types: Optional[List[str]] = Field(
         None, description="List of applicable types for this sizing scheme."
+    )
+    # Required in practice, but NOT via Field(...) or a validator: a Pydantic rejection is a 422,
+    # and sendRequest.js hardcodes "Invalid request" for every 422 without reading `detail`, so the
+    # operator would be told nothing about which field is missing. SizingService raises ValueError
+    # instead, which sizing_routes turns into a 400 whose detail is rendered verbatim.
+    # max_length stays here as a backstop; the service length-checks too, for the same reason.
+    goat_code: Optional[str] = Field(
+        None, max_length=100, description="GOAT size chart identifier. Required for a new scheme."
+    )
+    region_code: Optional[str] = Field(
+        None, max_length=20, description="Region for this scheme's sizes. Required for a new scheme."
     )
 
     @validator("sizes")

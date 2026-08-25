@@ -151,34 +151,11 @@ async def delete_entire_sizing_scheme(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
 
-@router.post(
-    "/sizes",
-    response_model=SizingSchemeEntryDB,
-    status_code=status.HTTP_201_CREATED,
-    summary="Add a new size to a sizing scheme",
-    description="Adds a single new size to an existing sizing scheme (queried by scheme_name). The combination of (scheme name, size value) must be unique.",
-)
-async def add_new_size_to_sizing_scheme(
-    scheme_name: str = Query(..., title="The name of the sizing scheme"),
-    entry_create: SizingSchemeEntryCreate = Body(...),
-):
-    try:
-        return await SizingService.add_size_to_scheme(scheme_name, entry_create)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    except IntegrityError:
-        logger.error(
-            f"Integrity error adding size '{entry_create.size}' to scheme '{scheme_name}'. Likely duplicate size."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Failed to add size to scheme '{scheme_name}' due to a conflict (e.g., duplicate size). Ensure size is unique within the scheme.",
-        )
-    except Exception as e:
-        logger.error(
-            f"Unexpected error adding size '{entry_create.size}' to scheme '{scheme_name}': {str(e)}"
-        )
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+# POST /sizes (add_new_size_to_sizing_scheme) was removed 2026-08-25. The service function it
+# called never verified the scheme existed, so ?scheme_name=Typo created a brand-new scheme with
+# NULL sizing_types, goat_code and region_code, bypassing FullSizingSchemeCreate's required-on-
+# create checks. It had no callers - the editor adds sizes to local state and persists them via
+# PUT /listingoptions/sizing_schemes.
 
 
 @router.get(
@@ -323,7 +300,15 @@ async def export_sizing_schemes():
         df = (
             pd.DataFrame(rows)
             if rows
-            else pd.DataFrame(columns=["Sizing Scheme", "Size", "Sizing Types"])
+            else pd.DataFrame(
+                columns=[
+                    "Sizing Scheme",
+                    "Size",
+                    "Sizing Types",
+                    "GOAT Code",
+                    "Region Code",
+                ]
+            )
         )
 
         output = io.BytesIO()

@@ -23,6 +23,33 @@ from listingoptions.services.spreadsheet_service import spreadsheet_service
 
 logger = logging.getLogger(__name__)
 
+# goat_code and region_code are SCHEME-level, denormalized onto every size row of the scheme (the
+# same shape as sizing_types) because there is no sizing scheme table. Every write path normalizes
+# blank to NULL so the column holds two states, not three - an empty string would silently satisfy
+# every future `WHERE goat_code IS NULL` check.
+MAX_GOAT_CODE_LENGTH = 100
+MAX_REGION_CODE_LENGTH = 20
+
+
+def _blank_to_none(value: Optional[str]) -> Optional[str]:
+    """'', '   ' and None all mean 'no value'. One representation of empty, everywhere."""
+    if value is None:
+        return None
+    return value.strip() or None
+
+
+def _validate_code_lengths(goat_code: Optional[str], region_code: Optional[str]) -> None:
+    """Length-check here rather than leaning on Pydantic's max_length.
+
+    A Pydantic rejection is a 422, and sendRequest.js renders every 422 as "Invalid request"
+    without reading `detail` - the same uselessness that keeps required-ness out of the models.
+    Raising ValueError gets it converted to a 400 whose message the operator can act on.
+    """
+    if goat_code is not None and len(goat_code) > MAX_GOAT_CODE_LENGTH:
+        raise ValueError(f"GOAT code must be {MAX_GOAT_CODE_LENGTH} characters or fewer.")
+    if region_code is not None and len(region_code) > MAX_REGION_CODE_LENGTH:
+        raise ValueError(f"Region code must be {MAX_REGION_CODE_LENGTH} characters or fewer.")
+
 
 class SizingService:
     @staticmethod
@@ -93,6 +120,8 @@ class SizingService:
                     schemes_dict[scheme_name] = {
                         "sizes": [],
                         "sizing_types": entry.sizing_types,
+                        "goat_code": entry.goat_code,
+                        "region_code": entry.region_code,
                     }
                 schemes_dict[scheme_name]["sizes"].append(
                     SizingSchemeEntryWithId(id=entry.id, size=entry.size, order=entry.order)
@@ -103,6 +132,8 @@ class SizingService:
                     sizing_scheme=name,
                     sizes=data["sizes"],
                     sizing_types=data["sizing_types"],
+                    goat_code=data["goat_code"],
+                    region_code=data["region_code"],
                 )
                 for name, data in schemes_dict.items()
             ]
@@ -145,14 +176,17 @@ class SizingService:
             if not entries:
                 return None
 
-            sizing_types = entries[0].sizing_types if entries else None
+            # Scheme-level values are identical on every row of the scheme, so any row answers.
+            head = entries[0]
 
             return SizingSchemeDetailResponse(
                 sizing_scheme=scheme_name,
                 sizes=[
                     SizingSchemeEntryWithId(id=e.id, size=e.size, order=e.order) for e in entries
                 ],
-                sizing_types=sizing_types,
+                sizing_types=head.sizing_types,
+                goat_code=head.goat_code,
+                region_code=head.region_code,
             )
         except DoesNotExist:
             logger.info(f"Sizing scheme '{scheme_name}' not found when fetching details.")
@@ -161,28 +195,12 @@ class SizingService:
             logger.error(f"Error retrieving details for sizing scheme {scheme_name}: {str(e)}")
             raise
 
-    @staticmethod
-    async def add_size_to_scheme(
-        scheme_name: str, entry_create: SizingSchemeEntryCreate
-    ) -> SizingSchemeEntryDB:
-        try:
-            new_entry = await SizingScheme.create(
-                sizing_scheme=scheme_name,
-                size=entry_create.size,
-                order=entry_create.order,
-            )
-            asyncio.create_task(spreadsheet_service.trigger_spreadsheet_update("sizes"))
-            return SizingSchemeEntryDB.from_orm(new_entry)
-        except IntegrityError:
-            logger.warning(
-                f"Integrity error adding size '{entry_create.size}' to scheme '{scheme_name}'. Likely duplicate size."
-            )
-            raise ValueError(
-                f"Size '{entry_create.size}' already exists in scheme '{scheme_name}'."
-            )
-        except Exception as e:
-            logger.error(f"Error adding size to scheme {scheme_name}: {str(e)}")
-            raise
+    # add_size_to_scheme / POST /listingoptions/sizing_schemes/sizes was removed 2026-08-25.
+    # It created a row with only sizing_scheme, size and order and never checked the scheme
+    # existed, so POST ?scheme_name=Typo invented a whole new scheme with NULL sizing_types,
+    # goat_code and region_code - bypassing FullSizingSchemeCreate and making required-on-create
+    # false. It had no callers: the editor's Add Size button only mutates local state, which
+    # update_scheme_size_orders then persists.
 
     @staticmethod
     async def create_full_sizing_scheme(
@@ -206,6 +224,16 @@ class SizingService:
                     "Duplicate orders provided in the creation request for the same scheme."
                 )
 
+            # Required on create only. Existing schemes predate these fields and must stay
+            # editable, so UpdateSizeOrderRequest deliberately carries no equivalent check.
+            goat_code = _blank_to_none(scheme_create.goat_code)
+            region_code = _blank_to_none(scheme_create.region_code)
+            if not goat_code:
+                raise ValueError("GOAT code is required for a new sizing scheme.")
+            if not region_code:
+                raise ValueError("Region code is required for a new sizing scheme.")
+            _validate_code_lengths(goat_code, region_code)
+
             created_db_entries = []
             for size_entry in scheme_create.sizes:
                 entry = await SizingScheme.create(
@@ -213,18 +241,28 @@ class SizingService:
                     size=size_entry.size,
                     order=size_entry.order,
                     sizing_types=scheme_create.sizing_types,
+                    goat_code=goat_code,
+                    region_code=region_code,
                 )
                 created_db_entries.append(entry)
 
-            asyncio.create_task(spreadsheet_service.trigger_spreadsheet_update("sizes"))
-            return SizingSchemeDetailResponse(
+            response = SizingSchemeDetailResponse(
                 sizing_scheme=scheme_create.sizing_scheme,
                 sizes=sorted(
                     [SizingSchemeEntryWithId.from_orm(e) for e in created_db_entries],
                     key=lambda x: x.order,
                 ),
                 sizing_types=scheme_create.sizing_types,
+                goat_code=goat_code,
+                region_code=region_code,
             )
+
+        # Outside the transaction on purpose. asyncio.create_task copies the current context, and
+        # Tortoise resolves connections through a ContextVar, so a task spawned inside the block
+        # inherits the transaction's connection and can run against it mid-COMMIT or after it has
+        # returned to the pool. update_scheme_size_orders already triggers from outside.
+        asyncio.create_task(spreadsheet_service.trigger_spreadsheet_update("sizes"))
+        return response
 
     @staticmethod
     async def update_scheme_size_orders(
@@ -238,8 +276,13 @@ class SizingService:
                 else scheme_name
             )
 
-            existing_entries = await SizingScheme.filter(sizing_scheme=scheme_name).order_by(
-                "order"
+            # select_for_update because resolving an omitted scheme-level field reads its current
+            # value and writes it back. Without the lock two concurrent PUTs lose an update: A
+            # reads 'eu_shoe', B commits 'us_shoe', A writes 'eu_shoe' back over it.
+            existing_entries = (
+                await SizingScheme.filter(sizing_scheme=scheme_name)
+                .select_for_update()
+                .order_by("order")
             )
             if not existing_entries and not update_request.sizes:
                 if new_scheme_name != scheme_name:
@@ -281,22 +324,53 @@ class SizingService:
                     sizing_scheme=new_scheme_name, size__in=list(sizes_to_delete)
                 ).delete()
 
+            # Resolve the scheme-level fields once, for the whole scheme. A field the caller omits
+            # arrives as None and keeps whatever the scheme already has, so an omission can neither
+            # wipe it nor leave rows disagreeing; a field sent blank resolves to NULL, which is how
+            # an operator clears one. `current` is never None here: every path where
+            # existing_entries is empty has already returned or raised above.
+            current = existing_entries[0]
+            _validate_code_lengths(update_request.goat_code, update_request.region_code)
+            scheme_values = {
+                "sizing_types": (
+                    update_request.sizing_types
+                    if update_request.sizing_types is not None
+                    else current.sizing_types
+                ),
+                "goat_code": (
+                    _blank_to_none(update_request.goat_code)
+                    if update_request.goat_code is not None
+                    else current.goat_code
+                ),
+                "region_code": (
+                    _blank_to_none(update_request.region_code)
+                    if update_request.region_code is not None
+                    else current.region_code
+                ),
+            }
+
             updated_entries = []
             for size_data in update_request.sizes:
                 if size_data.size in existing_sizes_map:
                     entry = existing_sizes_map[size_data.size]
                     entry.order = size_data.order
-                    entry.sizing_types = update_request.sizing_types
-                    await entry.save(update_fields=["order", "sizing_types", "updated_at"])
+                    await entry.save(update_fields=["order", "updated_at"])
                     updated_entries.append(entry)
                 else:
                     new_entry = await SizingScheme.create(
                         sizing_scheme=new_scheme_name,
                         size=size_data.size,
                         order=size_data.order,
-                        sizing_types=update_request.sizing_types,
                     )
                     updated_entries.append(new_entry)
+
+            # One statement covers surviving rows and rows just created above, which is what makes
+            # "every row of a scheme agrees" true by construction rather than by each branch
+            # remembering. It also self-heals any pre-existing drift on the next save.
+            await SizingScheme.filter(sizing_scheme=new_scheme_name).update(**scheme_values)
+            for entry in updated_entries:
+                for field, value in scheme_values.items():
+                    setattr(entry, field, value)
 
         asyncio.create_task(spreadsheet_service.trigger_spreadsheet_update("sizes"))
         final_entries = [SizingSchemeEntryWithId.from_orm(e) for e in updated_entries]
@@ -304,7 +378,11 @@ class SizingService:
         return SizingSchemeDetailResponse(
             sizing_scheme=new_scheme_name,
             sizes=sorted(final_entries, key=lambda x: x.order),
-            sizing_types=update_request.sizing_types,
+            # From the resolved values, not the request: a PUT that omitted a field must report
+            # what is actually stored.
+            sizing_types=scheme_values["sizing_types"],
+            goat_code=scheme_values["goat_code"],
+            region_code=scheme_values["region_code"],
         )
 
     @staticmethod
@@ -388,6 +466,8 @@ class SizingService:
                         "Sizing Scheme": entry.sizing_scheme,
                         "Size": entry.size,
                         "Sizing Types": sizing_types_str,
+                        "GOAT Code": entry.goat_code or "",
+                        "Region Code": entry.region_code or "",
                     }
                 )
 

@@ -110,6 +110,16 @@ class SizingScheme(Model):
         null=True,
         description="List of applicable types for this sizing scheme (e.g., ['Tops', 'Bottoms'])",
     )
+    goat_code = fields.CharField(
+        max_length=100,
+        null=True,
+        description="GOAT size chart identifier. Scheme-level: same on every row of the scheme.",
+    )
+    region_code = fields.CharField(
+        max_length=20,
+        null=True,
+        description="Region the scheme's sizes are expressed in (US, EU, UK, JP). Scheme-level.",
+    )
 
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

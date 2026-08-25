@@ -3566,7 +3566,7 @@ class DatabaseService:
     ) -> List[Dict[str, Any]]:
         try:
             if table_name == "sizes":
-                sizing_schemes_sql = f'SELECT sizing_scheme, size, "order", sizing_types FROM "{DatabaseService._table("sizing_schemes")}" ORDER BY sizing_scheme, "order"'
+                sizing_schemes_sql = f'SELECT sizing_scheme, size, "order", sizing_types, goat_code, region_code FROM "{DatabaseService._table("sizing_schemes")}" ORDER BY sizing_scheme, "order"'
                 sizing_schemes_records = await Tortoise.get_connection(
                     "default"
                 ).execute_query_dict(sizing_schemes_sql)
@@ -3621,6 +3621,14 @@ class DatabaseService:
                     }
                     if key in mappings:
                         row.update(mappings[key])
+                    # Set last so these sit to the right of the platform columns. Note pandas
+                    # orders DataFrame columns by first appearance ACROSS rows, and
+                    # spreadsheet_service uses list(df.columns) verbatim for "sizes", so this only
+                    # holds while `mappings` is empty - which it is, because it is built from the
+                    # deprecated listingoptions_sizing_lists. Whichever ticket revives that export
+                    # has to pin the column order explicitly.
+                    row["GOAT Code"] = scheme.get("goat_code") or ""
+                    row["Region Code"] = scheme.get("region_code") or ""
                     result_records.append(row)
 
                 return result_records
