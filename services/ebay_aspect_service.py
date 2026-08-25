@@ -798,11 +798,23 @@ class EbayAspectService:
                 # that is already answered.
                 "is_required": bool(mark_required and row["is_required"] and default is None),
                 "ui_size": row["ui_size"],
-                # NOT `default`. RJSF materialises a JSON Schema default into formData, and
-                # the next autosave writes it to listings.data -- turning a live default
-                # into a frozen per-listing copy that later default changes cannot reach.
-                # Shown as placeholder text instead, so the empty field still says what it
-                # will send.
+                # Emitted as a real JSON Schema default, so the form LOADS with the value
+                # rather than hinting at it.
+                #
+                # This is a reversal, and the cost is real: RJSF materialises a schema
+                # default into formData, so the next autosave writes it to listings.data and
+                # the value becomes a frozen per-listing copy that a later change to the
+                # default will not reach. That is the trade accepted deliberately -- a
+                # default nobody can see is a default nobody trusts, and an operator needs
+                # to read the value that will be sent, not a grey hint that disappears the
+                # moment they type.
+                #
+                # The submit path still resolves an ABSENT value the same way
+                # (data -> category default -> aspect default), so listings created before
+                # a default existed keep working without it being stored.
+                "default": default,
+                # Kept alongside it: on a field the operator clears, the placeholder still
+                # says what will be sent if they leave it empty.
                 "placeholder": _placeholder(default),
                 "display_in_form": True,
                 # Groups these under their own heading on the form instead of letting
