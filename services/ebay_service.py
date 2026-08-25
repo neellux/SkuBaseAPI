@@ -190,7 +190,19 @@ class EbayService:
             if resolved_by:
                 value = await EbayService._value_from_mapping(resolved_by, data)
             else:
-                value = data.get(name)
+                # A `mapped_field` aspect reads THE FIELD IT IS MAPPED TO, not its own
+                # name. Color is mapped to brand_color and Style to style_name, and neither
+                # key exists under the aspect's name -- so reading data["Color"] found
+                # nothing and the aspect was silently dropped from the file. eBay then
+                # refused the listing with "The item specific Color is missing".
+                #
+                # resolve_mapping returns None for these deliberately: brand_color needs no
+                # mapping TABLE. That is not the same as needing no value, which is the
+                # distinction this missed.
+                source_key = name
+                if settings.get("source") == "mapped_field" and settings.get("mapped_field"):
+                    source_key = settings["mapped_field"]
+                value = data.get(source_key)
                 if value in (None, "", []):
                     value = aspect.get("category_default")
                 if value in (None, "", []):
