@@ -782,6 +782,11 @@ class EbayAspectService:
                 # Only a closed list becomes an enum. 53% of aspects are FREE_TEXT yet
                 # still ship values, and eBay does not itself enforce those.
                 "options": values if (row["mode"] == "SELECTION_ONLY" and values) else None,
+                # The same values when eBay will NOT enforce them. Offered on the form as a
+                # freeSolo list: an operator picks from eBay's own vocabulary without being
+                # trapped by it, which is what FREE_TEXT means. Type in Coats, Jackets &
+                # Vests is exactly this -- 7 published values, none of them mandatory.
+                "suggestions": values if (row["mode"] != "SELECTION_ONLY" and values) else None,
                 # Optional for a `form` aspect, and its whole purpose is to take the list
                 # from a SkuBase table instead of eBay's. _load_mapped_options reads these
                 # two keys and its result wins over `options` above.

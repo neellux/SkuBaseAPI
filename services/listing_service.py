@@ -1004,6 +1004,14 @@ class ListingService:
             prop = {"title": field.get("display_name", field_name)}
             ui_prop = {}
 
+            # eBay values for an aspect eBay will not enforce. Deliberately NOT an enum:
+            # RJSF would validate against it and reject a value eBay would have accepted.
+            # Carried in the uiSchema instead, where a freeSolo widget can offer them.
+            suggestions = field.get("suggestions")
+            if suggestions and not field.get("options"):
+                ui_prop["ui:suggestions"] = suggestions
+                ui_prop["ui:widget"] = "SuggestAutocomplete"
+
             ui_size = field.get("ui_size")
             if ui_size and isinstance(ui_size, int) and 1 <= ui_size <= 12:
                 ui_prop["ui:grid"] = {"xs": ui_size}

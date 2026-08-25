@@ -65,6 +65,11 @@ CATALOG_COLUMNS = (
     "DescriptionTemplateId",
     "eBaySellerProfileID_Shipping",
     "eBayCategory1",
+    # The title eBay ends up showing. NOT eBayTopTitle: that is a resolved read-only value
+    # the catalog grid reports, and it is absent from the importable column list. It falls
+    # back through eBayTitle (empty on every product checked) to TopTitle, which is what
+    # actually carries the text.
+    "TopTitle",
 )
 CATALOG_KEY = "ProductID"
 DESCRIPTION_TEMPLATE = "Long Description"
@@ -479,6 +484,13 @@ class EbayService:
                 "eBaySellerProfileID_Shipping": shipping_profile_id(price),
                 "eBayCategory1": str(category),
             }
+            # The listing's own title, identical on every child: an eBay variation listing
+            # shows one title, so a per-child one is a SellerCloud storage detail rather
+            # than something eBay wants. Omitted entirely when the listing has none, so an
+            # empty title can never be written over a populated field.
+            title = (data.get("title") or "").strip()
+            if title:
+                wanted[sku]["TopTitle"] = title
         return wanted, problems
 
     @staticmethod
@@ -498,7 +510,9 @@ class EbayService:
             changed = False
             for column in CATALOG_COLUMNS:
                 existing = have.get(column, "")
-                if _is_unset(column, existing):
+                # A column this listing has no value for is carried through untouched, not
+                # blanked: `wanted` omits a key rather than offering an empty one.
+                if _is_unset(column, existing) and column in target:
                     row[column] = target[column]
                     changed = True
                 else:
