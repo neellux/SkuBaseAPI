@@ -61,6 +61,16 @@ MAPPING_SOURCES = (
 # meaning for eBay and is discarded on Grailed.
 SIZE_PREFIX_ASPECTS = {"Size Type"}
 
+# Form order. The operator's sort_order leads when set; everything untouched keeps eBay's
+# relative order behind it, so placing two aspects never requires placing all 167. Ties fall
+# through to eBay's order then the name, which makes the result total rather than arbitrary.
+#
+# Needed because eBay's own ordering contradicts itself: across the 62 reachable categories
+# 662 of 3,278 co-occurring aspect pairs (20.2%) flip their relative order by category.
+ASPECT_ORDER_SQL = (
+    "s.sort_order IS NULL, s.sort_order, a.is_required DESC, a.sort_order, a.aspect_name"
+)
+
 
 def derive_display_name(aspect_name: str) -> str:
     """Default label for an aspect: eBay's own name, unchanged.
@@ -422,7 +432,7 @@ class EbayAspectService:
             return None
 
         rows = await conn.execute_query_dict(
-            """
+            f"""
             SELECT a.aspect_name,
                    a.is_required,
                    a.mode,
@@ -432,7 +442,7 @@ class EbayAspectService:
                    a.max_length,
                    a.variations,
                    a.values_id,
-                   a.sort_order,
+                   a.sort_order AS ebay_sort_order,
                    a.constraint_json,
                    v.value_count,
                    CASE WHEN v.value_count <= $3 THEN v.values_json ELSE NULL END AS values_json,
@@ -445,6 +455,7 @@ class EbayAspectService:
                    s.sellercloud_field,
                    s.ai_tagging,
                    s.ui_size,
+                   s.sort_order,
                    s.min_length,
                    s.regex,
                    s.default_value,
@@ -468,7 +479,7 @@ class EbayAspectService:
                   AND NOT c.acknowledged
             ) ch ON TRUE
             WHERE a.marketplace_id = $1 AND a.category_id = $2
-            ORDER BY a.is_required DESC, a.sort_order
+            ORDER BY {ASPECT_ORDER_SQL}
             """,
             [marketplace_id, category_id, INLINE_VALUE_LIMIT],
         )
@@ -516,6 +527,10 @@ class EbayAspectService:
                 "data_type": row["data_type"],
                 "cardinality": row["cardinality"],
                 "usage": row["usage"],
+                # eBay's own position. Exposed so the page can reproduce the server's sort
+                # locally after a drag, instead of waiting for a save and a refetch to see
+                # the new order.
+                "sort_order": row["ebay_sort_order"],
                 "max_length": row["max_length"],
                 "variations": row["variations"],
                 "value_count": row["value_count"] or 0,
@@ -551,6 +566,10 @@ class EbayAspectService:
                 ),
                 "ai_tagging": bool(row["ai_tagging"]),
                 "ui_size": row["ui_size"],
+                # Null means "not placed": the aspect keeps eBay's own order behind
+                # everything that has been placed. 0 is a real position, so the two must
+                # stay distinguishable.
+                "sort_order": row["sort_order"],
                 "min_length": row["min_length"],
                 "regex": row["regex"],
                 "default_value": decode_json(row.get("default_value"), None),
@@ -705,18 +724,21 @@ class EbayAspectService:
             return []
         conn = Tortoise.get_connection("default")
         rows = await conn.execute_query_dict(
-            """
+            f"""
             SELECT a.aspect_name,
                    a.is_required,
                    a.mode,
                    a.data_type,
                    a.cardinality,
                    a.max_length,
-                   a.sort_order,
+                   -- Aliased: the operator's s.sort_order below owns the plain name, and
+                   -- two columns called sort_order would have the later one silently win.
+                   a.sort_order AS ebay_sort_order,
                    s.display_name,
                    s.mapped_table,
                    s.mapped_column,
                    s.ui_size,
+                   s.sort_order,
                    s.min_length,
                    s.regex,
                    COALESCE(s.category_defaults -> a.category_id, s.default_value)
@@ -735,7 +757,7 @@ class EbayAspectService:
               -- _present_aspect. Reading a missing tick as "off" would drop exactly the
               -- fields eBay will reject the listing over.
               AND (s.enabled OR a.is_required)
-            ORDER BY a.is_required DESC, a.sort_order
+            ORDER BY {ASPECT_ORDER_SQL}
             """,
             [category_id, DEFAULT_MARKETPLACE, INLINE_VALUE_LIMIT],
         )
@@ -781,8 +803,15 @@ class EbayAspectService:
                 # Groups these under their own heading on the form instead of letting
                 # them interleave with the listing's own fields.
                 "section": "ebay",
-                # After every template field, whose orders top out at 999.
-                "order": 1000 + (row["sort_order"] or index),
+                # After every template field, whose orders top out at 999. The operator's
+                # placement wins when set; an unplaced aspect keeps eBay's own sequence and
+                # sits behind every placed one, matching ASPECT_ORDER_SQL. The 100,000
+                # offset is what puts it behind: eBay's sort_order tops out in the tens.
+                "order": (
+                    1000 + row["sort_order"]
+                    if row["sort_order"] is not None
+                    else 100000 + (row["ebay_sort_order"] or index)
+                ),
             }
             # min/max/regex are string constraints. On a number field the same keys become
             # `minimum`/`maximum`, so an aspectMaxLength of 65 would silently cap the VALUE
@@ -1031,9 +1060,10 @@ class EbayAspectService:
                 INSERT INTO pm_ebay_aspect_settings
                     (marketplace_id, aspect_name, enabled, source, mapped_field,
                      mapped_table, mapped_column, display_name, sellercloud_field,
-                     ai_tagging, ui_size, min_length, regex, default_value,
+                     ai_tagging, ui_size, sort_order, min_length, regex, default_value,
                      category_defaults, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::jsonb,
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $17, $12, $13,
+                        $14::jsonb,
                         CASE WHEN $15::text IS NULL OR $16::jsonb IS NULL THEN '{}'::jsonb
                              ELSE jsonb_build_object($15, $16::jsonb) END,
                         now())
@@ -1047,6 +1077,7 @@ class EbayAspectService:
                     sellercloud_field = EXCLUDED.sellercloud_field,
                     ai_tagging    = EXCLUDED.ai_tagging,
                     ui_size       = EXCLUDED.ui_size,
+                    sort_order    = EXCLUDED.sort_order,
                     min_length    = EXCLUDED.min_length,
                     regex         = EXCLUDED.regex,
                     default_value = EXCLUDED.default_value,
@@ -1084,6 +1115,9 @@ class EbayAspectService:
                     orjson.dumps(entry["category_default"]).decode()
                     if has_default and entry.get("category_default") is not None
                     else None,
+                    # $17, appended rather than slotted in so the sixteen existing
+                    # positions keep their numbers.
+                    entry.get("sort_order"),
                 ],
             )
             written += 1

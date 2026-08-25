@@ -209,6 +209,10 @@ GRAILED_DEFAULT_SETTINGS = {
 # Note this does NOT enable eBay. Enablement is membership in app_settings.platforms, which
 # these defaults never touch.
 EBAY_DEFAULT_SETTINGS = {
+    # StartPrice = SitePrice / (1 - ebay_discount), rounded to whole dollars. eBay's fees
+    # come off the listed price, so the listing is marked UP from the site price rather than
+    # the site price being marked down.
+    "ebay_discount": 0.18,
     "manual_fallback": True,
     "min_batch_size": 100,
     "allow_resubmit": True,

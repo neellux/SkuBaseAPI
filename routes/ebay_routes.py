@@ -38,6 +38,11 @@ class EbayAspectSettingsEntry(BaseModel):
     category_default: Optional[Any] = None
     ai_tagging: bool = False
     ui_size: Optional[int] = Field(default=None, ge=1, le=12)
+    # Form position, aspect level. Null means unplaced: the aspect keeps eBay's own order
+    # and sits behind everything placed. The page assigns these in tens so a later reorder
+    # elsewhere can interleave without renumbering. No upper bound, since a category can
+    # offer 30+ aspects and nothing stops an operator placing all of them.
+    sort_order: Optional[int] = Field(default=None, ge=0)
     min_length: Optional[int] = Field(default=None, ge=0)
     regex: Optional[str] = None
     default_value: Optional[Any] = None

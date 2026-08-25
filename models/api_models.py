@@ -785,6 +785,12 @@ class CreateBatchResponse(BaseModel):
     product_import_id: Optional[int] = Field(
         None, description="Platform-side import id, if a batch was uploaded"
     )
+    # eBay only. The import file has no id to report, so the row count is what tells the
+    # operator how much actually went.
+    rows: Optional[int] = Field(None, description="Rows in the generated import file")
+    blocked: Optional[Dict[str, Any]] = Field(
+        None, description="Submission id -> why it contributed no rows"
+    )
 
 
 class AddProductRequest(BaseModel):

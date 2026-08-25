@@ -3,7 +3,7 @@ import io
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 import openpyxl
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -22,6 +22,7 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services import spo_service as spo_service_module
+from services.ebay_poller import ebay_poller
 from services.grailed_poller import grailed_poller
 from services.spo_poller import spo_poller
 from services.spo_service import spo_service
@@ -323,6 +324,36 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
         asyncio.create_task(_run_grailed_flush())
         return CreateBatchResponse(
             platform=platform, submission_count=pending, product_import_id=None
+        )
+
+    if platform == "ebay":
+        # Posts the specifics file synchronously, like SPO. ImportEbaySpecifics answers
+        # with a QueuedJobResponse, so its ID is a real SellerCloud queued job: it becomes
+        # the import id the dashboard keys on, and get_job_status can follow it.
+        try:
+            result = await ebay_poller.manual_flush()
+        except Exception as exc:
+            logger.exception("eBay specifics flush failed")
+            # The snackbar shows `detail` verbatim, so surface SellerCloud's own message
+            # rather than a generic failure the operator cannot act on.
+            body = getattr(getattr(exc, "response", None), "text", "") or ""
+            raise HTTPException(
+                status_code=500,
+                detail=f"eBay import failed: {body[:200]}" if body else "eBay specifics flush failed",
+            )
+
+        if result.get("sent") and not result.get("ok"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"SellerCloud rejected the import: {str(result.get('response'))[:200]}",
+            )
+
+        return CreateBatchResponse(
+            platform=platform,
+            submission_count=result.get("submission_count", 0),
+            product_import_id=result.get("job_id"),
+            rows=result.get("rows"),
+            blocked={str(k): v for k, v in (result.get("blocked") or {}).items()} or None,
         )
 
     raise HTTPException(

@@ -826,9 +826,14 @@ class ListingService:
         aspect defaults already refuse. The listing's category is resolved server-side
         instead, so an untouched listing stores nothing.
 
-        `order` is explicit rather than relying on 999 being both the aspects' base and the
-        sort key's default: it must sit ahead of the aspects, and a tie-break is not a
-        statement of intent.
+        `order` is the fallback for a category that offers no Department aspect (5 of the
+        62 reachable ones). _get_ebay_form_aspects overrides it to sit beside Department
+        everywhere else. Explicit rather than relying on 999 being both the aspects' base
+        and the sort key's default: a tie-break is not a statement of intent.
+
+        ui_size 8 pairs with Department's 4 to fill exactly one 12-column row. Two thirds
+        is also about as narrow as this field goes: its labels are full breadcrumbs up to
+        255 characters, and below this they truncate past the second level.
         """
         return {
             "name": "ebay_category_id",
@@ -841,7 +846,7 @@ class ListingService:
             "display_in_form": True,
             "section": "ebay",
             "order": 950,
-            "ui_size": 12,
+            "ui_size": 8,
         }
 
     @staticmethod
@@ -889,9 +894,16 @@ class ListingService:
                 mark_required=True,
                 ebay_settings=ebay_settings,
             )
-            return [
-                ListingService._ebay_category_field(candidates, category_id)
-            ] + aspects
+            category_field = ListingService._ebay_category_field(candidates, category_id)
+            # Placed relative to Department rather than at a fixed number. Department's
+            # sort_order runs 1 to 5 across the 62 reachable categories, so no constant
+            # sits after it everywhere. The half step keeps it ahead of whatever aspect
+            # follows. _convert_template_to_schema sorts on `order`, so list position here
+            # decides nothing.
+            anchor = next((a for a in aspects if a.get("name") == "Department"), None)
+            if anchor is not None:
+                category_field["order"] = anchor.get("order", 999) + 0.5
+            return aspects + [category_field]
         except Exception as e:  # noqa: BLE001 - the form must render without eBay
             logger.warning(f"Could not load eBay form aspects for {product_type!r}: {e}")
             return []
