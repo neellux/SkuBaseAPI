@@ -383,11 +383,26 @@ class OneInventoryService:
         HTTP 200, `userErrors: [{field: ["id"], message: "Product does not exist"}]`, which
         shopify_client turns into ShopifySemanticError. Matching on exc.user_errors rather
         than str(exc) because multiple userErrors are joined with "; " and the structured
-        list is the only reliable discriminator. Same predicate shape as
-        shopify_admin.delete_product and zero_inventory_at.
+        list is the only reliable discriminator.
+
+        THE FIELD PATH IS THE DISCRIMINATOR, NOT THE MESSAGE. An earlier version of this
+        matched "does not exist" anywhere in the message and cost a production submission:
+        _update's update_variants call failed with
+
+            ['variants', '0', 'id']: Product variant does not exist
+
+        on DNT-MTPS-0106, which is a stale VARIANT id on a product that exists perfectly
+        well. The loose predicate read that as a missing product, fell through to _create,
+        and Shopify rejected the create with "Handle ... already in use" - correctly, since
+        the product was there the whole time.
+
+        Only field == ["id"] is the product itself. shopify_admin.delete_product can afford
+        the loose check because productDelete has exactly one possible subject; _update
+        makes four calls and any of them can raise.
         """
         return any(
-            "does not exist" in str(e.get("message", "")).lower()
+            tuple(e.get("field") or ()) == ("id",)
+            and "does not exist" in str(e.get("message", "")).lower()
             for e in exc.user_errors
         )
 
