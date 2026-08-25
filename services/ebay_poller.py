@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from tortoise import Tortoise
 from tortoise.transactions import in_transaction
 
 from decimal import Decimal
@@ -74,14 +75,25 @@ class EbayPoller:
                         self.name, len(stale), requeued, failed)
         return {"requeued": requeued, "failed": failed}
 
-    async def manual_flush(self) -> dict[str, Any]:
-        """Post every pending row as ONE import, however few there are.
+    @staticmethod
+    async def _next_batch_number() -> int:
+        """Next eBay batch id, from a sequence so concurrent flushes cannot collide.
 
-        No min_batch_size here. That setting gates the scheduled sweep -- "do not bother
-        SellerCloud until N have piled up" -- and a person clicking submit has already made
-        that decision. One product is a valid manual batch.
+        Same mechanism as grailed_batch_seq. It exists because the batch needs an id BEFORE
+        any SellerCloud call: the export alone takes about a minute, and the queued job ids
+        that eventually come back belong to individual steps, not to the batch.
         """
-        submission_ids: list[int] = []
+        conn = Tortoise.get_connection("default")
+        rows = await conn.execute_query_dict("SELECT nextval('ebay_batch_seq') AS n")
+        return int(rows[0]["n"])
+
+    async def begin_batch(self) -> tuple[int | None, list[int]]:
+        """Claim the pending rows and stamp them with an import id. Database only.
+
+        Deliberately separate from the work: this is fast enough to run inside the request,
+        so the dashboard has an import row the moment Submit is clicked rather than a minute
+        later. run_batch then does the four SellerCloud round trips in the background.
+        """
         async with in_transaction("default") as conn:
             pending = await (
                 ListingSubmission.filter(
@@ -91,8 +103,7 @@ class EbayPoller:
                 .using_db(conn)
             )
             if not pending:
-                return {"submission_count": 0, "rows": 0, "sent": False}
-
+                return None, []
             submission_ids = [s.id for s in pending]
             await (
                 ListingSubmission.filter(id__in=submission_ids)
@@ -103,7 +114,54 @@ class EbayPoller:
                 )
             )
 
-        return await self._submit_batch(submission_ids)
+        import_id = await self._next_batch_number()
+        # product_import_id up front, so the import appears immediately. The per-step
+        # SellerCloud job ids are added to ebay_jobs as each one returns.
+        await record_step(
+            submission_ids,
+            "queued_batch",
+            meta={"product_import_id": import_id},
+            submissions=len(submission_ids),
+        )
+        logger.info("%s: batch %s claimed %d submission(s)",
+                    self.name, import_id, len(submission_ids))
+        return import_id, submission_ids
+
+    async def run_batch(self, import_id: int, submission_ids: list[int]) -> dict[str, Any]:
+        """The four SellerCloud round trips, for rows begin_batch already claimed."""
+        try:
+            return await self._submit_batch(submission_ids)
+        except Exception:
+            logger.exception("%s: batch %s failed", self.name, import_id)
+            raise
+
+    async def manual_flush(self) -> dict[str, Any]:
+        """Claim and run in one call. Used where a caller wants to block on the result."""
+        import_id, submission_ids = await self.begin_batch()
+        if not submission_ids:
+            return {"submission_count": 0, "rows": 0, "sent": False}
+        return await self.run_batch(import_id, submission_ids)
+
+    @staticmethod
+    async def _stage(
+        submission_ids: list[int], step: str, jobs: dict[str, Any], **details: Any
+    ) -> None:
+        """Record one stage, carrying every job id collected so far.
+
+        The whole map is rewritten each time, not merged in SQL: record_step's `meta` does a
+        shallow `platform_meta || $2`, so a nested key like ebay_jobs would be REPLACED by a
+        partial one rather than merged. Passing the accumulated dict keeps it complete.
+
+        Written twice on purpose, the way spo_poller does it: into `meta` for the top level
+        the dashboard reads, and onto the step entry so the history says which ids belonged
+        to which stage rather than only where things ended up.
+        """
+        await record_step(
+            submission_ids,
+            step,
+            meta={"ebay_jobs": dict(jobs)} if jobs else None,
+            **{k: v for k, v in details.items() if v is not None},
+        )
 
     async def _submit_batch(self, submission_ids: list[int]) -> dict[str, Any]:
         """One import file for these submissions."""
@@ -169,18 +227,21 @@ class EbayPoller:
             catalog_skus = sorted({r[0] for r in rows})
             current, export_job = await ebay_service.export_catalog_fields(catalog_skus)
             jobs["export"] = export_job
+            await self._stage(submission_ids, "catalog_exported", jobs,
+                              job=export_job, skus=len(catalog_skus))
             catalog_rows = ebay_service.diff_catalog_rows(current, wanted)
             if catalog_rows:
                 cat = await ebay_service.import_catalog_info(
                     ebay_service.render_catalog_tsv(catalog_rows)
                 )
                 jobs["catalog"] = cat.get("job_id")
-                await record_step(submission_ids, "catalog_imported",
+                await self._stage(submission_ids, "catalog_imported", jobs,
                                   rows=len(catalog_rows), job=cat.get("job_id"))
             else:
                 # Everything already correct. A normal outcome, not a failure: sending a
                 # file that changes nothing would still queue a job and still take a minute.
-                await record_step(submission_ids, "catalog_unchanged")
+                await self._stage(submission_ids, "catalog_unchanged", jobs,
+                                  skus=len(catalog_skus))
 
             # --- step 2: specifics ----------------------------------------------------
             result = await ebay_service.import_specifics(tsv)
@@ -197,8 +258,8 @@ class EbayPoller:
                 status=SubmissionStatus.FAILED,
                 error_display="eBay specifics import failed to send",
             )
-            await record_step(
-                submission_ids, "failed", stage="import",
+            await self._stage(
+                submission_ids, "failed", jobs, stage="import",
                 reason=f"{type(exc).__name__}: {detail}"[:600],
             )
             raise
@@ -207,6 +268,9 @@ class EbayPoller:
         job_id = result.get("job_id")
         jobs["specifics"] = job_id
         sent_ids = [sid for sid in submission_ids if sid in per_submission]
+        if ok:
+            await self._stage(submission_ids, "specifics_imported", jobs,
+                              job=job_id, rows=len(rows))
 
         # --- step 3: publish ---------------------------------------------------------
         if ok:
@@ -219,7 +283,7 @@ class EbayPoller:
                     status=SubmissionStatus.FAILED,
                     error_display="eBay publish to channel refused",
                 )
-                await record_step(sent_ids, "failed", stage="publish",
+                await self._stage(sent_ids, "failed", jobs, stage="publish",
                                   reason=str(published.get("message"))[:400])
                 return {"submission_count": 0, "rows": len(rows), "sent": True, "ok": False,
                         "jobs": jobs, "response": published.get("response"), "blocked": blocked}
@@ -231,15 +295,16 @@ class EbayPoller:
             # Left in PROCESSING, not SUCCESS: SellerCloud accepting the file means it
             # QUEUED a job, not that the specifics landed. get_job_status can settle that
             # later; claiming success now would be a claim we cannot support.
+            # The terminal stage. product_import_id is NOT rewritten here: begin_batch
+            # already stamped the batch's own id before any SellerCloud call, and the
+            # dashboard has been keying on it since. Overwriting it with a job id now would
+            # move an import row that operators have already been watching.
             await record_step(
                 sent_ids,
-                "submitted",
-                # meta=, not a bare kwarg: **details land on the step entry, while the
-                # dashboard reads product_import_id from the TOP level of platform_meta.
-                # Same call shape spo_poller uses for its import id. The publish job is the
-                # one worth surfacing: it is the step that actually lists the product.
-                meta={"product_import_id": jobs.get("publish") or job_id,
-                      "ebay_jobs": jobs},
+                "published",
+                meta={"ebay_jobs": dict(jobs),
+                      "published_at": datetime.now(timezone.utc).isoformat()},
+                job=jobs.get("publish"),
                 rows=len(rows),
                 message=str(result.get("message") or "")[:200],
             )

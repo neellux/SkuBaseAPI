@@ -327,33 +327,33 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
         )
 
     if platform == "ebay":
-        # Posts the specifics file synchronously, like SPO. ImportEbaySpecifics answers
-        # with a QueuedJobResponse, so its ID is a real SellerCloud queued job: it becomes
-        # the import id the dashboard keys on, and get_job_status can follow it.
-        try:
-            result = await ebay_poller.manual_flush()
-        except Exception as exc:
-            logger.exception("eBay specifics flush failed")
-            # The snackbar shows `detail` verbatim, so surface SellerCloud's own message
-            # rather than a generic failure the operator cannot act on.
-            body = getattr(getattr(exc, "response", None), "text", "") or ""
-            raise HTTPException(
-                status_code=500,
-                detail=f"eBay import failed: {body[:200]}" if body else "eBay specifics flush failed",
+        # Claimed and given an import id synchronously, then worked in the background --
+        # the same shape as grailed, and for a stronger reason: an eBay batch is four
+        # SellerCloud round trips and the custom export alone takes about a minute. Holding
+        # the request open for that would time out the browser long before it finished.
+        #
+        # The id comes from ebay_batch_seq rather than from SellerCloud: none of the queued
+        # job ids exist yet at this point, and the ones that arrive later belong to
+        # individual steps rather than to the batch.
+        import_id, submission_ids = await ebay_poller.begin_batch()
+        if not submission_ids:
+            return CreateBatchResponse(
+                platform=platform, submission_count=0, product_import_id=None
             )
 
-        if result.get("sent") and not result.get("ok"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"SellerCloud rejected the import: {str(result.get('response'))[:200]}",
-            )
+        async def _run_ebay_batch():
+            try:
+                await ebay_poller.run_batch(import_id, submission_ids)
+            except Exception:
+                # Already recorded on the rows by _submit_batch, which fails them and
+                # writes SellerCloud's own message into the step history.
+                logger.exception("Background eBay batch %s failed", import_id)
 
+        asyncio.create_task(_run_ebay_batch())
         return CreateBatchResponse(
             platform=platform,
-            submission_count=result.get("submission_count", 0),
-            product_import_id=result.get("job_id"),
-            rows=result.get("rows"),
-            blocked={str(k): v for k, v in (result.get("blocked") or {}).items()} or None,
+            submission_count=len(submission_ids),
+            product_import_id=import_id,
         )
 
     raise HTTPException(
