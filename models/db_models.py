@@ -11,15 +11,24 @@ class SubmissionStatus(StrEnum):
     QUEUED = "queued"
     PENDING = "pending"
     PROCESSING = "processing"
+    # The platform accepted the submission and a human still owes it something. eBay is
+    # the first: publishing a listing does not attach its images, which an operator does
+    # by uploading a File Exchange file by hand. Distinct from PENDING, which means "not
+    # sent yet" and drives the submit button and the dashboard's unsent-work badges.
+    AWAITING_ACTION = "awaiting_action"
     SUCCESS = "success"
     FAILED = "failed"
 
 
 TERMINAL_STATUSES = {SubmissionStatus.SUCCESS, SubmissionStatus.FAILED}
+# Work the system is still carrying. AWAITING_ACTION is in flight because the submission is
+# not finished, even though nothing automated will move it: the listing's "pending" count is
+# what tells an operator there is something left to do.
 IN_FLIGHT_STATUSES = {
     SubmissionStatus.QUEUED,
     SubmissionStatus.PENDING,
     SubmissionStatus.PROCESSING,
+    SubmissionStatus.AWAITING_ACTION,
 }
 
 
@@ -340,7 +349,10 @@ class ListingSubmission(Model):
         max_length=20,
         default="pending",
         index=True,
-        description="Submission status: pending, success, failed",
+        description=(
+            "Submission status: queued, pending, processing, awaiting_action, "
+            "success, failed"
+        ),
     )
 
     submitted_by = fields.CharField(
@@ -393,6 +405,20 @@ class ListingSubmission(Model):
         max_length=100,
         null=True,
         description="User ID who marked the failed submission as reviewed",
+    )
+
+    completed_at = fields.DatetimeField(
+        null=True,
+        description="When an operator confirmed the manual step this submission was "
+        "waiting on. Deliberately NOT reviewed_at: that records a FAILED submission "
+        "being triaged, this records a submission the platform accepted that still "
+        "needed a human. Conflating them would make the two indistinguishable in "
+        "reporting",
+    )
+    completed_by = fields.CharField(
+        max_length=100,
+        null=True,
+        description="User ID who confirmed the manual step",
     )
 
     created_at = fields.DatetimeField(auto_now_add=True)

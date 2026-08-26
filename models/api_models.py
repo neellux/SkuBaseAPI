@@ -737,6 +737,15 @@ class SubmissionsDashboardResponse(BaseModel):
         default_factory=dict,
         description="Pending submission count per platform_id, for tab badges",
     )
+    platform_awaiting_action_counts: Dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Submissions per platform_id that the platform accepted but that still owe a "
+            "human a manual step. Kept apart from platform_pending_counts: pending means "
+            "nothing has been sent yet, this means it was sent and a person owes it "
+            "something"
+        ),
+    )
 
 
 class ImportListingDetail(BaseModel):
@@ -760,6 +769,12 @@ class ImportListingDetail(BaseModel):
         default_factory=list,
         description="SKUs that were already on the sheet and refreshed in place "
         "(grailed updated_references), rather than added as new rows",
+    )
+    item_ids: Optional[Dict[str, str]] = Field(
+        None,
+        description="Per-child-SKU platform item id ({sku: id}); eBay item numbers, which "
+        "the UI counts against `skus` to show how much of an import is actually listed "
+        "before an operator downloads its image revise file",
     )
     updated_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = Field(
