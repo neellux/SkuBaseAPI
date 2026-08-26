@@ -64,8 +64,18 @@ class EbayPoller(BasePoller):
         `submitting` step, because that step is written immediately before the POST and by
         nothing else. Those provably never reached SellerCloud, so they go back to PENDING.
 
-        A row that DOES carry the step got as far as the call, and whether SellerCloud
-        received it is unknowable from here, so it is failed for review instead of retried.
+        A row whose LAST step is `submitting` got as far as the call and no further, and
+        whether SellerCloud received it is unknowable from here, so it is failed for review
+        instead of retried.
+
+        THE LAST STEP, NOT ANY STEP. Asking `any(step == "submitting")` was wrong and did
+        real damage: the flow passes THROUGH `submitting` on its way to `catalog_exported`,
+        `specifics_imported` and `published`, and a published row sits in PROCESSING on
+        purpose (SellerCloud accepting a file means it queued a job, not that the work
+        landed). So every successfully published row still carried a `submitting` step, and
+        the first cycle after this poller was enabled failed five of them on prod with
+        "Import interrupted". A row that got past `submitting` is not interrupted, it is
+        waiting, and the stage marker is what says which.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
         stale = await ListingSubmission.filter(
@@ -77,7 +87,16 @@ class EbayPoller(BasePoller):
         requeued = failed = 0
         for sub in stale:
             steps = (sub.platform_meta or {}).get("steps") or []
-            if any(st.get("step") == "submitting" for st in steps):
+            names = [st.get("step") for st in steps]
+            last = names[-1] if names else None
+
+            if last != "submitting" and "submitting" in names:
+                # Got past the call and was answered, so a later stage owns this row.
+                # collect_item_ids picks up a published one; anything else stopped
+                # somewhere worth looking at rather than silently retrying or failing.
+                continue
+
+            if last == "submitting":
                 sub.status = SubmissionStatus.FAILED
                 sub.error_display = "Import interrupted - check SellerCloud before resubmitting"
                 await sub.save(update_fields=["status", "error_display", "updated_at"])
