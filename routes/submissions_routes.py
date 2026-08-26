@@ -54,13 +54,21 @@ def _effective_import_status(status_counts: dict[str, int] | None) -> str:
     """Roll a per-status breakdown up to a single dominant status for the import.
 
     In-progress beats finished: any processing → processing; otherwise any pending
-    → pending; otherwise any failed → failed; otherwise success.
+    → pending; otherwise any awaiting_action → awaiting_action; otherwise any failed
+    → failed; otherwise success.
+
+    awaiting_action outranks failed on purpose. It is the only status in the list an
+    operator can act on from this screen, and an import showing "failed" because two of its
+    rows never listed would bury the fact that the other three hundred are waiting on an
+    upload. It sits below processing and pending because those still resolve on their own.
     """
     counts = status_counts or {}
     if counts.get(SubmissionStatus.PROCESSING, 0) > 0:
         return SubmissionStatus.PROCESSING
     if counts.get(SubmissionStatus.PENDING, 0) > 0:
         return SubmissionStatus.PENDING
+    if counts.get(SubmissionStatus.AWAITING_ACTION, 0) > 0:
+        return SubmissionStatus.AWAITING_ACTION
     if counts.get(SubmissionStatus.FAILED, 0) > 0:
         return SubmissionStatus.FAILED
     return SubmissionStatus.SUCCESS
@@ -87,12 +95,29 @@ async def _pending_counts_by_platform() -> dict[str, int]:
 
     Pending is unaffected by reviewed_at (that only flips failed->success), so a
     plain status='pending' count is correct. One grouped query keeps this cheap.
+
+    awaiting_action is deliberately NOT added in. Both are work outstanding, but they are
+    different work: pending is "nobody has sent this yet" and drives the submit button,
+    awaiting_action is "the platform has it and a person owes it a step". Summing them
+    would recreate exactly the ambiguity a separate status was introduced to remove. It is
+    counted alongside instead, by the function below.
     """
     conn = connections.get("default")
     rows = await conn.execute_query_dict(
         "SELECT platform_id, count(*) AS n FROM listing_submissions "
         "WHERE status = $1 GROUP BY platform_id",
         [SubmissionStatus.PENDING],
+    )
+    return {row["platform_id"]: row["n"] for row in rows}
+
+
+async def _awaiting_action_counts_by_platform() -> dict[str, int]:
+    """Submissions the platform accepted that still owe a human a step, per platform."""
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(
+        "SELECT platform_id, count(*) AS n FROM listing_submissions "
+        "WHERE status = $1 GROUP BY platform_id",
+        [SubmissionStatus.AWAITING_ACTION],
     )
     return {row["platform_id"]: row["n"] for row in rows}
 
@@ -281,6 +306,7 @@ async def get_dashboard(
             page=page,
             page_size=page_size,
             platform_pending_counts=await _pending_counts_by_platform(),
+            platform_awaiting_action_counts=await _awaiting_action_counts_by_platform(),
         )
     except HTTPException:
         raise
@@ -418,6 +444,7 @@ def _build_import_detail(
                 sku_errors=(sub.platform_meta or {}).get("sku_errors") or None,
                 skus=skus,
                 updated_skus=(sub.platform_meta or {}).get("updated_references") or [],
+                item_ids=(sub.external_id or {}).get("item_ids") or None,
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )
@@ -607,3 +634,206 @@ async def download_error_template(
             )
         },
     )
+
+
+# --------------------------------------------------------------- eBay image revise step
+# Publishing to eBay does not attach a listing's images. An operator does that by uploading
+# a File Exchange file by hand, which is why an eBay submission parks in AWAITING_ACTION
+# instead of going straight to SUCCESS.
+
+GCS_ROOT = "https://storage.googleapis.com/lux_products"
+# Row 1 and row 2 of eBay's revise template, reproduced exactly, including the space after
+# "Template=". Taken from the Ebay Import sheet of the operator's own workbook.
+REVISE_INFO_ROW = (
+    "#INFO",
+    "Version=1.0.0",
+    "Template= eBay-active-revise-price-quantity-download_US",
+)
+REVISE_HEADER_ROW = ("Action", "Item number", "PicURL")
+PIC_SEPARATOR = " | "
+
+
+def _require_manual_image_step(platform: str) -> None:
+    """These endpoints are eBay's, and deliberately not behind manual_fallback.
+
+    _get_platform_settings_for gates the SPO endpoints on
+    platform_settings.<id>.manual_fallback, which means "the automated path failed, a human
+    picked it up". eBay's image upload is not a fallback from anything: it is the only way
+    images are ever attached, on every listing, every time. Gating it on a fallback flag
+    would make the normal path look like an exception.
+    """
+    if platform != "ebay":
+        raise HTTPException(
+            status_code=404,
+            detail=f"There is no manual image step for platform '{platform}'",
+        )
+
+
+async def _images_by_parent(parents: list[str]) -> dict[str, int]:
+    """Image count per parent, from the NEWEST productimages row for each.
+
+    Newest matters. A re-shoot writes a new row and GCS keeps the old blobs, so a product
+    whose current shoot has 4 images can still have 5_fullsize.jpg sitting in the bucket
+    from the previous one. Counting what exists in GCS would attach a stale image to a live
+    listing; the table is the only thing that knows which shoot is current.
+
+    created_at, not updated_at: editing a product's washtags writes to its older
+    batch_creation row, which would otherwise make a stale shoot look like the newest.
+    """
+    wanted = [p for p in parents if p]
+    if not wanted:
+        return {}
+    rows = await connections.get("photography_db").execute_query_dict(
+        """
+        SELECT DISTINCT ON (product_id) product_id, product_images_count
+        FROM productimages
+        WHERE product_id = ANY($1::text[])
+        ORDER BY product_id, created_at DESC
+        """,
+        [wanted],
+    )
+    return {r["product_id"]: (r["product_images_count"] or 0) for r in rows}
+
+
+def _revise_rows(
+    submissions: list[ListingSubmission], image_counts: dict[str, int]
+) -> list[tuple[str, str]]:
+    """(item number, pipe-joined image URLs) per listed child, ready for the sheet.
+
+    One row per CHILD, because eBay addresses a variation by its own item number, and every
+    child of a parent carries that parent's images.
+    """
+    out: list[tuple[str, str]] = []
+    for sub in submissions:
+        parent = sub.listing.product_id if sub.listing else None
+        count = image_counts.get(parent, 0)
+        if not parent or not count:
+            continue
+        urls = PIC_SEPARATOR.join(
+            f"{GCS_ROOT}/{parent}/{index}_fullsize.jpg" for index in range(1, count + 1)
+        )
+        for _sku, item_id in sorted(((sub.external_id or {}).get("item_ids") or {}).items()):
+            out.append((str(item_id), urls))
+    return out
+
+
+@router.post("/imports/image_revise_template")
+async def download_image_revise_template(
+    id: int = Query(..., description="Platform-side import id"),
+    platform: str = Query("ebay", description="Platform identifier"),
+):
+    """The .xlsx an operator uploads to eBay to attach images to a published import."""
+    import_id = id
+    _require_manual_image_step(platform)
+
+    submissions = await _load_import_submissions(platform, import_id)
+    if not submissions:
+        raise HTTPException(status_code=404, detail=f"Import {import_id} not found")
+
+    image_counts = await _images_by_parent(
+        [s.listing.product_id for s in submissions if s.listing]
+    )
+    rows = _revise_rows(submissions, image_counts)
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No eBay item numbers yet for import {import_id}. They appear over the "
+                "hour or so after publishing; try again shortly."
+            ),
+        )
+
+    def _build_xlsx() -> bytes:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        # Renaming the default sheet, not adding one, so the workbook has exactly the one
+        # sheet the operator's template has.
+        ws.title = "Ebay Import"
+        ws.append(list(REVISE_INFO_ROW))
+        ws.append(list(REVISE_HEADER_ROW))
+        for item_id, urls in rows:
+            ws.append(["Revise", item_id, urls])
+        # Item numbers as TEXT. Written as a number, a 12-digit id reads back as
+        # 327206514106.0 and a longer one risks scientific notation. Set once on the column
+        # rather than per cell, which measured 143ms of a 219ms build at 1,573 rows.
+        for cell in ws["B"]:
+            cell.number_format = "@"
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    payload = await asyncio.get_event_loop().run_in_executor(None, _build_xlsx)
+
+    return StreamingResponse(
+        io.BytesIO(payload),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="ebay_image_revise_{import_id}.xlsx"'
+            )
+        },
+    )
+
+
+@router.post("/imports/mark_images_uploaded", response_model=ImportDetailResponse)
+async def mark_images_uploaded(
+    request: Request,
+    id: int = Query(..., description="Platform-side import id"),
+    platform: str = Query("ebay", description="Platform identifier"),
+):
+    """Close out an import the operator has uploaded images for.
+
+    One click, but per row. A child that never got an eBay item number never listed, so it
+    got no images either and there is nothing to confirm: marking it successful would record
+    it as live when it is not. Those fail instead, carrying eBay's own reason where the
+    publish job gave one.
+    """
+    import_id = id
+    _require_manual_image_step(platform)
+
+    submissions = await _load_import_submissions(platform, import_id)
+    if not submissions:
+        raise HTTPException(status_code=404, detail=f"Import {import_id} not found")
+
+    waiting = [s for s in submissions if s.status == SubmissionStatus.AWAITING_ACTION]
+    if not waiting:
+        # Not an error. A second click, or a colleague who got there first, should read as
+        # "already done" rather than as a failure.
+        return _build_import_detail(platform, import_id, submissions)
+
+    user_id = request.state.user["id"]
+    now = datetime.now(timezone.utc)
+    completed_ids: list[int] = []
+    failed_ids: list[int] = []
+
+    for sub in waiting:
+        item_ids = (sub.external_id or {}).get("item_ids") or {}
+        if item_ids:
+            sub.status = SubmissionStatus.SUCCESS
+            sub.completed_at = now
+            sub.completed_by = user_id
+            await sub.save(
+                update_fields=["status", "completed_at", "completed_by", "updated_at"]
+            )
+            completed_ids.append(sub.id)
+            continue
+
+        errors = (sub.platform_meta or {}).get("publish_errors") or {}
+        reason = next(iter(errors.values()), None) if isinstance(errors, dict) else None
+        sub.status = SubmissionStatus.FAILED
+        sub.error_display = reason or "eBay returned no item number for any child"
+        await sub.save(update_fields=["status", "error_display", "updated_at"])
+        failed_ids.append(sub.id)
+
+    if completed_ids:
+        await record_step(
+            completed_ids, "images_uploaded", completed_by=user_id
+        )
+    if failed_ids:
+        await record_step(failed_ids, "failed", stage="publish", reason="no eBay item number")
+
+    logger.info(
+        "Import %s (%s): %d completed, %d failed after image upload confirmed by %s",
+        import_id, platform, len(completed_ids), len(failed_ids), user_id,
+    )
+    return _build_import_detail(platform, import_id, submissions)

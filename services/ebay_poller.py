@@ -15,21 +15,47 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from tortoise import Tortoise
+from collections import defaultdict
+
+from tortoise import Tortoise, connections
 from tortoise.transactions import in_transaction
 
 from decimal import Decimal
 
 from models.db_models import AppSettings, ListingSubmission, SubmissionStatus
+from services.base_poller import BasePoller
 from services.ebay_service import ebay_service, render_tsv
+from services.sellercloud_internal_service import sellercloud_internal_service
+from services.sellercloud_service import sellercloud_service
 from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
 
+# platform_status markers. `submitting` is written immediately before the SellerCloud POST
+# and is the commitment marker recover_stale_processing keys on; the two below mark the
+# stages after it.
+PUBLISHED_STAGE = "published"
+AWAITING_IMAGES_STAGE = "awaiting_images"
 
-class EbayPoller:
+
+class EbayPoller(BasePoller):
     name = "ebay_poller"
     PLATFORM_ID = "ebay"
+
+    def __init__(self) -> None:
+        super().__init__("ebay_poller", name="ebay_poller")
+
+    async def _poll_cycle(self) -> None:
+        """Advance rows the submit path cannot.
+
+        Submitting is driven by POST /submissions/create_batch, not by this cycle. What the
+        cycle owns is what happens AFTER SellerCloud accepts: publish jobs finish minutes to
+        hours later, eBay item ids appear gradually as it processes them, and neither event
+        notifies anything. Measured on the 2026-08-25 run, item ids went 222 -> 797 -> 1,074
+        over about an hour.
+        """
+        await self.recover_stale_processing()
+        await self.collect_item_ids()
 
     async def recover_stale_processing(self, stale_minutes: int = 30) -> dict[str, int]:
         """Un-strand rows a killed flush left in PROCESSING.
@@ -162,6 +188,161 @@ class EbayPoller:
             meta={"ebay_jobs": dict(jobs)} if jobs else None,
             **{k: v for k, v in details.items() if v is not None},
         )
+
+
+    # ---------------------------------------------------------------- item ids
+    async def collect_item_ids(self) -> dict[str, int]:
+        """Read eBay item ids for published imports and park them for the image upload.
+
+        Publishing does not finish an eBay listing: the images are attached by uploading a
+        File Exchange file by hand. This is the stage that makes that visible, moving a row
+        from PROCESSING to AWAITING_ACTION once there is something to upload.
+        """
+        rows = await ListingSubmission.filter(
+            platform_id=self.PLATFORM_ID,
+            status=SubmissionStatus.PROCESSING,
+            platform_status=PUBLISHED_STAGE,
+        ).prefetch_related("listing")
+        if not rows:
+            return {"imports": 0, "submissions": 0}
+
+        by_import: dict[Any, list[ListingSubmission]] = defaultdict(list)
+        for sub in rows:
+            by_import[(sub.platform_meta or {}).get("product_import_id")].append(sub)
+
+        settled = 0
+        for import_id, subs in by_import.items():
+            try:
+                settled += await self._settle_import(import_id, subs)
+            except Exception:  # noqa: BLE001 - one bad import must not stall the cycle
+                logger.exception(
+                    "%s: import %s failed to settle", self.name, import_id
+                )
+        return {"imports": len(by_import), "submissions": settled}
+
+    async def _settle_import(
+        self, import_id: Any, subs: list[ListingSubmission]
+    ) -> int:
+        """One import: wait for its publish jobs, read item ids, park the rows."""
+        publish_jobs = {
+            str(job)
+            for sub in subs
+            if (job := ((sub.platform_meta or {}).get("ebay_jobs") or {}).get("publish"))
+        }
+        for job_id in publish_jobs:
+            if not await sellercloud_service.is_job_complete(job_id):
+                logger.debug(
+                    "%s: import %s waiting on publish job %s", self.name, import_id, job_id
+                )
+                return 0
+
+        # eBay's own words per child, merged across EVERY publish job before anything is
+        # written. record_step's `meta` does a top-level `platform_meta || $2`, so writing
+        # publish_errors once per job would have the second job REPLACE the first job's
+        # errors rather than merge with them. One publish call per batch today, but a
+        # parent's children can straddle a chunk boundary the moment publishing is chunked.
+        publish_errors: dict[str, str] = {}
+        for job_id in publish_jobs:
+            publish_errors.update(await self._publish_errors(job_id))
+
+        children = await self._children_by_parent(
+            [sub.listing.product_id for sub in subs if sub.listing]
+        )
+        all_children = [sku for skus in children.values() for sku in skus]
+        grid = (
+            await sellercloud_internal_service.get_catalog_grid_rows(all_children)
+            if all_children
+            else {}
+        )
+
+        settled = 0
+        for sub in subs:
+            parent = sub.listing.product_id if sub.listing else None
+            kids = children.get(parent, [])
+            item_ids = {
+                sku: str(item_id)
+                for sku in kids
+                if (item_id := (grid.get(sku) or {}).get("ebayItemID"))
+            }
+            errors = {sku: publish_errors[sku] for sku in kids if sku in publish_errors}
+
+            sub.external_id = {"item_ids": item_ids}
+            sub.status = SubmissionStatus.AWAITING_ACTION
+            sub.platform_status = AWAITING_IMAGES_STAGE
+            # platform_meta deliberately absent from update_fields: record_step below owns
+            # that column, and this instance is carrying a stale copy of it.
+            await sub.save(
+                update_fields=["status", "platform_status", "external_id", "updated_at"]
+            )
+            # Per submission, not per import: the errors differ per row, and record_step
+            # writes one `meta` to every id it is handed. Only rows that actually have
+            # errors pay for a call.
+            await record_step(
+                [sub.id],
+                "item_ids_read",
+                meta={"publish_errors": errors} if errors else None,
+                listed=len(item_ids),
+                children=len(kids),
+            )
+            settled += 1
+
+        logger.info(
+            "%s: import %s settled, %d submission(s), %d/%d children listed",
+            self.name, import_id, settled,
+            sum(len((s.external_id or {}).get("item_ids") or {}) for s in subs),
+            len(all_children),
+        )
+        return settled
+
+    @staticmethod
+    async def _publish_errors(job_id: str) -> dict[str, str]:
+        """{child SKU: eBay's message} from a publish job's output file.
+
+        SellerCloud 500s with "There is no output file for job #N" often enough that a
+        missing file is a normal outcome, not an error. The reason degrades to nothing
+        rather than taking the import down with it.
+        """
+        try:
+            raw = await sellercloud_service.get_job_output_file(job_id)
+        except Exception as exc:  # noqa: BLE001 - a missing output file is expected
+            logger.info("%s: no output file for publish job %s (%s)",
+                        EbayPoller.name, job_id, type(exc).__name__)
+            return {}
+
+        text = raw.decode("utf-8", "replace").replace("\r\n", "\n")
+        lines = [line for line in text.split("\n") if line.strip()]
+        if not lines:
+            return {}
+        header = lines[0].split("\t")
+        out: dict[str, str] = {}
+        for line in lines[1:]:
+            row = dict(zip(header, line.split("\t")))
+            sku = (row.get("ProductID") or "").strip()
+            message = (row.get("ErrorMessage") or "").strip()
+            if sku and message:
+                out[sku] = message[:600]
+        return out
+
+    @staticmethod
+    async def _children_by_parent(parents: list[str]) -> dict[str, list[str]]:
+        """Active child SKUs per parent, one query for the whole import.
+
+        The products registry rather than a SellerCloud catalog search per parent: it is the
+        same list get_product_children filters its search against, and one query beats one
+        round trip per listing.
+        """
+        wanted = [p for p in parents if p]
+        if not wanted:
+            return {}
+        rows = await connections.get("product_db").execute_query_dict(
+            "SELECT sku, parent_sku FROM child_products "
+            "WHERE parent_sku = ANY($1::text[]) AND is_active",
+            [wanted],
+        )
+        out: dict[str, list[str]] = defaultdict(list)
+        for row in rows:
+            out[row["parent_sku"]].append(row["sku"])
+        return out
 
     async def _submit_batch(self, submission_ids: list[int]) -> dict[str, Any]:
         """One import file for these submissions."""
@@ -307,6 +488,14 @@ class EbayPoller:
                 job=jobs.get("publish"),
                 rows=len(rows),
                 message=str(result.get("message") or "")[:200],
+            )
+            # The stage marker the poll cycle keys on. A queryset update, not an instance
+            # save: record_step wrote platform_meta through its own connection, and an ORM
+            # save carrying this instance's stale copy of that column would overwrite the
+            # steps just recorded. Written after the step so the cycle can never observe
+            # the marker without the history behind it.
+            await ListingSubmission.filter(id__in=sent_ids).update(
+                platform_status=PUBLISHED_STAGE
             )
         else:
             await ListingSubmission.filter(id__in=sent_ids).update(
