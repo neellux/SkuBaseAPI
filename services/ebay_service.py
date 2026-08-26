@@ -70,9 +70,27 @@ CATALOG_COLUMNS = (
     # back through eBayTitle (empty on every product checked) to TopTitle, which is what
     # actually carries the text.
     "TopTitle",
+    # Capital E AND capital B, unlike eBayCategory1 and eBaySellerProfileID_Shipping right
+    # above it. The catalog grid spells the same field eBayItemCondition with a lowercase
+    # e. Both spellings verified against GET /Catalog/Imports/Custom/Templates/Fields; the
+    # import only accepts this one.
+    "EBayItemCondition",
 )
 CATALOG_KEY = "ProductID"
 DESCRIPTION_TEMPLATE = "Long Description"
+
+# eBay condition 1000 = New. Read off products that are already listed and live --
+# DNT-MJNS-0035/L and ALD-MHDS-0057/L both carry 1000 -- rather than guessed from eBay's
+# published list. Categories like 260956 refuse the launch outright without it:
+# "Category id 260956 requires condition specified. Condition is not specified".
+ITEM_CONDITION = "1000"
+
+# Columns the diff SETS rather than merely fills. Everything else keeps the never-overwrite
+# rule. These three are one derived group: BuyItNowPrice is SitePrice / (1 - ebay_discount),
+# StartPrice equals it, and the shipping profile is its band. Whatever else has written
+# them -- the Pricehub repricer, an earlier run of this script -- does not survive, because
+# a price that is not the eBay price is the wrong price on an eBay listing.
+ENFORCED_COLUMNS = ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping")
 
 # eBay seller shipping profiles, banded on price. Deliberately a function rather than an
 # enum: the bands are the logic, and an enum would name the ids without saying when each
@@ -95,7 +113,8 @@ def _is_unset(column: str, value: Any) -> bool:
     text = ("" if value is None else str(value)).strip()
     if not text:
         return True
-    if column in ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping", "eBayCategory1"):
+    if column in ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping",
+                  "eBayCategory1", "EBayItemCondition"):
         try:
             return Decimal(text) == 0
         except (InvalidOperation, ValueError):
@@ -243,7 +262,10 @@ class EbayService:
         return None
 
     @staticmethod
-    async def build_rows(listing: Listing) -> Tuple[List[Tuple[str, str, str, str, str]], List[str]]:
+    async def build_rows(
+        listing: Listing,
+        children: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[List[Tuple[str, str, str, str, str]], List[str]]:
         """This listing's rows, one block per CHILD SKU.
 
         ProductID is the child, not the parent. Confirmed against a real SellerCloud eBay
@@ -267,14 +289,18 @@ class EbayService:
             return [], problems
 
         data = listing.data or {}
-        try:
-            children_data = await sellercloud_service.get_product_children(parent_id)
-        except Exception as e:  # noqa: BLE001 - reported per listing, never fatal
-            problems.append(f"could not fetch children: {type(e).__name__}: {e}")
-            return [], problems
+        # `children` is passed in by callers that already hold the whole run's children --
+        # one bulk read beats one SellerCloud round trip per listing. Same shape
+        # get_product_children returns: [{"id", "size", ...}], active only.
+        if children is None:
+            try:
+                children_data = await sellercloud_service.get_product_children(parent_id)
+            except Exception as e:  # noqa: BLE001 - reported per listing, never fatal
+                problems.append(f"could not fetch children: {type(e).__name__}: {e}")
+                return [], problems
+            children = children_data.get("children") or []
 
         overrides = data.get("child_size_overrides") or {}
-        children = children_data.get("children") or []
 
         targets: List[Tuple[str, Optional[str]]] = []
         for child in children:
@@ -464,7 +490,10 @@ class EbayService:
 
     @staticmethod
     async def desired_catalog_values(
-        listing: Listing, child_skus: List[str], discount: Decimal
+        listing: Listing,
+        child_skus: List[str],
+        discount: Decimal,
+        prices: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
         """What each child's catalog fields SHOULD read, before any diff."""
         problems: List[str] = []
@@ -479,7 +508,10 @@ class EbayService:
             # under nothing, and its specifics were resolved for a category it will not use.
             return {}, [f"no eBay category for type {product_type!r}"]
 
-        prices = await sellercloud_internal_service.get_catalog_grid_rows(child_skus)
+        # Same reasoning as build_rows: a caller working through many listings reads the
+        # grid once for every child in the run and passes the map down.
+        if prices is None:
+            prices = await sellercloud_internal_service.get_catalog_grid_rows(child_skus)
         wanted: Dict[str, Dict[str, str]] = {}
         for sku in child_skus:
             site_price = (prices.get(sku) or {}).get("SitePrice")
@@ -495,6 +527,7 @@ class EbayService:
                 "DescriptionTemplateId": DESCRIPTION_TEMPLATE,
                 "eBaySellerProfileID_Shipping": shipping_profile_id(price),
                 "eBayCategory1": str(category),
+                "EBayItemCondition": ITEM_CONDITION,
             }
             # The listing's own title, identical on every child: an eBay variation listing
             # shows one title, so a per-child one is a SellerCloud storage detail rather
@@ -518,13 +551,42 @@ class EbayService:
         rows: List[Dict[str, str]] = []
         for sku, target in wanted.items():
             have = current.get(sku, {})
+            target = dict(target)
+
+            # All three follow the computed eBay price. desired_catalog_values already set
+            # them from SitePrice / (1 - ebay_discount); this only re-derives the band so
+            # the three can never drift apart.
+            computed = target.get("BuyItNowPrice")
+            if computed is not None:
+                try:
+                    target["StartPrice"] = computed
+                    target["eBaySellerProfileID_Shipping"] = shipping_profile_id(
+                        Decimal(computed))
+                except (InvalidOperation, ValueError):
+                    pass
+
             row = {CATALOG_KEY: sku}
             changed = False
             for column in CATALOG_COLUMNS:
                 existing = have.get(column, "")
+                wanted_value = target.get(column)
                 # A column this listing has no value for is carried through untouched, not
                 # blanked: `wanted` omits a key rather than offering an empty one.
-                if _is_unset(column, existing) and column in target:
+                fill = _is_unset(column, existing) and column in target
+                # ENFORCED, not merely filled. These two are not independent facts about a
+                # product, they are functions of BuyItNowPrice -- StartPrice must equal it
+                # and the shipping profile must be its band. A value that contradicts that
+                # is wrong no matter who wrote it, and never-overwrite would preserve the
+                # contradiction forever. It preserved 1,270 of them once already.
+                if (not fill and column in ENFORCED_COLUMNS and wanted_value is not None
+                        and str(existing).strip() != str(wanted_value)):
+                    try:
+                        same = Decimal(str(existing).strip() or 0) == Decimal(wanted_value)
+                    except (InvalidOperation, ValueError):
+                        same = False
+                    if not same:
+                        fill = True
+                if fill:
                     row[column] = target[column]
                     changed = True
                 else:
