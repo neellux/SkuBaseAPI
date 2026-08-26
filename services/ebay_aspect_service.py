@@ -773,6 +773,31 @@ class EbayAspectService:
             values = decode_json(row.get("values_json"), None)
             field_type = EbayAspectService.derive_field_type(row)
             default = decode_json(row.get("effective_default"), None)
+
+            # ONE OPTION IS NOT A CHOICE. When eBay accepts exactly one value for an aspect
+            # and will not take anything else, making an operator open a dropdown to pick
+            # the only entry is a keystroke that can have no other outcome. Selected for
+            # them, so the form loads answered and (because is_required below reads
+            # `default is None`) it stops blocking submit over a field with one legal value.
+            #
+            # SELECTION_ONLY only. A FREE_TEXT aspect that happens to ship one value is
+            # offering a suggestion, not a constraint -- eBay will accept anything there,
+            # so filling it in would put a value on the listing that nobody chose.
+            #
+            # Skipped when the aspect is mapped to a SkuBase table: _load_mapped_options
+            # replaces `options` with that table's list downstream, and defaulting to
+            # eBay's single value could seed something absent from the list actually shown.
+            if (
+                default is None
+                and row["mode"] == "SELECTION_ONLY"
+                and values
+                and len(values) == 1
+                and not row["mapped_table"]
+            ):
+                # MULTI renders as an array of checkboxes, so its default has to be a list
+                # or the schema and the widget disagree about the type.
+                default = [values[0]] if row["cardinality"] == "MULTI" else values[0]
+
             field = {
                 "name": row["aspect_name"],
                 "display_name": derive_form_label(
