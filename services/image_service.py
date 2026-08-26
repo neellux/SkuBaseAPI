@@ -811,9 +811,11 @@ class ImageService:
                     }
 
         # Always, including the unchanged path: the DB is not the authority on what the
-        # bucket holds. sellercloud_service blind-probes washtag_1..3 at submission
-        # time, so a ghost blob past the end reaches live listings, and short-circuiting
-        # on a DB-only comparison would freeze that divergence forever.
+        # bucket holds, and a ghost blob past the end outlives the row that stopped
+        # counting it. Nothing renders one now that the listing gallery reads washtags
+        # from here rather than blind-probing the bucket, but short-circuiting on a
+        # DB-only comparison would still freeze that divergence in place forever, and
+        # the bytes are what a re-shoot or a direct bucket write sees.
         await self._cleanup_washtag_blobs(
             target_product_id, len(new_data), max(old_count, MAX_WASHTAG_IMAGES)
         )

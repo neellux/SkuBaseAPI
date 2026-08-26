@@ -447,40 +447,49 @@ class SellerCloudService:
                         logger.debug(f"Error checking image {image_url}: {e}")
                         return index, image_url, False
 
-            async def check_washtag_exists(index: int) -> tuple[int, str, bool]:
-                washtag_url = f"https://storage.googleapis.com/lux_products/{parent_product_id}/washtag_{index}.jpg"
-                async with semaphore:
-                    try:
-                        async with httpx.AsyncClient(timeout=10.0) as client:
-                            response = await client.head(washtag_url)
-                            exists = response.status_code == 200
-                            if exists:
-                                logger.info(f"Found washtag image: {washtag_url}")
-                            else:
-                                logger.debug(
-                                    f"Washtag image not found: {washtag_url} (status {response.status_code})"
-                                )
-                            return index, washtag_url, exists
-                    except Exception as e:
-                        logger.debug(f"Error checking washtag image {washtag_url}: {e}")
-                        return index, washtag_url, False
+            async def washtag_urls_from_db() -> List[str]:
+                """Every washtag this parent has, from photography_db.
+
+                Not probed like the images above. There is no limit on how many washtags a
+                batch produces - production holds parents with twelve - so any fixed range
+                of HEADs is a cap, and the previous one stopped at three. image_service
+                already answers this in one query for ManageProducts, resolving the washtag
+                section to the newest batch_creation row that carries data, so this reads
+                the same way and the two pages agree.
+
+                Isolated from the caller's except: that one returns [] for the whole
+                product, and an empty list fails validate_product_images_on_gcs, which
+                blocks listing creation. A photography_db blip must cost the washtags, not
+                the gallery.
+                """
+                try:
+                    from services.image_service import image_service
+
+                    record = await image_service.get_product_images(resolved_parent)
+                    return [w["url"] for w in record["washtags"]]
+                except Exception as e:
+                    logger.warning(
+                        f"Could not read washtags for {resolved_parent}: {type(e).__name__}: {e}"
+                    )
+                    return []
 
             logger.info(
-                f"Checking GCS for images 1-8 and washtags for product {parent_product_id}"
+                f"Checking GCS for images 1-8 for product {parent_product_id}, "
+                "washtags from productimages"
             )
 
             image_checks = [check_image_exists(i) for i in range(1, 9)]
-            washtag_checks = [check_washtag_exists(i) for i in range(1, 4)]
 
-            results = await asyncio.gather(*image_checks, *washtag_checks)
+            results, washtag_urls = await asyncio.gather(
+                asyncio.gather(*image_checks), washtag_urls_from_db()
+            )
 
             image_urls = []
 
-            for index, url, exists in sorted(results[:8]):
+            for index, url, exists in sorted(results):
                 if exists:
                     image_urls.append(url)
 
-            washtag_urls = [url for _, url, exists in sorted(results[8:]) if exists]
             if washtag_urls:
                 image_urls.extend(washtag_urls)
                 logger.info(
@@ -502,7 +511,15 @@ class SellerCloudService:
         self, product_id: str, max_workers: int = 3, parent_sku: Optional[str] = None
     ) -> tuple[bool, List[str], int]:
         try:
-            image_urls = await self.get_product_images(product_id, parent_sku=parent_sku)
+            all_urls = await self.get_product_images(product_id, parent_sku=parent_sku)
+
+            # Product shots only. get_product_images confirms each of those with a HEAD
+            # before returning it, so this is a re-check against a race; the washtags
+            # beside them are now built from productimages rows instead, and a row that
+            # outlived its blob would fail this check and block listing creation over a
+            # missing washtag. Which is not what this gate is for: it decides whether a
+            # product has photographs, and says exactly that when it fails.
+            image_urls = [url for url in all_urls if "washtag_" not in url]
 
             if not image_urls:
                 logger.warning(f"No product images found for product {product_id}")
