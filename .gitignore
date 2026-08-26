@@ -199,3 +199,5 @@ db.*
 *.zip
 *.sql
 migrations/
+*.jpg
+*.xlsx

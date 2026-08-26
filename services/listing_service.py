@@ -821,10 +821,19 @@ class ListingService:
         `ui:enumNames` the paths, which is what lets the operator read a breadcrumb while
         the listing stores something stable.
 
-        Deliberately carries no `default`. RJSF materialises a JSON Schema default into
-        formData and the next autosave freezes it into the listing -- the same hazard the
-        aspect defaults already refuse. The listing's category is resolved server-side
-        instead, so an untouched listing stores nothing.
+        A `default` ONLY when the type maps to exactly one category. RJSF materialises a
+        JSON Schema default into formData and the next autosave freezes it into the
+        listing, which is why a multi-candidate type still carries none: the type's default
+        can be changed later and a frozen copy would not hear about it.
+
+        With one candidate there is nothing to drift from. The stored value is identical to
+        what resolve_listing_category would return for an empty listing, and if the type is
+        later remapped, that resolver IGNORES a stored id which is no longer among the
+        type's candidates and falls back to the current default. So the freeze cannot
+        outlive the mapping, which is the hazard the multi-candidate case is avoiding.
+
+        Making the operator open a dropdown to pick its only entry is a keystroke that can
+        have no other outcome, the same reasoning as a single-value aspect.
 
         `order` is the fallback for a category that offers no Department aspect (5 of the
         62 reachable ones). _get_ebay_form_aspects overrides it to sit beside Department
@@ -835,7 +844,7 @@ class ListingService:
         is also about as narrow as this field goes: its labels are full breadcrumbs up to
         255 characters, and below this they truncate past the second level.
         """
-        return {
+        field = {
             "name": "ebay_category_id",
             "display_name": "eBay category",
             "type": "text",
@@ -848,6 +857,9 @@ class ListingService:
             "order": 950,
             "ui_size": 8,
         }
+        if len(candidates) == 1:
+            field["default"] = candidates[0]["category_id"]
+        return field
 
     @staticmethod
     async def _get_ebay_form_aspects(
