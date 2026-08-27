@@ -315,14 +315,34 @@ class SizingService:
             if len(set(s.order for s in update_request.sizes)) != len(update_request.sizes):
                 raise ValueError("Duplicate orders provided in the update request.")
 
-            existing_sizes_map = {e.size: e for e in existing_entries}
-            request_sizes_map = {s.size: s for s in update_request.sizes}
+            # Resolve every requested size to an existing row, preferring the row id. This is what
+            # makes a rename an UPDATE rather than delete-plus-create: matching on the size string
+            # alone reads '40' -> '41' as "'40' removed, '41' added", which deletes the row and
+            # takes everything keyed on its id with it (sizing_lists rows via ON DELETE CASCADE,
+            # sizes_default_list rows orphaned via ON DELETE SET NULL).
+            existing_by_id = {str(e.id): e for e in existing_entries}
+            existing_by_size = {e.size: e for e in existing_entries}
 
-            sizes_to_delete = set(existing_sizes_map.keys()) - set(request_sizes_map.keys())
-            if sizes_to_delete:
-                await SizingScheme.filter(
-                    sizing_scheme=new_scheme_name, size__in=list(sizes_to_delete)
-                ).delete()
+            resolved: List[tuple] = []
+            claimed: set = set()
+            for size_data in update_request.sizes:
+                entry = None
+                if size_data.id is not None:
+                    entry = existing_by_id.get(str(size_data.id))
+                if entry is None:
+                    # No id (older client, or a newly added size) - fall back to the size string.
+                    entry = existing_by_size.get(size_data.size)
+                if entry is not None and str(entry.id) in claimed:
+                    entry = None  # already taken by an earlier request row; treat this as new
+                if entry is not None:
+                    claimed.add(str(entry.id))
+                resolved.append((entry, size_data))
+
+            # Delete by id, not by size string. A renamed row's OLD size is absent from the
+            # request, so a string-keyed diff would delete the very row we just matched.
+            ids_to_delete = [e.id for e in existing_entries if str(e.id) not in claimed]
+            if ids_to_delete:
+                await SizingScheme.filter(id__in=ids_to_delete).delete()
 
             # Resolve the scheme-level fields once, for the whole scheme. A field the caller omits
             # arrives as None and keeps whatever the scheme already has, so an omission can neither
@@ -349,12 +369,25 @@ class SizingService:
                 ),
             }
 
+            # Park every renamed row on a unique placeholder before writing final values.
+            # unique_together is (sizing_scheme, size) and is not deferrable, so renaming
+            # '40'->'41' while a row still holds '41' would violate it mid-loop - which happens
+            # whenever an operator shifts a run of sizes along. Both passes are inside the
+            # transaction, so the placeholder is never visible outside it.
+            renames = [
+                (entry, size_data.size)
+                for entry, size_data in resolved
+                if entry is not None and entry.size != size_data.size
+            ]
+            for entry, _ in renames:
+                await SizingScheme.filter(id=entry.id).update(size=f"__renaming_{entry.id}")
+
             updated_entries = []
-            for size_data in update_request.sizes:
-                if size_data.size in existing_sizes_map:
-                    entry = existing_sizes_map[size_data.size]
+            for entry, size_data in resolved:
+                if entry is not None:
+                    entry.size = size_data.size
                     entry.order = size_data.order
-                    await entry.save(update_fields=["order", "updated_at"])
+                    await entry.save(update_fields=["size", "order", "updated_at"])
                     updated_entries.append(entry)
                 else:
                     new_entry = await SizingScheme.create(

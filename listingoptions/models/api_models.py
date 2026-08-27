@@ -387,6 +387,26 @@ class SizingSchemeEntryWithId(SizingSchemeEntryBase):
     id: UUID
 
 
+class SizingSchemeEntryUpdate(SizingSchemeEntryBase):
+    """A size in an update request, carrying the row id when the client knows it.
+
+    The id is what lets a rename stay an UPDATE. Without it the service can only compare size
+    strings, so renaming '40' to '41' looks like "'40' was removed, '41' was added" - it deletes
+    the row and creates a new one with a fresh id. Everything keyed on that id goes with it:
+    listingoptions_sizing_lists rows are hard-deleted by ON DELETE CASCADE, and
+    listingoptions_sizes_default_list rows are orphaned by ON DELETE SET NULL (prod holds 6,786
+    such rows).
+
+    Optional so callers that predate this - and the create path, where no row exists yet - keep
+    working by falling back to size-string matching.
+    """
+
+    id: Optional[UUID] = Field(
+        None,
+        description="Existing row id. Omit or null for a size being added.",
+    )
+
+
 class SizingSchemeEntryCreate(SizingSchemeEntryBase):
     pass
 
@@ -440,8 +460,8 @@ class UpdateSizeOrderRequest(BaseModel):
         max_length=50,
         description="Optional new name for the sizing scheme. If provided, the scheme will be renamed.",
     )
-    sizes: List[SizingSchemeEntryBase] = Field(
-        ..., description="A list of sizes with their new order."
+    sizes: List[SizingSchemeEntryUpdate] = Field(
+        ..., description="A list of sizes with their new order, and their row id where known."
     )
     sizing_types: Optional[List[str]] = Field(
         None, description="Updated list of applicable types for this sizing scheme."
