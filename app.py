@@ -79,6 +79,11 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # The UI and the API are different origins, so a response header is invisible to
+    # JavaScript unless it is named here. File downloads read Content-Disposition to save
+    # under the name the server chose; without this the fetch still succeeds and the header
+    # is simply absent, which fails as a wrong filename rather than as an error.
+    expose_headers=["Content-Disposition"],
 )
 
 

@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import io
 import logging
 from collections import defaultdict
@@ -642,13 +643,9 @@ async def download_error_template(
 # instead of going straight to SUCCESS.
 
 GCS_ROOT = "https://storage.googleapis.com/lux_products"
-# Row 1 and row 2 of eBay's revise template, reproduced exactly, including the space after
-# "Template=". Taken from the Ebay Import sheet of the operator's own workbook.
-REVISE_INFO_ROW = (
-    "#INFO",
-    "Version=1.0.0",
-    "Template= eBay-active-revise-price-quantity-download_US",
-)
+# CSV with a single header row. eBay's downloaded template carries a "#INFO Version=1.0.0
+# Template=..." line above the header, but File Exchange only requires it on the templates
+# it hands out; an upload with two header rows reads the second one as data.
 REVISE_HEADER_ROW = ("Action", "Item number", "PicURL")
 PIC_SEPARATOR = " | "
 
@@ -717,12 +714,73 @@ def _revise_rows(
     return out
 
 
+def _revise_csv(rows: list[tuple[str, str]]) -> bytes:
+    """The File Exchange upload: comma-delimited, ONE header row.
+
+    eBay's downloaded template carries a "#INFO Version=1.0.0 Template=..." line above the
+    header, but that is metadata on the file eBay hands out, not something an upload needs.
+    Sent back with two header rows, File Exchange reads the second one as a data row.
+
+    CRLF line endings, because File Exchange is a Windows-era format that has been reported
+    to read a whole LF-only file as a single row. csv.writer emits them directly, so nothing
+    depends on newline translation at write time.
+    """
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, lineterminator="\r\n")
+    writer.writerow(REVISE_HEADER_ROW)
+    for item_id, urls in rows:
+        writer.writerow(["Revise", item_id, urls])
+    # utf-8-sig: the BOM is what stops Excel opening a UTF-8 CSV as latin-1 and mangling an
+    # accented brand name inside a URL. eBay ignores it.
+    return buf.getvalue().encode("utf-8-sig")
+
+
+def _batch_ids(submissions: list[ListingSubmission]) -> list[int]:
+    """SkuBase batches the import touched, ascending. Names the revise download.
+
+    A list rather than one value: an eBay flush claims every pending row, so an import can
+    span batches when two were submitted close together. batch is nullable and SET_NULL on
+    delete, so a listing whose batch is gone contributes nothing rather than a None the
+    caller has to filter again.
+    """
+    return sorted(
+        {
+            sub.listing.batch_id
+            for sub in submissions
+            if sub.listing and sub.listing.batch_id is not None
+        }
+    )
+
+
+def _revise_filename(import_id: int, batch_ids: list[int]) -> str:
+    """Name the download after the batch, because that is what the operator is working on.
+
+    The import id alone said nothing an operator could match to the batch page they came
+    from. Sent on Content-Disposition and read back by ImportDetailDialog, so the name lives
+    on the one side that knows what went into the file.
+
+    Truncated past three batches rather than listing them all, so a flush that swept a dozen
+    batches cannot produce a filename a file manager refuses to write.
+    """
+    if not batch_ids:
+        return f"ebay_image_revise_import_{import_id}.csv"
+    if len(batch_ids) == 1:
+        return f"ebay_image_revise_batch_{batch_ids[0]}_import_{import_id}.csv"
+    if len(batch_ids) <= 3:
+        joined = "-".join(str(b) for b in batch_ids)
+        return f"ebay_image_revise_batches_{joined}_import_{import_id}.csv"
+    return (
+        f"ebay_image_revise_batches_{batch_ids[0]}-and-{len(batch_ids) - 1}-more"
+        f"_import_{import_id}.csv"
+    )
+
+
 @router.post("/imports/image_revise_template")
 async def download_image_revise_template(
     id: int = Query(..., description="Platform-side import id"),
     platform: str = Query("ebay", description="Platform identifier"),
 ):
-    """The .xlsx an operator uploads to eBay to attach images to a published import."""
+    """The CSV an operator uploads to eBay to attach images to a published import."""
     import_id = id
     _require_manual_image_step(platform)
 
@@ -743,35 +801,13 @@ async def download_image_revise_template(
             ),
         )
 
-    def _build_xlsx() -> bytes:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        # Renaming the default sheet, not adding one, so the workbook has exactly the one
-        # sheet the operator's template has.
-        ws.title = "Ebay Import"
-        ws.append(list(REVISE_INFO_ROW))
-        ws.append(list(REVISE_HEADER_ROW))
-        for item_id, urls in rows:
-            ws.append(["Revise", item_id, urls])
-        # Item numbers as TEXT. Written as a number, a 12-digit id reads back as
-        # 327206514106.0 and a longer one risks scientific notation. Set once on the column
-        # rather than per cell, which measured 143ms of a 219ms build at 1,573 rows.
-        for cell in ws["B"]:
-            cell.number_format = "@"
-        buf = io.BytesIO()
-        wb.save(buf)
-        return buf.getvalue()
-
-    payload = await asyncio.get_event_loop().run_in_executor(None, _build_xlsx)
+    payload = _revise_csv(rows)
+    filename = _revise_filename(import_id, _batch_ids(submissions))
 
     return StreamingResponse(
         io.BytesIO(payload),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="ebay_image_revise_{import_id}.xlsx"'
-            )
-        },
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
