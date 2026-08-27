@@ -1233,9 +1233,9 @@ class SellerCloudService:
                         )
 
                     if size and list_price not in ("", None):
-                        product_name = f"{title_value} SIZE {size} ${list_price}"
+                        product_name = f"{title_value} Size {size} ${list_price}"
                     elif size:
-                        product_name = f"{title_value} SIZE {size}"
+                        product_name = f"{title_value} Size {size}"
                     else:
                         product_name = title_value
                     normal_fields.append({"Name": "ProductName", "Value": product_name})
@@ -1696,7 +1696,7 @@ class SellerCloudService:
                         for field in child_normal_fields:
                             if field["Name"] == "ProductName":
                                 field["Value"] = (
-                                    f"{field['Value']} SIZE {size} ${list_price}"
+                                    f"{field['Value']} Size {size} ${list_price}"
                                 )
                                 break
 

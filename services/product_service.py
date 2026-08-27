@@ -742,7 +742,7 @@ class ProductService:
                     await _retry_sc(
                         lambda c=child_sku, s=size, p=unit_price, u=upc: sellercloud_service.create_product(
                             product_sku=c,
-                            product_name=f"{title} SIZE {s}",
+                            product_name=f"{title} Size {s}",
                             company_id=company_code,
                             site_cost=p,
                             product_type_name=product_type,
@@ -922,7 +922,7 @@ class ProductService:
                 }
 
             list_price = template_data.get("ListPrice", "")
-            product_name = f"{parent['title']} SIZE {size} ${list_price}"
+            product_name = f"{parent['title']} Size {size} ${list_price}"
             product_type_name = template_data.get("ProductType", "")
             brand_name = template_data.get("BrandName", parent.get("brand", ""))
 
@@ -1139,7 +1139,7 @@ class ProductService:
                 }
 
             list_price = template_data.get("ListPrice", "")
-            product_name = f"{parent['title']} SIZE {size} ${list_price}"
+            product_name = f"{parent['title']} Size {size} ${list_price}"
             product_type_name = template_data.get("ProductType", "")
             brand_name = template_data.get("BrandName", parent.get("brand", ""))
             site_cost = template_data.get("SiteCost", 0.0)
