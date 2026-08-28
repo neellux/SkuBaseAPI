@@ -260,19 +260,28 @@ class EbayPoller(BasePoller):
         # publish_errors once per job would have the second job REPLACE the first job's
         # errors rather than merge with them. One publish call per batch today, but a
         # parent's children can straddle a chunk boundary the moment publishing is chunked.
-        publish_errors: dict[str, str] = {}
+        results: dict[str, tuple[str, str]] = {}
         for job_id in publish_jobs:
-            publish_errors.update(await self._publish_errors(job_id))
+            results.update(await self._publish_results(job_id))
+        publish_errors = {sku: msg for sku, (_id, msg) in results.items() if msg}
 
         children = await self._children_by_parent(
             [sub.listing.product_id for sub in subs if sub.listing]
         )
         all_children = [sku for skus in children.values() for sku in skus]
-        grid = (
-            await sellercloud_internal_service.get_catalog_grid_rows(all_children)
-            if all_children
-            else {}
-        )
+
+        # The job's own output is the source of item ids. The catalog grid is only read
+        # when that output is missing -- SellerCloud 500s "There is no output file" often
+        # enough that dropping the fallback would turn a routine gap into a batch marked
+        # entirely failed. When the output is there, this saves a bulk grid read of every
+        # child in the import AND is correct sooner, the grid lagging a publish by up to
+        # an hour.
+        job_item_ids = {sku: item for sku, (item, _msg) in results.items() if item}
+        grid = {}
+        if not job_item_ids and all_children:
+            logger.info("%s: import %s has no item ids from its publish job(s), "
+                        "falling back to the catalog grid", self.name, import_id)
+            grid = await sellercloud_internal_service.get_catalog_grid_rows(all_children)
 
         settled = 0
         for sub in subs:
@@ -281,7 +290,8 @@ class EbayPoller(BasePoller):
             item_ids = {
                 sku: str(item_id)
                 for sku in kids
-                if (item_id := (grid.get(sku) or {}).get("ebayItemID"))
+                if (item_id := job_item_ids.get(sku)
+                    or (grid.get(sku) or {}).get("ebayItemID"))
             }
             errors = {sku: publish_errors[sku] for sku in kids if sku in publish_errors}
 
@@ -336,12 +346,18 @@ class EbayPoller(BasePoller):
         return settled
 
     @staticmethod
-    async def _publish_errors(job_id: str) -> dict[str, str]:
-        """{child SKU: eBay's message} from a publish job's output file.
+    async def _publish_results(job_id: str) -> dict[str, tuple[str, str]]:
+        """{child SKU: (eBay item id, eBay's message)} from a publish job's output file.
+
+        The output carries BOTH columns, and it is the authority for both. Item ids were
+        read from the catalog grid instead, which lags a publish by up to an hour: 14 of
+        import 2's 44 products had listed cleanly -- eBay returned Success and a real item
+        number for every child -- and were recorded as having listed nothing because the
+        grid had not caught up. The job knows immediately.
 
         SellerCloud 500s with "There is no output file for job #N" often enough that a
-        missing file is a normal outcome, not an error. The reason degrades to nothing
-        rather than taking the import down with it.
+        missing file is a normal outcome, not an error. It degrades to nothing rather than
+        taking the import down, and the caller falls back to the grid.
         """
         try:
             raw = await sellercloud_service.get_job_output_file(job_id)
@@ -355,13 +371,17 @@ class EbayPoller(BasePoller):
         if not lines:
             return {}
         header = lines[0].split("\t")
-        out: dict[str, str] = {}
+        out: dict[str, tuple[str, str]] = {}
         for line in lines[1:]:
             row = dict(zip(header, line.split("\t")))
             sku = (row.get("ProductID") or "").strip()
-            message = (row.get("ErrorMessage") or "").strip()
-            if sku and message:
-                out[sku] = message[:600]
+            if not sku:
+                continue
+            item_id = (row.get("EBayItemID") or "").strip()
+            # eBay's stack trace is appended to its own sentence and is the same 400
+            # characters on every row. Only the sentence is useful to an operator.
+            message = (row.get("ErrorMessage") or "").strip().split(" at eBay.Service")[0]
+            out[sku] = (item_id, message.strip()[:600])
         return out
 
     @staticmethod
