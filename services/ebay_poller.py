@@ -24,7 +24,7 @@ from decimal import Decimal
 
 from models.db_models import AppSettings, ListingSubmission, SubmissionStatus
 from services.base_poller import BasePoller
-from services.ebay_service import ebay_service, render_tsv
+from services.ebay_service import ebay_service, render_tsv, weight_oz
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
 from utils.submission_steps import record_step
@@ -396,6 +396,10 @@ class EbayPoller(BasePoller):
         # Catalog targets are per LISTING, not per batch: each listing has its own category
         # and its own SitePrice. Accumulated here so one export covers the whole batch.
         wanted: dict[str, dict[str, str]] = {}
+        # Child SKU -> the type's weight in ounces, and -> the submission that owns it, so
+        # a fault found after the export can be reported on the right row.
+        fallback_oz: dict[str, Decimal] = {}
+        sku_owner: dict[str, int] = {}
 
         for sub in submissions:
             listing = sub.listing
@@ -415,6 +419,14 @@ class EbayPoller(BasePoller):
                 if catalog_problems:
                     blocked.setdefault(sub.id, []).extend(catalog_problems)
                 wanted.update(targets)
+                # The type's weight, for the shipping band, used only where the catalog
+                # export has none of its own. The field is "Item weight: OZ", mapped from
+                # listingoptions_types.item_weight_oz, so it is already in ounces.
+                type_oz = weight_oz(None, (listing.data or {}).get("shipping_weight"))
+                if type_oz is not None:
+                    for sku in listing_skus:
+                        fallback_oz[sku] = type_oz
+                sku_owner.update({sku: sub.id for sku in listing_skus})
 
         tsv = render_tsv(rows)
         logger.info(
@@ -446,7 +458,36 @@ class EbayPoller(BasePoller):
             jobs["export"] = export_job
             await self._stage(submission_ids, "catalog_exported", jobs,
                               job=export_job, skus=len(catalog_skus))
-            catalog_rows = ebay_service.diff_catalog_rows(current, wanted)
+            # A self-contradictory price pair, or a band that cannot be decided, makes a
+            # WRONG listing rather than a refused one -- it goes live at the wrong price or
+            # on the wrong shipping profile, and nothing downstream will ever flag it.
+            #
+            # The whole batch stops, rather than the faulted children being dropped and the
+            # rest going. Partial would mean a submission publishing some of its variations
+            # and silently not others, and the fault is nearly always something systemic
+            # (a repricer mid-run, a type with no weight) that will affect the next child
+            # too. Measured across all 15,568 children: zero have no weight, and the price
+            # pair only diverges when something else has written one of them.
+            faults = ebay_service.catalog_faults(current, wanted, fallback_oz)
+            if faults:
+                for sku, reason in sorted(faults.items()):
+                    owner = sku_owner.get(sku)
+                    if owner is not None:
+                        blocked.setdefault(owner, []).append(f"{sku}: {reason}")
+                logger.warning("%s: %d catalog fault(s), nothing imported: %s",
+                               self.name, len(faults), sorted(faults.items())[:5])
+                await ListingSubmission.filter(id__in=submission_ids).update(
+                    status=SubmissionStatus.FAILED,
+                    error_display=f"{len(faults)} product(s) have a price or weight fault",
+                )
+                await self._stage(
+                    submission_ids, "failed", jobs, stage="catalog",
+                    reason="; ".join(f"{sku}: {why}"
+                                     for sku, why in sorted(faults.items()))[:600],
+                )
+                return {"submission_count": 0, "rows": len(rows), "sent": True,
+                        "ok": False, "jobs": jobs, "blocked": blocked}
+            catalog_rows = ebay_service.diff_catalog_rows(current, wanted, fallback_oz)
             if catalog_rows:
                 cat = await ebay_service.import_catalog_info(
                     ebay_service.render_catalog_tsv(catalog_rows)

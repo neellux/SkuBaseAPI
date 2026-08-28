@@ -64,18 +64,36 @@ CATALOG_COLUMNS = (
     "BuyItNowPrice",
     "DescriptionTemplateId",
     "eBaySellerProfileID_Shipping",
+    # The other two seller profiles. Fixed for the account, unlike Shipping, which is the
+    # only one of the three that varies -- it bands on price. All three spellings verified
+    # against GET /Catalog/Imports/Custom/Templates/Fields: capital B, capital ID, and
+    # Returns is plural while Payment is not.
+    "eBaySellerProfileID_Payment",
+    "eBaySellerProfileID_Returns",
     "eBayCategory1",
     # The title eBay ends up showing. NOT eBayTopTitle: that is a resolved read-only value
     # the catalog grid reports, and it is absent from the importable column list. It falls
     # back through eBayTitle (empty on every product checked) to TopTitle, which is what
     # actually carries the text.
     "TopTitle",
+    # Carried so the SIZE -> Size recasing can reach it. NEVER set from the listing: nothing
+    # writes a desired ProductName, so the diff copies whatever SellerCloud holds straight
+    # back, and the only edit it ever receives is the recasing below.
+    "ProductName",
     # Capital E AND capital B, unlike eBayCategory1 and eBaySellerProfileID_Shipping right
     # above it. The catalog grid spells the same field eBayItemCondition with a lowercase
     # e. Both spellings verified against GET /Catalog/Imports/Custom/Templates/Fields; the
     # import only accepts this one.
     "EBayItemCondition",
 )
+# Read out of the export, never written back. They are inputs to the shipping band, and
+# putting them in CATALOG_COLUMNS would make diff_catalog_rows fill an empty weight with
+# one of its own -- the never-overwrite rule is about catalog fields this tool owns, and
+# a product's weight is not one of them.
+#
+# PackageWeightLbs/Oz rather than ShippingWeight, which is the same value in ounces but is
+# NOT among the 1,260 columns a custom export can ask for (only ShippingWeightUnits is).
+EXPORT_ONLY_COLUMNS = ("PackageWeightLbs", "PackageWeightOz")
 CATALOG_KEY = "ProductID"
 DESCRIPTION_TEMPLATE = "Long Description"
 
@@ -85,18 +103,78 @@ DESCRIPTION_TEMPLATE = "Long Description"
 # "Category id 260956 requires condition specified. Condition is not specified".
 ITEM_CONDITION = "1000"
 
+# The account's payment and return policies. Constants rather than settings because there is
+# one of each: eBay resolves them by profile id, and a listing carrying a different one is
+# not a variation on the policy, it is the wrong policy.
+PAYMENT_PROFILE = "212360617021"
+RETURNS_PROFILE = "290560198021"
+
 # Columns the diff SETS rather than merely fills. Everything else keeps the never-overwrite
 # rule. These three are one derived group: BuyItNowPrice is SitePrice / (1 - ebay_discount),
 # StartPrice equals it, and the shipping profile is its band. Whatever else has written
 # them -- the Pricehub repricer, an earlier run of this script -- does not survive, because
 # a price that is not the eBay price is the wrong price on an eBay listing.
-ENFORCED_COLUMNS = ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping")
+# The payment and returns profiles are ENFORCED, not filled. They were fill-only until
+# eBay refused a publish with "You've provided an invalid return policy" on a child holding
+# 116834424021 -- a value SellerCloud already had, which never-overwrite therefore wrote
+# straight back. A stale profile id is not an operator's considered choice, it is a dead
+# reference, and 47 children were already carrying 212360617021 before this run, which is
+# what identified the 1168... pair as the retired one.
+ENFORCED_COLUMNS = ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping",
+                    "eBaySellerProfileID_Payment", "eBaySellerProfileID_Returns")
 
-# eBay seller shipping profiles, banded on price. Deliberately a function rather than an
-# enum: the bands are the logic, and an enum would name the ids without saying when each
-# applies.
-def shipping_profile_id(price: Decimal) -> str:
+# The size-word casing changed in product_service ("... SIZE L $325" -> "... Size L $325"),
+# leaving 3,175 live eBay children on the old spelling. Fixed by EDITING the title
+# SellerCloud already holds rather than rewriting it from the listing: the listing's own
+# title is the bare "Denim Tears White Levi's Hands Jacket", so writing that would strip the
+# size and the price off every child instead of recasing them.
+#
+# ProductName is the column that carries it. Settled by export 4195099: TopTitle was EMPTY
+# on 352 of 409 children while ProductName held the title on all of them, so the grid's
+# read-only eBayTopTitle resolves through ProductName whenever TopTitle is blank. The old
+# note on CATALOG_COLUMNS had this backwards.
+OLD_SIZE_TOKEN = " SIZE "
+NEW_SIZE_TOKEN = " Size "
+
+# 4 lb, in ounces. SellerCloud holds weight as PackageWeightLbs + PackageWeightOz, and the
+# grid's ShippingWeight is the same figure already converted to ounces -- 64.0 there reads
+# back as 4.0 lb + 0.0 oz here. Ounces are the common unit, so everything converts to them.
+OUNCES_PER_POUND = Decimal(16)
+HEAVY_OZ = Decimal(64)
+
+
+def weight_oz(lbs: Any, oz: Any) -> Optional[Decimal]:
+    """A product's weight in ounces, or None when SellerCloud is holding nothing.
+
+    Zero is NOT a weight. SellerCloud returns 0.0 for a product whose weight was never
+    written, which was 1,677 of 15,568 children when this was measured -- treating that as
+    "weighs nothing" would silently read every one of them as light.
+    """
+    total = Decimal(0)
+    seen = False
+    for value, unit in ((lbs, OUNCES_PER_POUND), (oz, Decimal(1))):
+        text = ("" if value is None else str(value)).strip()
+        if not text:
+            continue
+        try:
+            parsed = Decimal(text)
+        except (InvalidOperation, ValueError):
+            continue
+        seen = True
+        total += parsed * unit
+    return total if seen and total > 0 else None
+
+
+# eBay seller shipping profiles, banded on price and -- under $100 -- on weight.
+# Deliberately a function rather than an enum: the bands are the logic, and an enum would
+# name the ids without saying when each applies.
+#
+# The heavy rule only ever moves the $50-$100 band, because everything under $50 is already
+# on this profile. Measured across all 15,568 children of every listing: 42 move.
+def shipping_profile_id(price: Decimal, oz: Optional[Decimal] = None) -> str:
     if price < 50:
+        return "331669932021"
+    if price < 100 and oz is not None and oz > HEAVY_OZ:
         return "331669932021"
     if price <= 100:          # 50 and 100 both sit in the middle band
         return "300065418021"
@@ -114,6 +192,7 @@ def _is_unset(column: str, value: Any) -> bool:
     if not text:
         return True
     if column in ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping",
+                  "eBaySellerProfileID_Payment", "eBaySellerProfileID_Returns",
                   "eBayCategory1", "EBayItemCondition"):
         try:
             return Decimal(text) == 0
@@ -446,7 +525,8 @@ class EbayService:
         Measured at ~51s for 5 SKUs, so this is the slow step of a submit.
         """
         body = {
-            "Columns": [{"OriginalName": c, "DisplayName": c} for c in CATALOG_COLUMNS],
+            "Columns": [{"OriginalName": c, "DisplayName": c}
+                        for c in CATALOG_COLUMNS + EXPORT_ONLY_COLUMNS],
             "ProductIds": list(skus),
             "FileFormat": FORMAT_TAB,
         }
@@ -526,6 +606,8 @@ class EbayService:
                 "BuyItNowPrice": str(price),
                 "DescriptionTemplateId": DESCRIPTION_TEMPLATE,
                 "eBaySellerProfileID_Shipping": shipping_profile_id(price),
+                "eBaySellerProfileID_Payment": PAYMENT_PROFILE,
+                "eBaySellerProfileID_Returns": RETURNS_PROFILE,
                 "eBayCategory1": str(category),
                 "EBayItemCondition": ITEM_CONDITION,
             }
@@ -539,8 +621,64 @@ class EbayService:
         return wanted, problems
 
     @staticmethod
+    def catalog_faults(
+        current: Dict[str, Dict[str, str]],
+        wanted: Dict[str, Dict[str, str]],
+        fallback_oz: Optional[Dict[str, Decimal]] = None,
+    ) -> Dict[str, str]:
+        """Children whose catalog state is self-contradictory, keyed by SKU.
+
+        Two faults, both of which produce a wrong listing rather than a refused one, which
+        is why they are checked instead of left to eBay:
+
+        StartPrice != BuyItNowPrice   Not a comparison against the computed price -- an
+                                      operator is free to set prices by hand and this tool
+                                      does not argue with them. It is the two fields
+                                      disagreeing WITH EACH OTHER, which is the shape of the
+                                      1,270-child incident: never-overwrite kept the
+                                      repricer's BuyItNowPrice while writing a StartPrice
+                                      beside it. Wrong no matter who wrote it.
+
+        no weight under $100          The band cannot be decided. Above $100 weight is not
+                                      consulted, so a missing one is not a fault there.
+                                      fallback_oz is the type's item_weight_oz, which is
+                                      what a newly created product carries before anything
+                                      has written a weight to SellerCloud.
+        """
+        fallback_oz = fallback_oz or {}
+        faults: Dict[str, str] = {}
+        for sku in wanted:
+            have = current.get(sku) or {}
+            start, bin_price = have.get("StartPrice"), have.get("BuyItNowPrice")
+            if not _is_unset("StartPrice", start) and not _is_unset("BuyItNowPrice", bin_price):
+                try:
+                    if Decimal(str(start).strip()) != Decimal(str(bin_price).strip()):
+                        faults[sku] = (f"StartPrice {str(start).strip()} != "
+                                       f"BuyItNowPrice {str(bin_price).strip()}")
+                        continue
+                except (InvalidOperation, ValueError):
+                    faults[sku] = f"unreadable price: StartPrice {start!r}, BuyItNowPrice {bin_price!r}"
+                    continue
+            price_text = (wanted[sku] or {}).get("BuyItNowPrice")
+            try:
+                price = Decimal(str(price_text))
+            except (InvalidOperation, ValueError, TypeError):
+                continue
+            if price >= 100:
+                continue
+            oz = weight_oz(have.get("PackageWeightLbs"), have.get("PackageWeightOz"))
+            if oz is None:
+                oz = fallback_oz.get(sku)
+            if oz is None:
+                faults[sku] = (f"no weight in SellerCloud or on the type, and at ${price} "
+                               "the shipping band depends on it")
+        return faults
+
+    @staticmethod
     def diff_catalog_rows(
-        current: Dict[str, Dict[str, str]], wanted: Dict[str, Dict[str, str]]
+        current: Dict[str, Dict[str, str]],
+        wanted: Dict[str, Dict[str, str]],
+        fallback_oz: Optional[Dict[str, Decimal]] = None,
     ) -> List[Dict[str, str]]:
         """Import rows for the children that need one, and only those.
 
@@ -560,10 +698,43 @@ class EbayService:
             if computed is not None:
                 try:
                     target["StartPrice"] = computed
+                    # Weight from the export row, because that is the only read of it in
+                    # this flow -- desired_catalog_values runs before the export exists and
+                    # so bands on price alone. Falls back to the type's item_weight_oz,
+                    # which is what a product carries until something writes a weight to
+                    # SellerCloud; 1,677 of 15,568 children were still at 0 there.
+                    oz = weight_oz(have.get("PackageWeightLbs"), have.get("PackageWeightOz"))
+                    if oz is None:
+                        oz = (fallback_oz or {}).get(sku)
                     target["eBaySellerProfileID_Shipping"] = shipping_profile_id(
-                        Decimal(computed))
+                        Decimal(computed), oz)
                 except (InvalidOperation, ValueError):
                     pass
+
+            # Columns this child gets whether or not SellerCloud is holding something.
+            forced: set = set()
+            product_name = str(have.get("ProductName") or "").strip()
+            if product_name:
+                # Written every time, not only when the casing is wrong. The pair has to
+                # agree: TopTitle is pinned to ProductName below, so leaving ProductName
+                # alone whenever it happened to look right would let the two drift apart.
+                product_name = product_name.replace(OLD_SIZE_TOKEN, NEW_SIZE_TOKEN)
+                target["ProductName"] = product_name
+                forced.add("ProductName")
+            # TopTitle FOLLOWS ProductName, and does not come from the listing.
+            #
+            # desired_catalog_values offers the listing's own title, which is the bare
+            # "Denim Tears Yellow Wreath Camo Shorts" with no size or price. TopTitle was
+            # empty on 352 of 409 children, so the fill-only rule wrote that bare title --
+            # and since eBay resolves TopTitle ahead of ProductName, those listings lost the
+            # size and price the other 43 kept. One batch, two conventions.
+            #
+            # ProductName is the title SellerCloud has always carried and the one eBay has
+            # been showing, so TopTitle is pinned to it. The listing's title stays as the
+            # fallback for a child SellerCloud has no name for at all.
+            if product_name:
+                target["TopTitle"] = product_name
+                forced.add("TopTitle")
 
             row = {CATALOG_KEY: sku}
             changed = False
@@ -572,7 +743,7 @@ class EbayService:
                 wanted_value = target.get(column)
                 # A column this listing has no value for is carried through untouched, not
                 # blanked: `wanted` omits a key rather than offering an empty one.
-                fill = _is_unset(column, existing) and column in target
+                fill = (_is_unset(column, existing) and column in target) or column in forced
                 # ENFORCED, not merely filled. These two are not independent facts about a
                 # product, they are functions of BuyItNowPrice -- StartPrice must equal it
                 # and the shipping profile must be its band. A value that contradicts that
