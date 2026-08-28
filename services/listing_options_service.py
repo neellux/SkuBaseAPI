@@ -481,6 +481,29 @@ class ListingOptionsService:
     ):
         conn = connections.get("default")
 
+        # Whitespace is normalised before anything else looks at the value. This table is
+        # its own vocabulary -- get_platform_size_records builds the dropdown from the
+        # distinct platform_value it holds -- so "Regular L" and "Regular  L" would become
+        # two permanent entries an operator cannot tell apart. Nothing trimmed on write
+        # before, which is survivable while the field is a closed list and not once it
+        # accepts typing.
+        if platform_value:
+            platform_value = " ".join(str(platform_value).split())
+
+        # eBay stores one string, "<Size Type> <Size>", and split_size_value partitions on
+        # the FIRST space. A value with no space at all yields the whole string as the size
+        # type and an empty size, which drops the Size aspect from the file and writes a
+        # nonsense Size Type -- silently, with eBay accepting the listing. Refused here
+        # because the failure is otherwise invisible until someone reads a live listing.
+        if platform_value and platform_id == "ebay" and " " not in platform_value:
+            return {
+                "error": "invalid_format",
+                "message": (
+                    f'"{platform_value}" is missing its size type. An eBay size is stored '
+                    'as "<Size Type> <Size>", for example "Regular L".'
+                ),
+            }
+
         if not platform_value:
             existing = await conn.execute_query_dict(
                 """
@@ -488,7 +511,12 @@ class ListingOptionsService:
                 FROM listingoptions_sizes_default_list sdl
                 WHERE sdl.primary_id = $1::uuid AND sdl.platform_id = $2
                     AND sdl.primary_table_column = 'size'
-                    AND sdl.sizing_type = $3
+                    -- IS NOT DISTINCT FROM, not =. sizing_type is nullable, and `= NULL`
+                    -- is NULL rather than true, so an unscoped mapping was invisible to
+                    -- its own lookup: the conflict guard never fired and the DELETE below
+                    -- removed nothing. Matches how database_service.py already queries
+                    -- this table.
+                    AND sdl.sizing_type IS NOT DISTINCT FROM $3
                 """,
                 [sizing_scheme_entry_id, platform_id, sizing_type],
             )
@@ -501,7 +529,7 @@ class ListingOptionsService:
                 DELETE FROM listingoptions_sizes_default_list
                 WHERE primary_id = $1::uuid AND platform_id = $2
                     AND primary_table_column = 'size'
-                    AND sizing_type = $3
+                    AND sizing_type IS NOT DISTINCT FROM $3
                 """,
                 [sizing_scheme_entry_id, platform_id, sizing_type],
             )
@@ -529,7 +557,7 @@ class ListingOptionsService:
             FROM listingoptions_sizes_default_list sdl
             WHERE sdl.primary_id = $1::uuid AND sdl.platform_id = $2
                 AND sdl.primary_table_column = 'size'
-                AND sdl.sizing_type = $3
+                AND sdl.sizing_type IS NOT DISTINCT FROM $3
             """,
             [sizing_scheme_entry_id, platform_id, sizing_type],
         )
@@ -556,7 +584,7 @@ class ListingOptionsService:
             [sizing_scheme_entry_id, platform_value, platform_id, sizing_type],
         )
 
-        return {"success": True}
+        return {"success": True, "created_value": platform_value}
 
     async def get_mapped_platform_sizes(
         self, sizing_scheme: str, sizes: list, platform_id: str, sizing_type: str = None
