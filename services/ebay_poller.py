@@ -316,7 +316,12 @@ class EbayPoller(BasePoller):
             await record_step(
                 [sub.id],
                 "item_ids_read",
-                meta={"publish_errors": errors} if errors else None,
+                # sku_errors, the key _build_import_detail reads and the dashboard renders
+                # per child. Written as publish_errors until now, which nothing read: eBay's
+                # own reasons were recorded on every row of import 2 and shown on none of
+                # them. publish_errors is kept alongside because mark_images_uploaded reads
+                # it when it closes an import.
+                meta={"sku_errors": errors, "publish_errors": errors} if errors else None,
                 listed=len(item_ids),
                 children=len(kids),
             )
