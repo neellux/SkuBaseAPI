@@ -16,6 +16,7 @@ from models.api_models import (
 )
 from models.db_models import AppSettings, Listing, Template
 from services.ebay_aspect_service import ebay_aspect_service
+from services.ebay_service import EbayService
 from services.ai_service import AIService
 from services.listing_options_service import listing_options_service
 from services.product_service import format_mpn
@@ -1259,6 +1260,9 @@ class ListingService:
         return ListingResponse(
             id=str(listing.id),
             product_id=listing.product_id,
+            company_code=await EbayService.company_code(listing.product_id)
+            if listing.product_id
+            else None,
             info_product_id=listing.info_product_id,
             assigned_to=listing.assigned_to,
             data=listing.data,

@@ -40,7 +40,7 @@ from services.ebay_aspect_service import ebay_aspect_service
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.listing_options_service import listing_options_service
 from services.sellercloud_service import sellercloud_service
-from tortoise import Tortoise
+from tortoise import Tortoise, connections
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,16 @@ RETURNS_PROFILE = "290560198021"
 # what identified the 1168... pair as the retired one.
 ENFORCED_COLUMNS = ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping",
                     "eBaySellerProfileID_Payment", "eBaySellerProfileID_Returns")
+
+# The only company whose products list on eBay. 182 is nymilan; 249 is EssxNYC, which has
+# no selling city or postal code on its SellerCloud company settings, so eBay refuses every
+# one of its products with "Selling city and postal code is not defined on company
+# settings". Blocked here rather than left to fail at publish an hour later.
+#
+# Read from parent_products.company_code, never inferred from the SKU prefix -- the same
+# rule oneinventory_service.py:61 documents, where 2,420 EssxNYC parents lack the "ESSX/"
+# prefix and 544 prefixed SKUs sit under a different company.
+EBAY_COMPANY_CODE = 182
 
 # The size-word casing changed in product_service ("... SIZE L $325" -> "... Size L $325"),
 # leaving 3,175 live eBay children on the old spelling. Fixed by EDITING the title
@@ -398,6 +408,19 @@ class EbayService:
         return None
 
     @staticmethod
+    async def company_code(parent_sku: str) -> Optional[int]:
+        """The SellerCloud company a parent belongs to, or None when it has no record.
+
+        parent_products lives in the PRODUCTS database, not SkuBase's own, and 193 of the
+        listings on file have no row there at all -- so None is a real answer and not an
+        error.
+        """
+        rows = await connections.get("product_db").execute_query_dict(
+            "SELECT company_code FROM parent_products WHERE sku = $1 LIMIT 1", [parent_sku]
+        )
+        return rows[0]["company_code"] if rows else None
+
+    @staticmethod
     async def build_rows(
         listing: Listing,
         children: Optional[List[Dict[str, Any]]] = None,
@@ -422,6 +445,15 @@ class EbayService:
         parent_id = listing.product_id
         if not parent_id:
             problems.append("listing has no product_id")
+            return [], problems
+
+        company = await EbayService.company_code(parent_id)
+        if company != EBAY_COMPANY_CODE:
+            problems.append(
+                f"company {company} does not list on eBay"
+                if company is not None
+                else "no company on record, so eBay eligibility cannot be established"
+            )
             return [], problems
 
         data = listing.data or {}

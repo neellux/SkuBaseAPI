@@ -279,6 +279,13 @@ class ListingResponse(BaseModel):
 
     id: str = Field(..., description="Listing UUID")
     product_id: str = Field(..., description="Product ID from SellerCloud")
+    # The SellerCloud company the product belongs to, from parent_products.company_code in
+    # the PRODUCTS database. Null when the parent has no row there. eBay lists only company
+    # 182 (nymilan); 249 (EssxNYC) has no selling city or postal code on its company
+    # settings, so eBay refuses its products outright.
+    company_code: Optional[int] = Field(
+        None, description="SellerCloud company code for this product"
+    )
     info_product_id: Optional[str] = Field(
         None, description="Full SellerCloud product ID, including variations"
     )

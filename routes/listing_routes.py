@@ -33,7 +33,7 @@ from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import DEFAULT_BATCH_SORT, BatchService
 from services.ebay_aspect_service import ebay_aspect_service
-from services.ebay_service import ebay_service
+from services.ebay_service import ebay_service, EbayService, EBAY_COMPANY_CODE
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
@@ -551,10 +551,24 @@ async def get_mapping_status(
     status = await listing_options_service.get_mapping_status(
         product_type, color, non_sc_platforms, platform_settings, brand=brand
     )
+
+    # eBay lists only company 182. Reported through the same channel as the brand, type and
+    # colour exclusions rather than as a new concept, so the pill locks, the tooltip names
+    # the reason and the platform auto-deselects with no UI work beyond reading the key.
+    #
+    # Computed here rather than in get_mapping_status because the company belongs to the
+    # PRODUCT, and that service takes a product type, a colour and a brand -- not a listing.
+    company = await EbayService.company_code(listing.product_id)
+    company_excluded = {
+        platform_id: platform_id == "ebay" and company != EBAY_COMPANY_CODE
+        for platform_id in non_sc_platforms
+    }
     return {
         "product_type": product_type,
         "standard_color": color,
         "brand_name": brand,
+        "company_code": company,
+        "company_excluded": company_excluded,
         **status,
     }
 
