@@ -286,12 +286,29 @@ class EbayPoller(BasePoller):
             errors = {sku: publish_errors[sku] for sku in kids if sku in publish_errors}
 
             sub.external_id = {"item_ids": item_ids}
-            sub.status = SubmissionStatus.AWAITING_ACTION
-            sub.platform_status = AWAITING_IMAGES_STAGE
+            # A submission that listed NOTHING is failed, not awaiting images. Every child
+            # was refused -- an invalid return policy, no quantity, a category eBay would
+            # not take -- so there is no live listing to attach a photo to, and parking it
+            # in awaiting_action showed "Images needed" on a product that never reached
+            # eBay. It also inflated the coverage denominator with children the file can
+            # never contain, so "12 of 40" undercounted a complete upload.
+            if item_ids:
+                sub.status = SubmissionStatus.AWAITING_ACTION
+                sub.platform_status = AWAITING_IMAGES_STAGE
+            else:
+                sub.status = SubmissionStatus.FAILED
+                sub.platform_status = None
+                # eBay's own words where the publish job gave them, rather than a generic
+                # line: "You've provided an invalid return policy" is actionable, "publish
+                # failed" is not.
+                sub.error_display = (
+                    next(iter(errors.values()), "")[:200] or "No eBay listing was created"
+                )
             # platform_meta deliberately absent from update_fields: record_step below owns
             # that column, and this instance is carrying a stale copy of it.
             await sub.save(
-                update_fields=["status", "platform_status", "external_id", "updated_at"]
+                update_fields=["status", "platform_status", "external_id",
+                               "error_display", "updated_at"]
             )
             # Per submission, not per import: the errors differ per row, and record_step
             # writes one `meta` to every id it is handed. Only rows that actually have

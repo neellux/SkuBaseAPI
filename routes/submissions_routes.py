@@ -413,7 +413,8 @@ async def _load_import_submissions(
 
 
 def _build_import_detail(
-    platform: str, import_id: int, submissions: list[ListingSubmission]
+    platform: str, import_id: int, submissions: list[ListingSubmission],
+    image_counts: dict[str, int] | None = None,
 ) -> ImportDetailResponse:
     status_counts: dict[str, int] = defaultdict(int)
     details: list[ImportListingDetail] = []
@@ -445,6 +446,7 @@ def _build_import_detail(
                 sku_errors=(sub.platform_meta or {}).get("sku_errors") or None,
                 skus=skus,
                 updated_skus=(sub.platform_meta or {}).get("updated_references") or [],
+                image_count=(image_counts or {}).get(product_id or "", 0),
                 item_ids=(sub.external_id or {}).get("item_ids") or None,
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
@@ -472,7 +474,15 @@ async def get_import_detail(
     if not submissions:
         raise HTTPException(status_code=404, detail=f"Import {import_id} not found")
 
-    return _build_import_detail(platform, import_id, submissions)
+    # One extra query, and only for the platform that has a manual image step. Without it
+    # the dialog cannot tell a product that is missing from the image file from one that is
+    # in it, because the difference is whether the parent has photos at all.
+    image_counts = (
+        await _images_by_parent([s.listing.product_id for s in submissions if s.listing])
+        if platform == "ebay"
+        else {}
+    )
+    return _build_import_detail(platform, import_id, submissions, image_counts)
 
 
 @router.post("/imports/mark_reviewed", response_model=ImportDetailResponse)

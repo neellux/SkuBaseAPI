@@ -770,6 +770,13 @@ class ImportListingDetail(BaseModel):
         description="SKUs that were already on the sheet and refreshed in place "
         "(grailed updated_references), rather than added as new rows",
     )
+    # Why a listed child can still be absent from the image file. The revise file needs
+    # BOTH an eBay item number and a photo to point at; counting item ids alone reported
+    # "40 of 40 ready" for a file that carried 34 rows.
+    image_count: int = Field(
+        0, description="Photos on the parent's newest productimages row; 0 means the "
+                       "image file cannot include this product"
+    )
     item_ids: Optional[Dict[str, str]] = Field(
         None,
         description="Per-child-SKU platform item id ({sku: id}); eBay item numbers, which "
