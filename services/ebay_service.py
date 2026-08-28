@@ -789,8 +789,16 @@ class EbayService:
             # ProductName is the title SellerCloud has always carried and the one eBay has
             # been showing, so TopTitle is pinned to it. The listing's title stays as the
             # fallback for a child SellerCloud has no name for at all.
+            # Always written, whichever source it comes from. Payment and returns are
+            # enforced for the same reason and by the same principle: these are values this
+            # tool owns outright, so "keep whatever is there" only preserves whatever was
+            # wrong last time. Without the fallback a child SellerCloud has no ProductName
+            # for would still be merely FILLED, and its title would go stale the moment the
+            # listing's own changed.
             if product_name:
                 target["TopTitle"] = product_name
+                forced.add("TopTitle")
+            elif target.get("TopTitle"):
                 forced.add("TopTitle")
 
             row = {CATALOG_KEY: sku}
