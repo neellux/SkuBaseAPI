@@ -673,19 +673,41 @@ class OneInventoryService:
     ) -> dict[str, Any]:
         """Additive. Adds missing variants, refreshes descriptive fields, removes nothing."""
         gid = existing["id"]
-        present = {
-            n["sku"]: n["id"]
-            for n in (existing.get("variants") or {}).get("nodes") or []
-            if n.get("sku")
-        }
 
         await admin.update_product_details(gid, product_fields)
         await admin.add_tags(gid, tags)
 
         by_sku = {v["inventoryItem"]["sku"]: v for v in variants}
 
+        # VARIANT IDS COME FROM A DIRECT FETCH, NEVER FROM `existing`.
+        #
+        # `existing` comes from find_product_by_variant_sku, which reads Shopify's search
+        # index, so its ids are only as fresh as that index. The fetch below costs one read
+        # and removes the doubt.
+        live = await admin.get_product(gid)
+        present = {v.sku: v.gid for v in (live.variants if live else ()) if v.sku}
+
         missing = [v for sku, v in by_sku.items() if sku not in present]
         made = await admin.create_variants(gid, missing) if missing else []
+
+        if made:
+            # THIS RE-READ IS THE ACTUAL FIX, and it is not defensive - it is required.
+            #
+            # create_variants runs productVariantsBulkCreate with REMOVE_STANDALONE_VARIANT,
+            # which DELETES the product's existing variant and rebuilds the set. Its
+            # docstring claims "It never removes a variant"; that is false, and it cost
+            # three production submissions. Proof from Shopify's own timestamps: the
+            # submission for DNT-MJNS-0035 started at 13:38:55 on 2026-08-28 and its L
+            # variant reports createdAt 13:38:58 - our own call, three seconds in. Same
+            # shape on DNT-MTPS-0106, whose four variants all carry createdAt 15:15:22
+            # against a submission that started at 15:15:19.
+            #
+            # So the ids captured before the create are dead by the time update_variants
+            # runs, and writing them fails as
+            #     ['variants', '0', 'id']: Product variant does not exist
+            # on a product that is perfectly healthy. Re-read, never assume they survived.
+            live = await admin.get_product(gid)
+            present = {v.sku: v.gid for v in (live.variants if live else ()) if v.sku}
 
         # Existing variants get their inventoryItem refreshed (cost, weight) but NOT their
         # price: an additive update must not fight the consignment pipeline for price

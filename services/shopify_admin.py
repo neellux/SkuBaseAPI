@@ -747,19 +747,38 @@ class ShopifyAdmin:
     async def create_variants(
         self, product_gid: str, variants: Sequence[Mapping[str, Any]]
     ) -> list[dict[str, Any]]:
-        """productVariantsBulkCreate. REMOVE_STANDALONE_VARIANT drops Shopify's default.
+        """productVariantsBulkCreate on the DEFAULT strategy.
 
         Used for the initial variant set and, on an additive update, for sizes that are
         missing. It never removes a variant: one holding live stock must survive a
         resubmit whose listing no longer lists that size.
+
+        THAT PROMISE WAS FALSE UNTIL 2026-08-28, and the strategy is why. This passed
+        REMOVE_STANDALONE_VARIANT, which Shopify defines as
+
+            Deletes the existing standalone variant when the product has only a single
+            default ("Default Title") OR CUSTOM variant.
+
+        "Standalone" means the product's ONLY variant, not the placeholder. So on the
+        update path, a product down to one real variant had it deleted: DNT-MJNS-0035 lost
+        its XL and the 11 units on it when a submission added L, and the dead id then broke
+        the update_variants call that followed.
+
+        DEFAULT is what both paths actually want, so no per-path flag is needed:
+
+            Deletes the standalone default ("Default Title") variant when it's the only
+            variant on the product. PRESERVES THE STANDALONE CUSTOM VARIANT.
+
+        On a create the only variant is Shopify's placeholder, which DEFAULT removes. On an
+        update a real variant survives. PRESERVE_STANDALONE_VARIANT would also stop the
+        deletion but would leave the placeholder behind on creates.
         """
         if not variants:
             return []
         data = await self.client.execute(
             """
             mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-              productVariantsBulkCreate(productId: $productId, variants: $variants,
-                                        strategy: REMOVE_STANDALONE_VARIANT) {
+              productVariantsBulkCreate(productId: $productId, variants: $variants) {
                 productVariants { id sku price compareAtPrice }
                 userErrors { field message }
               }
@@ -780,13 +799,25 @@ class ShopifyAdmin:
         Callers pass inventoryItem fields (cost, weight, requiresShipping). Inventory
         QUANTITY is never among them: the app holds no write_inventory scope, so an
         attempt would fail at the credential rather than silently zero live stock.
+
+        allowPartialUpdates=true here, and false in set_variant_prices above. The two are
+        not in tension: pricing carries a cross-variant invariant (uniform price per
+        product), so a partial write there leaves mixed pricing no ledger row can describe.
+        The fields THIS method writes - cost, weight, requiresShipping - are independent
+        per variant, so there is no state a partial application can corrupt.
+
+        What it buys: one unusable variant id no longer discards the refresh for every
+        other variant. DNT-MJNS-0035 failed outright on three consecutive submissions over
+        a single bad id and refreshed nothing. The userErrors array still reports the row
+        that could not be applied, so a partial write is still visible rather than silent.
         """
         if not variants:
             return []
         data = await self.client.execute(
             """
             mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-              productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+              productVariantsBulkUpdate(productId: $productId, variants: $variants,
+                                        allowPartialUpdates: true) {
                 productVariants {
                   id sku
                   inventoryItem { measurement { weight { value unit } } }
