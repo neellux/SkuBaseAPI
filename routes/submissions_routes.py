@@ -419,10 +419,15 @@ def _build_import_detail(
     status_counts: dict[str, int] = defaultdict(int)
     details: list[ImportListingDetail] = []
     batch_number = None
+    publish_job_id = None
     for sub in submissions:
         status_counts[_effective_status(sub)] += 1
         if batch_number is None:
             batch_number = (sub.platform_meta or {}).get("batch_number")
+        # Every submission in an import carries the same ebay_jobs map, so the first one
+        # that has it answers for the batch.
+        if publish_job_id is None:
+            publish_job_id = ((sub.platform_meta or {}).get("ebay_jobs") or {}).get("publish")
         listing = sub.listing
         title = None
         product_id = None
@@ -457,6 +462,7 @@ def _build_import_detail(
         import_id=import_id,
         platform_id=platform,
         batch_number=batch_number,
+        publish_job_id=str(publish_job_id) if publish_job_id else None,
         submissions=details,
         status_counts=dict(status_counts),
     )

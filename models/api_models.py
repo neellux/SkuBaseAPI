@@ -804,6 +804,12 @@ class ImportDetailResponse(BaseModel):
     batch_number: Optional[int] = Field(
         None, description="Grailed sequential batch number (shown zero-padded to 6 digits)"
     )
+    # SellerCloud's queued job that published this import to eBay, so the dialog can link
+    # straight to it. Publishing is where an operator most often needs the job -- to raise
+    # its priority in the queue, or to read the per-child errors eBay returned.
+    publish_job_id: Optional[str] = Field(
+        None, description="SellerCloud queued job id for this import's publish step"
+    )
     submissions: List[ImportListingDetail] = Field(default_factory=list)
     status_counts: Dict[str, int] = Field(default_factory=dict)
 
