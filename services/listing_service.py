@@ -840,9 +840,13 @@ class ListingService:
         everywhere else. Explicit rather than relying on 999 being both the aspects' base
         and the sort key's default: a tie-break is not a statement of intent.
 
-        ui_size 8 pairs with Department's 4 to fill exactly one 12-column row. Two thirds
-        is also about as narrow as this field goes: its labels are full breadcrumbs up to
-        255 characters, and below this they truncate past the second level.
+        ui_size 12 because the eBay group now renders in its own half-width column beside
+        the description, so a size here is measured against that column rather than the
+        form: 12 is half the form, which is where this field's breadcrumb labels (up to 255
+        characters) stop truncating past the second level. It was 8, pairing with
+        Department's 4 to fill one row back when the group sat full width beneath the form.
+        Unlike the aspects, this field is synthesized rather than stored in
+        pm_ebay_aspect_settings, so its width is not settable from the eBay aspects page.
         """
         field = {
             "name": "ebay_category_id",
@@ -855,7 +859,7 @@ class ListingService:
             "display_in_form": True,
             "section": "ebay",
             "order": 950,
-            "ui_size": 8,
+            "ui_size": 12,
         }
         if len(candidates) == 1:
             field["default"] = candidates[0]["category_id"]

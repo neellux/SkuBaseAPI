@@ -33,6 +33,7 @@ from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import DEFAULT_BATCH_SORT, BatchService
 from services.ebay_aspect_service import ebay_aspect_service
+from services.ebay_service import ebay_service
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
@@ -751,6 +752,15 @@ async def submit_listing(
         sizing_scheme = form_data.get("SIZING_SCHEME")
         child_sizes = list(set(v for v in child_size_overrides.values() if v and v.strip()))
         size_platforms = [p for p in non_sc_platforms if p not in excluded]
+        # eBay only wants a size where the chosen category has a size aspect. Necklaces &
+        # Pendants and Sunglasses have none, so a size mapping there would be a value that
+        # is never sent -- and one the operator could not supply anyway, the dialog having
+        # no eBay vocabulary to offer for those sizing types. The other platforms are
+        # unaffected: Grailed and SPO take a size on everything.
+        if "ebay" in size_platforms and not await ebay_service.needs_size_mapping(
+            product_type, form_data.get("ebay_category_id")
+        ):
+            size_platforms = [p for p in size_platforms if p != "ebay"]
         if sizing_scheme and child_sizes and size_platforms:
             sizing_type = None
             if product_type:

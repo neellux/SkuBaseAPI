@@ -266,7 +266,7 @@ class EbayService:
         pairs: List[Tuple[str, str]] = []
         # Aspects the size mapping answers. Held back rather than resolved here: their
         # value differs per child, and this function does not know the child.
-        size_names: List[str] = []
+        size_names = EbayService.size_specific_names(detail)
         problems: List[str] = []
 
         for aspect in detail["aspects"]:
@@ -282,8 +282,7 @@ class EbayService:
             resolved_by = aspect.get("resolved_by")
 
             if resolved_by == "size":
-                size_names.append(specific_name)
-                continue
+                continue          # collected by size_specific_names above
 
             if resolved_by:
                 value = await EbayService._value_from_mapping(resolved_by, data)
@@ -322,6 +321,64 @@ class EbayService:
             pairs.append((specific_name, value))
 
         return pairs, size_names, problems
+
+    @staticmethod
+    def size_specific_names(detail: Dict[str, Any]) -> List[str]:
+        """The item specifics the SIZE MAPPING answers on this category, not the form.
+
+        One implementation with two callers, so the gate that demands a size mapping and
+        the builder that consumes one can never disagree about whether eBay wants a size.
+        """
+        out: List[str] = []
+        for aspect in detail.get("aspects") or []:
+            settings = aspect["settings"]
+            if not (settings["enabled"] or aspect["ebay"]["is_required"]):
+                continue
+            if aspect.get("resolved_by") != "size":
+                continue
+            out.append(settings["sellercloud_field_effective"] or aspect["aspect_name"])
+        return out
+
+    @staticmethod
+    async def needs_size_mapping(
+        product_type: Optional[str], requested_category: Optional[str] = None
+    ) -> bool:
+        """Whether eBay asks for a size on this listing at all.
+
+        Plenty of categories do not. Jewelry & Watches > Fashion Jewelry > Necklaces &
+        Pendants (155101) carries 45 aspects and not one of them is Size or Size Type, and
+        the same is true of Sunglasses. Demanding a size mapping there blocks the submit
+        over a value that would never be sent, and the operator cannot even clear it: the
+        mapping dialog builds its dropdown from the platform values already recorded for
+        that sizing type, and eBay has none for Jewelry because eBay has no size vocabulary
+        for necklaces to record.
+
+        Three outcomes, not two, because "we cannot tell" is not "no size needed":
+
+          no usable category   False. Either the type maps nowhere, or it maps to an id the
+                               loaded tree does not contain -- 185075 and 185080 (Joggers,
+                               Track Pants) are mapped on three types and are not in the
+                               tree, so resolve_listing_category rejects them. Both cases
+                               end the same way: the listing cannot go to eBay at all and
+                               is blocked with "no eBay category for type X", which is a
+                               straight answer. A size gate here would instead send the
+                               operator to a dialog about sizes for a listing whose real
+                               problem is its category.
+          aspects unreadable   True, leaving the gate exactly as it was. A category the
+                               tree knows but returns no aspects for is a gap in the
+                               reference load, not a category without sizes, and reading it
+                               as "no size wanted" would quietly stop asking for one.
+          loaded               Whatever its aspects say.
+        """
+        category_id = await ebay_aspect_service.resolve_listing_category(
+            product_type, requested_category
+        )
+        if not category_id:
+            return False
+        detail = await ebay_aspect_service.get_category_aspects(category_id)
+        if not detail:
+            return True
+        return bool(EbayService.size_specific_names(detail))
 
     @staticmethod
     async def _value_from_mapping(resolved_by: str, data: Dict[str, Any]) -> Optional[str]:
