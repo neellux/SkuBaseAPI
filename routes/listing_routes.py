@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import orjson
 from fastapi import APIRouter, HTTPException, Query, Request
+from listingoptions.services.sizing_service import SizingService
 from models.api_models import (
     BatchConfirmationRequest,
     BatchConfirmationResponse,
