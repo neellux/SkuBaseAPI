@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field, validator, model_validator
 from typing import List, Optional, Union, Literal, Dict, Any
 from datetime import datetime
 from decimal import Decimal
+from uuid import UUID
 import re
 
 
@@ -555,6 +556,10 @@ class SizeEntry(BaseModel):
 
     id: str
     size: str
+    # Surfaced so the size-mapping dialogs can show the US equivalent beside the native size.
+    # Declaring it here is required: Pydantic drops keys the model does not know about, so adding
+    # it to the SQL alone would return a query that has it and a response that does not.
+    us_size: Optional[str] = None
 
 
 class SizingSchemeData(BaseModel):

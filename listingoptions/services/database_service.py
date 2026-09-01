@@ -3926,7 +3926,8 @@ class DatabaseService:
                     sizing_scheme,
                     sizing_types,
                     json_agg(
-                        json_build_object('id', id, 'size', size, 'order', "order")
+                        json_build_object('id', id, 'size', size, 'order', "order",
+                                          'us_size', us_size)
                         ORDER BY "order"
                     ) as sizes
                 FROM unaggregated_schemes
@@ -3952,6 +3953,7 @@ class DatabaseService:
                                 id=size_dict["id"],
                                 size=size_dict["size"],
                                 order=size_dict["order"],
+                                us_size=size_dict.get("us_size"),
                             )
                         )
 
@@ -4083,7 +4085,8 @@ class DatabaseService:
                     sizing_scheme,
                     sizing_types,
                     json_agg(
-                        json_build_object('id', id, 'size', size, 'order', "order")
+                        json_build_object('id', id, 'size', size, 'order', "order",
+                                          'us_size', us_size)
                         ORDER BY "order"
                     ) as sizes
                 FROM unaggregated_schemes
@@ -4109,6 +4112,7 @@ class DatabaseService:
                                 id=size_dict["id"],
                                 size=size_dict["size"],
                                 order=size_dict["order"],
+                                us_size=size_dict.get("us_size"),
                             )
                         )
 

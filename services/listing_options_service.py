@@ -406,6 +406,112 @@ class ListingOptionsService:
             "brand_excluded": brand_excluded,
         }
 
+    # us_size is scheme-and-size level, never per platform, so this is a sibling of
+    # check_unmapped_sizes rather than an extension of it: the two raise different 422 types
+    # consumed by different dialogs, and one function returning a union of both payloads would be
+    # worse than two.
+    #
+    # Deliberately takes no sizing_type. us_size is keyed on (scheme, size) only, and accepting a
+    # sizing_type it then ignored would imply a granularity the column does not have. Three
+    # schemes are knowingly approximate as a result (Salomon Footwear, JP Men's, JP Women's) -
+    # see docs/plans/2026-08-27-feat-us-size-mappings-plan.md.
+    US_NATIVE_REGIONS = {"US", "UNIVERSAL"}
+
+    async def check_missing_us_sizes(
+        self,
+        sizing_scheme: str,
+        sizes: list[str],
+        platforms: list[str],
+        platform_settings: dict | None = None,
+    ) -> dict | None:
+        conn = connections.get("default")
+        platform_settings = platform_settings or {}
+
+        triggering = [
+            p for p in platforms
+            if (platform_settings.get(p) or {}).get("require_us_size")
+        ]
+        if not triggering:
+            return None
+
+        # Scheme-level read as its own ordered query. Reading these off row 0 of the
+        # size-filtered result would make a scheme-level fact depend on which sizes the operator
+        # happened to be submitting, and the ordering would be arbitrary.
+        scheme_rows = await conn.execute_query_dict(
+            'SELECT region_code, require_us_size FROM listingoptions_sizing_schemes '
+            'WHERE sizing_scheme = $1 ORDER BY "order" LIMIT 1',
+            [sizing_scheme],
+        )
+        if not scheme_rows:
+            return None
+
+        # BOTH flags are required. The platform saying it wants US sizes is not enough, because
+        # plenty of non-US schemes have no US equivalent to give: Rings are already US ring sizes,
+        # Bracelets are centimetres, Hats CM is a head measurement. Inferring the requirement from
+        # "not a US region" would demand a conversion that does not exist, and the operator would
+        # type filler to unblock themselves - filler that becomes permanent reference data.
+        if not scheme_rows[0]["require_us_size"]:
+            return None
+
+        # Belt and braces on top of the scheme flag: a US or Universal scheme's sizes already ARE
+        # the US sizes, so it can never sensibly demand a conversion even if someone ticks the box.
+        # Case-folded because region_code is free text with no DB constraint - the editor offers a
+        # dropdown but the column accepts anything, so 'us', 'USA' and 'US ' must not silently
+        # mean "not US".
+        region = (scheme_rows[0]["region_code"] or "").strip().upper()
+        if region in self.US_NATIVE_REGIONS:
+            return None
+
+        rows = await conn.execute_query_dict(
+            "SELECT size, us_size FROM listingoptions_sizing_schemes "
+            "WHERE sizing_scheme = $1 AND size = ANY($2)",
+            [sizing_scheme, sizes],
+        )
+        have = {r["size"] for r in rows if (r["us_size"] or "").strip()}
+        # Computed from the INPUT, matching check_unmapped_sizes. Computing it from `rows` would
+        # let a child size that has no row in the scheme pass silently.
+        missing = [s for s in sizes if s not in have]
+        if not missing:
+            return None
+
+        # Resolve names in one query so the dialog can say "eBay", not "ebay".
+        named = await conn.execute_query_dict(
+            "SELECT id, name FROM listingoptions_platforms WHERE id = ANY($1)", [triggering]
+        )
+        names = {r["id"]: r["name"] for r in named}
+        return {
+            "sizing_scheme": sizing_scheme,
+            # So the dialog can label the native size with its region ("EU 43", not a bare "43").
+            # The operator is being asked to convert between two systems; naming both halves is
+            # the difference between a clear question and a guess.
+            "region_code": scheme_rows[0]["region_code"],
+            "missing_sizes": missing,
+            "platforms_with_missing": [
+                {"platform_id": p, "platform_name": names.get(p, p)} for p in triggering
+            ],
+        }
+
+    async def get_scheme_size_context(self, sizing_scheme: str) -> dict:
+        """What the mapping dialog needs to show a US size beside each native size.
+
+        Returns {"us_sizes": {size: us_size}, "region_code": str|None}.
+
+        Carried on the unmapped_sizes 422 payload rather than refetched by the client. The client
+        holds availableSizingSchemes from a fetch keyed on product_type, and nothing refreshes it
+        after a US size is saved - so a refetch would either race the resubmit or show a blank
+        column for values the operator typed seconds earlier.
+        """
+        conn = connections.get("default")
+        rows = await conn.execute_query_dict(
+            "SELECT size, us_size, region_code FROM listingoptions_sizing_schemes "
+            "WHERE sizing_scheme = $1",
+            [sizing_scheme],
+        )
+        return {
+            "us_sizes": {r["size"]: r["us_size"] for r in rows if r["us_size"]},
+            "region_code": rows[0]["region_code"] if rows else None,
+        }
+
     async def check_unmapped_sizes(
         self,
         sizing_scheme: str,

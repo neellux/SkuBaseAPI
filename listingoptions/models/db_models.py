@@ -120,6 +120,23 @@ class SizingScheme(Model):
         null=True,
         description="Region the scheme's sizes are expressed in (US, EU, UK, JP). Scheme-level.",
     )
+    require_us_size = fields.BooleanField(
+        default=False,
+        description=(
+            "Whether this scheme needs a us_size on every size. SCHEME-level, like the two "
+            "fields above. The submit gate requires this AND the platform's require_us_size, so "
+            "a scheme with no US equivalent (Rings, Bracelets, Hats CM) never demands one."
+        ),
+    )
+    us_size = fields.CharField(
+        max_length=50,
+        null=True,
+        description=(
+            "US equivalent of this size. PER SIZE ROW - not scheme-level, unlike the three fields "
+            "above. Never include it in the blanket scheme-wide UPDATE in "
+            "update_scheme_size_orders; see SCHEME_LEVEL_FIELDS."
+        ),
+    )
 
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

@@ -307,6 +307,7 @@ async def export_sizing_schemes():
                     "Sizing Types",
                     "GOAT Code",
                     "Region Code",
+                    "US Size",
                 ]
             )
         )

@@ -6,6 +6,16 @@ gallery sync poller, and the one-off remediation script), so the shape lives her
 
 A row either ADDs an image by URL or DELETEs one by ImageID. To replace a product's
 image, send both: the DELETE first, then the ADD.
+
+IsDefault and IsMainDescriptionImage both mean "this is the product's slot-1 image".
+SellerCloud holds exactly one of each per product and moves them together: importing a
+new image with them set demotes the previous image to False/False. Measured across 193
+rows (MSNK export 4202240 plus the July 2026 backup) they never diverge.
+
+Both pushes here send exactly one row per child -- the parent's `1_1500.jpg`, which is
+the priority-1 shot -- so both flags are always True on it. Do not try to express
+"studio vs edited" through IsMainDescriptionImage: withholding it would also withhold
+IsDefault, leaving the product with no visible image at all.
 """
 import io
 from typing import Any, Dict, List, Optional
@@ -22,7 +32,11 @@ IMAGE_IMPORT_COLUMNS = [
 
 
 def add_default_image_row(product_id: str, image_url: str) -> Dict[str, Any]:
-    """Add `image_url` as the product's default image."""
+    """Add `image_url` as the product's slot-1 image: default AND main description image.
+
+    Every caller sends the priority-1 shot, so both flags belong on it. See the module
+    docstring for why they are not separable.
+    """
     return {
         "ProductID": product_id,
         "ImageID": None,
@@ -35,14 +49,18 @@ def add_default_image_row(product_id: str, image_url: str) -> Dict[str, Any]:
 
 
 def delete_image_row(product_id: str, image_id: Any) -> Dict[str, Any]:
-    """Remove one existing image, identified by the ImageID a kind-11 export reports."""
+    """Remove one existing image, identified by the ImageID a kind-11 export reports.
+
+    The flags are left blank: a DELETE is matched on ProductID + ImageID, so sending
+    IsMainDescriptionImage=True here only claimed something about a row on its way out.
+    """
     return {
         "ProductID": product_id,
         "ImageID": image_id,
         "ImageURL": "",
-        "IsDefault": True,
-        "IsMainDescriptionImage": True,
-        "IsSupplementImage": False,
+        "IsDefault": None,
+        "IsMainDescriptionImage": None,
+        "IsSupplementImage": None,
         "_ACTION_": "DELETE",
     }
 

@@ -15,6 +15,7 @@ from listingoptions.models.api_models import (
     UpdateSizeOrderRequest,
     SizingSchemeListedName,
     AllSizingSchemesResponse,
+    MAX_US_SIZE_LENGTH,
 )
 import logging
 import asyncio
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 # every future `WHERE goat_code IS NULL` check.
 MAX_GOAT_CODE_LENGTH = 100
 MAX_REGION_CODE_LENGTH = 20
+
+# The fields that may go into the blanket scheme-wide UPDATE in update_scheme_size_orders. That
+# statement writes one value to every row of the scheme, so it is only safe for scheme-level
+# columns. us_size is PER SIZE ROW and must never appear here: adding it would stamp a single
+# value across the whole scheme and destroy every distinct US size in it.
+SCHEME_LEVEL_FIELDS = ("sizing_types", "goat_code", "region_code", "require_us_size")
 
 
 def _blank_to_none(value: Optional[str]) -> Optional[str]:
@@ -49,6 +56,43 @@ def _validate_code_lengths(goat_code: Optional[str], region_code: Optional[str])
         raise ValueError(f"GOAT code must be {MAX_GOAT_CODE_LENGTH} characters or fewer.")
     if region_code is not None and len(region_code) > MAX_REGION_CODE_LENGTH:
         raise ValueError(f"Region code must be {MAX_REGION_CODE_LENGTH} characters or fewer.")
+
+
+def _require_complete_us_sizes(pairs) -> None:
+    """A scheme that declares it needs US sizes must actually have them all.
+
+    `pairs` is (size, effective us_size). Half-filled is the worst state available: the submit
+    gate blocks on the missing ones, and the person who hits that block is a lister mid-listing
+    rather than whoever curates the scheme. The editor blocks this client-side; this is the
+    backstop for every other caller.
+
+    ValueError, so the route turns it into a 400 whose detail the UI renders. Kept short - it goes
+    into a snackbar.
+    """
+    missing = [size for size, us in pairs if not (us or "").strip()]
+    if not missing:
+        return
+    shown = ", ".join(missing[:6]) + (", ..." if len(missing) > 6 else "")
+    raise ValueError(
+        f"{len(missing)} size{'' if len(missing) == 1 else 's'} still need a US size: {shown}. "
+        'Fill them in, or turn off "Requires a US size".'
+    )
+
+
+def _validate_us_sizes(sizes) -> None:
+    """Same reasoning as _validate_code_lengths: a 400 the operator can act on, not a 500.
+
+    us_size is varchar(50). Without this an over-long value reaches Tortoise, whose
+    ValidationError is not a ValueError subclass, so it falls past the route's `except ValueError`
+    into the generic handler and returns a 500 with raw ORM text.
+    """
+    for size_data in sizes:
+        us_size = getattr(size_data, "us_size", None)
+        if us_size is not None and len(us_size) > MAX_US_SIZE_LENGTH:
+            raise ValueError(
+                f"US size for '{size_data.size}' must be "
+                f"{MAX_US_SIZE_LENGTH} characters or fewer."
+            )
 
 
 class SizingService:
@@ -122,9 +166,13 @@ class SizingService:
                         "sizing_types": entry.sizing_types,
                         "goat_code": entry.goat_code,
                         "region_code": entry.region_code,
+                        "require_us_size": entry.require_us_size,
                     }
                 schemes_dict[scheme_name]["sizes"].append(
-                    SizingSchemeEntryWithId(id=entry.id, size=entry.size, order=entry.order)
+                    SizingSchemeEntryWithId(
+                        id=entry.id, size=entry.size, order=entry.order,
+                        us_size=entry.us_size,
+                    )
                 )
 
             schemes = [
@@ -134,6 +182,7 @@ class SizingService:
                     sizing_types=data["sizing_types"],
                     goat_code=data["goat_code"],
                     region_code=data["region_code"],
+                    require_us_size=data["require_us_size"],
                 )
                 for name, data in schemes_dict.items()
             ]
@@ -182,11 +231,15 @@ class SizingService:
             return SizingSchemeDetailResponse(
                 sizing_scheme=scheme_name,
                 sizes=[
-                    SizingSchemeEntryWithId(id=e.id, size=e.size, order=e.order) for e in entries
+                    SizingSchemeEntryWithId(
+                        id=e.id, size=e.size, order=e.order, us_size=e.us_size
+                    )
+                    for e in entries
                 ],
                 sizing_types=head.sizing_types,
                 goat_code=head.goat_code,
                 region_code=head.region_code,
+                require_us_size=head.require_us_size,
             )
         except DoesNotExist:
             logger.info(f"Sizing scheme '{scheme_name}' not found when fetching details.")
@@ -234,6 +287,12 @@ class SizingService:
                 raise ValueError("Region code is required for a new sizing scheme.")
             _validate_code_lengths(goat_code, region_code)
 
+            _validate_us_sizes(scheme_create.sizes)
+            if scheme_create.require_us_size:
+                _require_complete_us_sizes(
+                    [(s.size, s.us_size) for s in scheme_create.sizes]
+                )
+
             created_db_entries = []
             for size_entry in scheme_create.sizes:
                 entry = await SizingScheme.create(
@@ -243,6 +302,8 @@ class SizingService:
                     sizing_types=scheme_create.sizing_types,
                     goat_code=goat_code,
                     region_code=region_code,
+                    require_us_size=bool(scheme_create.require_us_size),
+                    us_size=size_entry.us_size or None,
                 )
                 created_db_entries.append(entry)
 
@@ -255,6 +316,7 @@ class SizingService:
                 sizing_types=scheme_create.sizing_types,
                 goat_code=goat_code,
                 region_code=region_code,
+                require_us_size=bool(scheme_create.require_us_size),
             )
 
         # Outside the transaction on purpose. asyncio.create_task copies the current context, and
@@ -351,6 +413,7 @@ class SizingService:
             # existing_entries is empty has already returned or raised above.
             current = existing_entries[0]
             _validate_code_lengths(update_request.goat_code, update_request.region_code)
+            _validate_us_sizes(update_request.sizes)
             scheme_values = {
                 "sizing_types": (
                     update_request.sizing_types
@@ -366,6 +429,11 @@ class SizingService:
                     _blank_to_none(update_request.region_code)
                     if update_request.region_code is not None
                     else current.region_code
+                ),
+                "require_us_size": (
+                    update_request.require_us_size
+                    if update_request.require_us_size is not None
+                    else current.require_us_size
                 ),
             }
 
@@ -387,19 +455,50 @@ class SizingService:
                 if entry is not None:
                     entry.size = size_data.size
                     entry.order = size_data.order
-                    await entry.save(update_fields=["size", "order", "updated_at"])
+                    # us_size is PER SIZE ROW, so it is written here and never in the blanket
+                    # scheme-wide UPDATE below. The model validator has already turned a blank
+                    # into None, so an omission and an explicit clear arrive identically - which
+                    # is fine because the editor always sends every size it is displaying.
+                    fields = ["size", "order", "updated_at"]
+                    if size_data.us_size is not None:
+                        # "" means the operator cleared the field; None means they did not send
+                        # it. Only the former writes, and it writes NULL - so the column holds
+                        # two states on disk while the request can express all three.
+                        entry.us_size = size_data.us_size or None
+                        fields.insert(2, "us_size")
+                    await entry.save(update_fields=fields)
                     updated_entries.append(entry)
                 else:
                     new_entry = await SizingScheme.create(
                         sizing_scheme=new_scheme_name,
                         size=size_data.size,
                         order=size_data.order,
+                        us_size=size_data.us_size or None,
                     )
                     updated_entries.append(new_entry)
 
             # One statement covers surviving rows and rows just created above, which is what makes
             # "every row of a scheme agrees" true by construction rather than by each branch
             # remembering. It also self-heals any pre-existing drift on the next save.
+            if scheme_values["require_us_size"]:
+                _require_complete_us_sizes(
+                    [
+                        (
+                            size_data.size,
+                            size_data.us_size
+                            if size_data.us_size is not None
+                            else (entry.us_size if entry is not None else None),
+                        )
+                        for entry, size_data in resolved
+                    ]
+                )
+
+            # Guard the invariant rather than trusting a comment: this statement writes one
+            # value to every row of the scheme, so a row-level column here would destroy every
+            # distinct value in it. us_size is exactly such a column.
+            assert set(scheme_values) <= set(SCHEME_LEVEL_FIELDS), (
+                f"scheme-wide UPDATE may only carry scheme-level fields, got {set(scheme_values)}"
+            )
             await SizingScheme.filter(sizing_scheme=new_scheme_name).update(**scheme_values)
             for entry in updated_entries:
                 for field, value in scheme_values.items():
@@ -416,6 +515,7 @@ class SizingService:
             sizing_types=scheme_values["sizing_types"],
             goat_code=scheme_values["goat_code"],
             region_code=scheme_values["region_code"],
+            require_us_size=scheme_values["require_us_size"],
         )
 
     @staticmethod
@@ -501,6 +601,9 @@ class SizingService:
                         "Sizing Types": sizing_types_str,
                         "GOAT Code": entry.goat_code or "",
                         "Region Code": entry.region_code or "",
+                        # The only way to get us_size back out. It is hand-entered and has no
+                        # external source, unlike goat_code which has its TSV.
+                        "US Size": entry.us_size or "",
                     }
                 )
 

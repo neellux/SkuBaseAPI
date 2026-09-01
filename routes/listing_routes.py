@@ -214,7 +214,8 @@ async def get_sizing_schemes(
             """
             SELECT t.sizing_types, ss.sizing_scheme,
                    array_agg(ss.size ORDER BY ss."order") as sizes,
-                   json_agg(json_build_object('id', ss.id::text, 'size', ss.size) ORDER BY ss."order") as size_entries
+                   json_agg(json_build_object('id', ss.id::text, 'size', ss.size,
+                                              'us_size', ss.us_size) ORDER BY ss."order") as size_entries
             FROM listingoptions_types t
             CROSS JOIN listingoptions_sizing_schemes ss
             WHERE t.type = $1
@@ -786,6 +787,27 @@ async def submit_listing(
                 if type_result:
                     sizing_type = type_result[0]["sizing_types"]
 
+            # Before the platform-mapping gate on purpose. Only one 422 fires per submit and
+            # completion auto-re-submits, so raising this one first is what sequences the US size
+            # dialog ahead of the mapping dialog - which then has the US sizes to display.
+            missing_us = await listing_options_service.check_missing_us_sizes(
+                sizing_scheme,
+                child_sizes,
+                size_platforms,
+                platform_settings=platform_settings,
+            )
+            if missing_us:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "type": "unmapped_us_sizes",
+                        "sizing_scheme": missing_us["sizing_scheme"],
+                        "region_code": missing_us["region_code"],
+                        "missing_sizes": missing_us["missing_sizes"],
+                        "platforms_with_missing": missing_us["platforms_with_missing"],
+                    },
+                )
+
             unmapped = await listing_options_service.check_unmapped_sizes(
                 sizing_scheme,
                 child_sizes,
@@ -800,6 +822,11 @@ async def submit_listing(
                         "type": "unmapped_sizes",
                         "sizing_scheme": sizing_scheme,
                         "platforms_with_missing": unmapped,
+                        # Freshest source in the system, and it arrives atomically with the thing
+                        # that opens the dialog. A client-side refetch would race the resubmit.
+                        **await listing_options_service.get_scheme_size_context(
+                            sizing_scheme
+                        ),
                     },
                 )
 

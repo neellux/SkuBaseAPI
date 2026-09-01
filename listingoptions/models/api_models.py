@@ -5,6 +5,10 @@ from datetime import datetime
 import re
 from pydantic import computed_field
 
+# varchar(50) on listingoptions_sizing_schemes.us_size. Legitimate values include '7 1/4' and
+# '30x32', which is why us_size does not reuse the size validator that rejects spaces/slashes.
+MAX_US_SIZE_LENGTH = 50
+
 
 class ColumnDefinition(BaseModel):
 
@@ -371,6 +375,21 @@ class SizingSchemeEntryBase(BaseModel):
         description="A specific size within the scheme (e.g., 'S', 'M', 'L', '42', 'UK 8')",
     )
     order: int = Field(..., description="The display order of this size within its scheme.")
+    # On the base (request) model on purpose: the scheme editor is the authoring surface, so this
+    # has to arrive on the update/create payloads. Deliberately NOT run through
+    # validate_size_content below - that rejects spaces and slashes, and legitimate US sizes
+    # include '7 1/4' and '30x32'.
+    # No max_length on purpose. Pydantic's max_length fires before the service ever runs and
+    # produces a 422, which sendRequest.js renders as the useless "Invalid request". The length
+    # is enforced by _validate_us_sizes in sizing_service, which raises ValueError and so becomes
+    # a 400 naming the offending size. Limit is MAX_US_SIZE_LENGTH (varchar(50) on the column).
+    us_size: Optional[str] = Field(
+        None,
+        description=(
+            "US equivalent of this size, 50 chars or fewer. Omit to leave unchanged; send blank "
+            "to clear it. Per size row, not per scheme."
+        ),
+    )
 
     model_config = {"from_attributes": True}
 
@@ -381,6 +400,25 @@ class SizingSchemeEntryBase(BaseModel):
         if " " in v or "/" in v:
             raise ValueError("Size value cannot contain spaces or forward slashes ('/').")
         return v
+
+    @validator("us_size")
+    def normalize_us_size(cls, v):
+        """Trim only. Blank must stay distinguishable from absent.
+
+        Three states have to survive to the service, because collapsing two of them means an
+        operator can never clear a US size:
+
+          absent/None  the caller is not talking about us_size -> leave the row alone
+          ""           the caller cleared the field -> store NULL
+          a value      store it
+
+        Folding "" into None here would make a cleared field indistinguishable from an omitted
+        one, and the service would preserve the old value forever. The service is what turns ""
+        into NULL, so the column still only ever holds two states on disk.
+        """
+        if v is None:
+            return None
+        return v.strip()
 
 
 class SizingSchemeEntryWithId(SizingSchemeEntryBase):
@@ -444,6 +482,9 @@ class SizingSchemeDetailResponse(BaseModel):
     region_code: Optional[str] = Field(
         None, description="Region this scheme's sizes are expressed in (US, EU, UK, JP)."
     )
+    require_us_size: bool = Field(
+        False, description="Whether this scheme needs a us_size on every size."
+    )
 
 
 class AllSizingSchemesResponse(BaseModel):
@@ -472,10 +513,16 @@ class UpdateSizeOrderRequest(BaseModel):
     # optional - without it an over-long value reaches Tortoise, whose ValidationError is not a
     # ValueError subclass and so returns a 500 with raw ORM text instead of a readable 400.
     goat_code: Optional[str] = Field(
-        None, max_length=100, description="GOAT size chart identifier for this scheme."
+        None, description="GOAT size chart identifier for this scheme."
     )
     region_code: Optional[str] = Field(
-        None, max_length=20, description="Region this scheme's sizes are expressed in."
+        None, description="Region this scheme's sizes are expressed in."
+    )
+    # Optional, not bool: None means "not sent, leave it alone", the same rule the other
+    # scheme-level fields follow. A plain bool defaulting False would silently switch the
+    # flag off on any caller that omitted it.
+    require_us_size: Optional[bool] = Field(
+        None, description="Whether this scheme needs a us_size on every size."
     )
 
     @validator("sizes")
@@ -506,10 +553,13 @@ class FullSizingSchemeCreate(BaseModel):
     # instead, which sizing_routes turns into a 400 whose detail is rendered verbatim.
     # max_length stays here as a backstop; the service length-checks too, for the same reason.
     goat_code: Optional[str] = Field(
-        None, max_length=100, description="GOAT size chart identifier. Required for a new scheme."
+        None, description="GOAT size chart identifier. Required for a new scheme."
     )
     region_code: Optional[str] = Field(
-        None, max_length=20, description="Region for this scheme's sizes. Required for a new scheme."
+        None, description="Region for this scheme's sizes. Required for a new scheme."
+    )
+    require_us_size: Optional[bool] = Field(
+        False, description="Whether this scheme needs a us_size on every size."
     )
 
     @validator("sizes")
