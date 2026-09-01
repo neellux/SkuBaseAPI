@@ -745,46 +745,48 @@ class ShopifyAdmin:
         return (data.get("productCreate") or {}).get("product") or {}
 
     async def create_variants(
-        self, product_gid: str, variants: Sequence[Mapping[str, Any]]
+        self, product_gid: str, variants: Sequence[Mapping[str, Any]],
+        *, strategy: str = "PRESERVE_STANDALONE_VARIANT",
     ) -> list[dict[str, Any]]:
-        """productVariantsBulkCreate on the DEFAULT strategy.
+        """productVariantsBulkCreate. The strategy is the CALLER's decision, per path.
 
-        Used for the initial variant set and, on an additive update, for sizes that are
-        missing. It never removes a variant: one holding live stock must survive a
-        resubmit whose listing no longer lists that size.
+        There is no single safe value, and assuming there was took the create path down
+        for four days on 2026-08-28.
 
-        THAT PROMISE WAS FALSE UNTIL 2026-08-28, and the strategy is why. This passed
-        REMOVE_STANDALONE_VARIANT, which Shopify defines as
+        REMOVE_STANDALONE_VARIANT - "Deletes the existing standalone variant when the
+        product has only a single default ("Default Title") or custom variant."
+        Required on CREATE. _create passes productOptions, so productCreate auto-generates
+        a variant for the FIRST size before we add any. That placeholder carries a real
+        option value, which makes it a *custom* standalone, and it must go or the real
+        variant for that size collides with it as ['variants','0']: The variant 'XS'
+        already exists.
 
-            Deletes the existing standalone variant when the product has only a single
-            default ("Default Title") OR CUSTOM variant.
+        PRESERVE_STANDALONE_VARIANT - keeps it. Required on UPDATE, where a product down to
+        one variant holds a real, stock-bearing size. Passing REMOVE there deleted
+        DNT-MJNS-0035/XL and the 11 units on it.
 
-        "Standalone" means the product's ONLY variant, not the placeholder. So on the
-        update path, a product down to one real variant had it deleted: DNT-MJNS-0035 lost
-        its XL and the 11 units on it when a submission added L, and the dead id then broke
-        the update_variants call that followed.
+        DEFAULT is wrong for CREATE specifically: it removes only the "Default Title"
+        placeholder and explicitly PRESERVES the standalone custom variant - which is the
+        one create always produces.
 
-        DEFAULT is what both paths actually want, so no per-path flag is needed:
-
-            Deletes the standalone default ("Default Title") variant when it's the only
-            variant on the product. PRESERVES THE STANDALONE CUSTOM VARIANT.
-
-        On a create the only variant is Shopify's placeholder, which DEFAULT removes. On an
-        update a real variant survives. PRESERVE_STANDALONE_VARIANT would also stop the
-        deletion but would leave the placeholder behind on creates.
+        The default here is the conservative one: a caller that does not think about it
+        never destroys a variant, it only risks a collision it will see immediately.
         """
         if not variants:
             return []
         data = await self.client.execute(
             """
-            mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-              productVariantsBulkCreate(productId: $productId, variants: $variants) {
+            mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!,
+                     $strategy: ProductVariantsBulkCreateStrategy) {
+              productVariantsBulkCreate(productId: $productId, variants: $variants,
+                                        strategy: $strategy) {
                 productVariants { id sku price compareAtPrice }
                 userErrors { field message }
               }
             }
             """,
-            {"productId": product_gid, "variants": [dict(v) for v in variants]},
+            {"productId": product_gid, "variants": [dict(v) for v in variants],
+             "strategy": strategy},
             operation=f"productVariantsBulkCreate[{self.store_id}]",
             mutation_name="productVariantsBulkCreate",
             is_write=True,

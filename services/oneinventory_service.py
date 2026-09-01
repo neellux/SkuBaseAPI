@@ -653,7 +653,13 @@ class OneInventoryService:
         media = [{"originalSource": u, "mediaContentType": "IMAGE"} for u in images]
 
         created = await admin.create_product(product_input, media)
-        made = await admin.create_variants(created["id"], variants)
+        # REMOVE, not preserve: productCreate above was given productOptions, so Shopify
+        # has already auto-generated a variant for the first size. It is a *custom*
+        # standalone (it carries a real option value), and unless it is removed the real
+        # variant for that size collides with it.
+        made = await admin.create_variants(
+            created["id"], variants, strategy="REMOVE_STANDALONE_VARIANT"
+        )
         return {
             "product_gid": created["id"],
             "handle": created.get("handle"),
@@ -688,7 +694,14 @@ class OneInventoryService:
         present = {v.sku: v.gid for v in (live.variants if live else ()) if v.sku}
 
         missing = [v for sku, v in by_sku.items() if sku not in present]
-        made = await admin.create_variants(gid, missing) if missing else []
+        # PRESERVE on the update path: a product down to a single variant holds a real
+        # size with real stock, and REMOVE would delete it.
+        made = (
+            await admin.create_variants(
+                gid, missing, strategy="PRESERVE_STANDALONE_VARIANT"
+            )
+            if missing else []
+        )
 
         if made:
             # THIS RE-READ IS THE ACTUAL FIX, and it is not defensive - it is required.
