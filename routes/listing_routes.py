@@ -21,6 +21,9 @@ from models.api_models import (
     NextOpenBatchResponse,
     ProductConfirmationData,
     ProductTypeInfoResponse,
+    QueueRowResponse,
+    QueueSummaryResponse,
+    QueueWindowResponse,
     SaveSizeMappingRequest,
     SizingSchemeData,
     SizingSchemesResponse,
@@ -38,6 +41,7 @@ from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
 from services.product_info_service import ProductInfoService
+from services import product_queue_service
 from services.product_resolver import SkuResolutionError, resolve_parent
 from services.oneinventory_service import oneinventory_service
 from services.sellercloud_service import sellercloud_service
@@ -1474,6 +1478,93 @@ async def get_next_open_batch(batch_id: int = Query(..., description="Current ba
         )
 
     return {"batch": batch_with_user_data, "wrapped": wrapped}
+
+
+def _queue_dates(date_from: Optional[str], date_to: Optional[str]):
+    """Parse the queue's date filters, same format and same errors as /listings/batches."""
+    parsed = []
+    for label, raw in (("date_from", date_from), ("date_to", date_to)):
+        if not raw:
+            parsed.append(None)
+            continue
+        try:
+            parsed.append(datetime.strptime(raw, "%Y-%m-%d"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid {label} format. Use YYYY-MM-DD")
+    return parsed[0], parsed[1]
+
+
+@router.get("/queue", response_model=List[QueueRowResponse])
+async def get_product_queue(
+    assigned_to: Optional[List[str]] = Query(
+        None, description="Filter by the assignee of the batch the product sits in"
+    ),
+    priority: Optional[List[str]] = Query(None, description="Filter by batch priority"),
+    date_from: Optional[str] = Query(None, description="Batch created from (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="Batch created to (YYYY-MM-DD)"),
+    search: Optional[str] = Query(None, description="Search by product ID"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+):
+    """Pending products across open batches, most valuable first.
+
+    No status parameter: the queue is pending-in-open-batches by definition. Returns a
+    bare list, like /listings/batches, so the table's useInfiniteList can infer "there
+    is more" from a full page.
+    """
+    date_from_obj, date_to_obj = _queue_dates(date_from, date_to)
+
+    rows = await product_queue_service.get_queue_page(
+        page=page,
+        page_size=page_size,
+        assigned_to=assigned_to,
+        priority=priority,
+        date_from=date_from_obj,
+        date_to=date_to_obj,
+        search=search,
+    )
+    return await add_user_data(data=rows, keys=["assigned_to"], new_keys=["name"])
+
+
+@router.get("/queue/around", response_model=QueueWindowResponse)
+async def get_product_queue_around(
+    listing_id: str = Query(..., description="Listing to centre the window on"),
+    before: int = Query(2, ge=0, le=20, description="Rows before the anchor"),
+    after: int = Query(6, ge=0, le=20, description="Rows after the anchor"),
+):
+    """The window around one listing: the queue strip, the arrows and the position.
+
+    Takes no filters on purpose. Table filters narrow the table only, never the walk.
+
+    A null position means the anchor has left the queue (it was just submitted, or a
+    finished listing was opened to review it) and the rows are the front of the queue
+    instead of a window around it.
+    """
+    rows, position, total = await product_queue_service.get_queue_around(
+        listing_id=listing_id, before=before, after=after
+    )
+    rows = await add_user_data(data=rows, keys=["assigned_to"], new_keys=["name"])
+    return {"rows": rows, "position": position, "total": total}
+
+
+@router.get("/queue/summary", response_model=QueueSummaryResponse)
+async def get_product_queue_summary(
+    assigned_to: Optional[List[str]] = Query(None, description="Filter by batch assignee"),
+    priority: Optional[List[str]] = Query(None, description="Filter by batch priority"),
+    date_from: Optional[str] = Query(None, description="Batch created from (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="Batch created to (YYYY-MM-DD)"),
+    search: Optional[str] = Query(None, description="Search by product ID"),
+):
+    """What the whole queue is worth, under the same filters as /listings/queue."""
+    date_from_obj, date_to_obj = _queue_dates(date_from, date_to)
+
+    return await product_queue_service.get_queue_summary(
+        assigned_to=assigned_to,
+        priority=priority,
+        date_from=date_from_obj,
+        date_to=date_to_obj,
+        search=search,
+    )
 
 
 @router.put("/batch", response_model=BatchListResponse)

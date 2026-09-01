@@ -510,6 +510,85 @@ class NextOpenBatchResponse(BaseModel):
     )
 
 
+class QueueRowResponse(BaseModel):
+    """One product in the global work queue.
+
+    Deliberately lean rather than a ListingResponse, which carries data, ai_response
+    and ebay_categories: twenty of those a page would be absurd for a table that shows
+    a title and a value.
+    """
+
+    listing_id: str = Field(..., description="Listing UUID, the row's identity")
+    product_id: str = Field(..., description="Parent SKU")
+    batch_id: int = Field(..., description="Batch this product sits in")
+    title: Optional[str] = Field(None, description="Listing title from data.title")
+    brand_name: Optional[str] = Field(None, description="Brand from data.brand_name")
+    product_type: Optional[str] = Field(None, description="Type from data.product_type")
+    priority: str = Field(..., description="Priority of the batch this product sits in")
+    assigned_to: Optional[str] = Field(None, description="User ID the batch is assigned to")
+    assigned_to_name: Optional[str] = Field(None, description="Name of the assigned user")
+    value: Optional[Decimal] = Field(
+        None,
+        description=(
+            "Merchandise value snapshot for this product, from batches.product_values. "
+            "Null means the product has no entry there, which is not the same as a "
+            "product genuinely worth 0"
+        ),
+    )
+    qty: Optional[int] = Field(None, description="Physical quantity behind the value")
+    children: Optional[int] = Field(None, description="Active variants asked about")
+    priced: Optional[int] = Field(
+        None,
+        description=(
+            "Variants that came back with a non-zero price. children == 0 means no "
+            "active variants are registered; children > priced means SellerCloud had "
+            "no price rather than no stock"
+        ),
+    )
+    created_at: datetime = Field(..., description="When the listing was created")
+    rank: Optional[int] = Field(
+        None,
+        description=(
+            "Position in the queue. Only set by /listings/queue/around; the table "
+            "renders its own ordinal so the number stays right as the list grows"
+        ),
+    )
+
+
+class QueueWindowResponse(BaseModel):
+
+    rows: List[QueueRowResponse] = Field(
+        default_factory=list, description="The window of queue rows, in queue order"
+    )
+    position: Optional[int] = Field(
+        None,
+        description=(
+            "Rank of the anchor listing, or null when it is no longer in the queue "
+            "(just submitted, or a finished listing opened for review). Null means the "
+            "rows are the front of the queue rather than a window around the anchor"
+        ),
+    )
+    total: int = Field(0, description="Size of the whole queue, not of this window")
+
+
+class QueueSummaryResponse(BaseModel):
+
+    count: int = Field(0, description="Products in the queue under the current filters")
+    total_value: Decimal = Field(
+        Decimal(0),
+        description=(
+            "Sum of the value snapshots. Double-counts a product sitting in two open "
+            "batches, which is a known imprecision in the sum, not in the count"
+        ),
+    )
+    unvalued: int = Field(0, description="Products with no entry in product_values")
+    zero_valued: int = Field(
+        0,
+        description="Products valued at exactly 0. Never summed with unvalued: the two "
+        "have different causes and different fixes",
+    )
+
+
 class BatchFilterOptionsResponse(BaseModel):
 
     users: List[Dict[str, str]] = Field(..., description="Available users with id and name")
