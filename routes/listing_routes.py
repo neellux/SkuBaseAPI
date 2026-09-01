@@ -807,6 +807,13 @@ async def submit_listing(
         ):
             size_platforms = [p for p in size_platforms if p != "ebay"]
         if sizing_scheme and child_sizes and size_platforms:
+            # Scheme order, not the hash order the set() above produced. Both gates below
+            # preserve the order they are handed, and both feed a dialog that reads top to
+            # bottom. Done once here rather than in each gate so the two dialogs cannot
+            # disagree about the order of the same sizes.
+            child_sizes = await listing_options_service.order_sizes_by_scheme(
+                sizing_scheme, child_sizes
+            )
             sizing_type = None
             if product_type:
                 conn = Tortoise.get_connection("default")

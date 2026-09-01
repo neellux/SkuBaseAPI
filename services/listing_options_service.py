@@ -406,6 +406,29 @@ class ListingOptionsService:
             "brand_excluded": brand_excluded,
         }
 
+    async def order_sizes_by_scheme(self, sizing_scheme: str, sizes: list[str]) -> list[str]:
+        """`sizes` in the scheme's own order.
+
+        The submit gate builds its size list with `set()`, so what reaches the two checks below
+        is in hash order. Both of them preserve the order they are given and both feed a dialog
+        that lists sizes top to bottom, so an EU footwear scheme the editor shows as 39, 40, 41
+        arrived at the operator as 43, 39, 44.
+
+        A size with no row in the scheme keeps its place at the end rather than being dropped.
+        Both gates compute their missing list from the INPUT precisely so an unknown child size
+        stays visible, and quietly losing one here would undo that.
+        """
+        if not sizes:
+            return []
+        conn = connections.get("default")
+        rows = await conn.execute_query_dict(
+            'SELECT size, "order" FROM listingoptions_sizing_schemes '
+            "WHERE sizing_scheme = $1 AND size = ANY($2)",
+            [sizing_scheme, sizes],
+        )
+        order = {r["size"]: r["order"] for r in rows}
+        return sorted(sizes, key=lambda s: (order.get(s) is None, order.get(s) or 0, s))
+
     # us_size is scheme-and-size level, never per platform, so this is a sibling of
     # check_unmapped_sizes rather than an extension of it: the two raise different 422 types
     # consumed by different dialogs, and one function returning a union of both payloads would be
