@@ -503,13 +503,16 @@ class ListingOptionsService:
         """
         conn = connections.get("default")
         rows = await conn.execute_query_dict(
-            "SELECT size, us_size, region_code FROM listingoptions_sizing_schemes "
-            "WHERE sizing_scheme = $1",
+            "SELECT size, us_size, region_code, require_us_size "
+            "FROM listingoptions_sizing_schemes WHERE sizing_scheme = $1",
             [sizing_scheme],
         )
         return {
             "us_sizes": {r["size"]: r["us_size"] for r in rows if r["us_size"]},
             "region_code": rows[0]["region_code"] if rows else None,
+            # Paired with each entry's require_us_size, this decides whether the mapping grid is
+            # editable: both on means the US size is the value being sent.
+            "scheme_requires_us_size": bool(rows[0]["require_us_size"]) if rows else False,
         }
 
     async def check_unmapped_sizes(
@@ -555,6 +558,10 @@ class ListingOptionsService:
                         "platform_name": (
                             platform_info[0]["name"] if platform_info else platform_id
                         ),
+                        # Paired with the scheme's flag, this decides whether the mapping grid
+                        # for THIS platform is editable: both on means the US size is the value
+                        # being sent, so there is nothing to hand-map.
+                        "require_us_size": bool(settings.get("require_us_size")),
                         "missing_sizes": missing,
                     }
                 )

@@ -519,6 +519,67 @@ class SizingService:
         )
 
     @staticmethod
+    async def save_us_sizes(entries: list) -> dict:
+        """Fill in us_size for specific size rows, from the in-listing US size dialog.
+
+        FILL-ONLY: the UPDATE carries `AND us_size IS NULL`. This is reachable with the `global`
+        permission - every authenticated user - while every other write to this table needs
+        edit_sizing_schemes. Fill-only is what bounds that: a lister can fill a gap blocking their
+        submission but cannot overwrite a value someone curated. It also makes the concurrent case
+        fail safe - two listers on the same scheme no longer silently overwrite each other.
+
+        Keyed on the row id, not (scheme, size): a concurrent scheme rename would make a
+        name-keyed UPDATE match nothing and report success anyway.
+
+        Returns the rows actually written. An UPDATE matching nothing is not an error in Postgres,
+        so without a count the dialog would report success, re-submit, get the identical 422, and
+        loop with no error shown.
+        """
+        if not entries:
+            raise ValueError("No US sizes supplied.")
+
+        ids, values, seen = [], [], set()
+        for e in entries:
+            key = str(e.id)
+            if key in seen:
+                raise ValueError(f"Duplicate size id in request: {key}")
+            seen.add(key)
+            us_size = _blank_to_none(e.us_size)
+            if not us_size:
+                # Blank cannot mean "clear" here: this endpoint fills gaps, and the dialog only
+                # ever asks about sizes that have none. Clearing stays in the scheme editor.
+                raise ValueError(f"US size for size id {key} cannot be blank.")
+            if len(us_size) > MAX_US_SIZE_LENGTH:
+                raise ValueError(
+                    f"US size '{us_size}' must be {MAX_US_SIZE_LENGTH} characters or fewer."
+                )
+            ids.append(e.id)
+            values.append(us_size)
+
+        conn = Tortoise.get_connection("default")
+        # One statement: atomic without a transaction block, one round trip instead of N, and it
+        # returns exactly the rows that changed.
+        written = await conn.execute_query_dict(
+            """
+            UPDATE listingoptions_sizing_schemes AS ss
+            SET us_size = v.us_size, updated_at = NOW()
+            FROM unnest($1::uuid[], $2::text[]) AS v(id, us_size)
+            WHERE ss.id = v.id AND ss.us_size IS NULL
+            RETURNING ss.id, ss.size, ss.us_size
+            """,
+            [ids, values],
+        )
+        asyncio.create_task(spreadsheet_service.trigger_spreadsheet_update("sizes"))
+        return {
+            "requested": len(ids),
+            "written": len(written),
+            "rows": [
+                {"id": str(r["id"]), "size": r["size"], "us_size": r["us_size"]}
+                for r in written
+            ],
+        }
+
+    @staticmethod
     async def delete_size_from_scheme(scheme_name: str, size_value: str) -> bool:
         deleted_count = await SizingScheme.filter(
             sizing_scheme=scheme_name, size=size_value

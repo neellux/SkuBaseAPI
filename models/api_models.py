@@ -266,6 +266,26 @@ class SubmitListingRequest(BaseModel):
     )
 
 
+class UsSizeEntry(BaseModel):
+
+    id: UUID = Field(..., description="UUID of the sizing_schemes size row")
+    us_size: str = Field(..., description="US equivalent of that size")
+
+
+class SaveUsSizesRequest(BaseModel):
+    """Fill in us_size for specific size rows, from the in-listing US size dialog.
+
+    Keyed on the row id rather than (scheme, size), matching SaveSizeMappingRequest. No
+    max_length on us_size on purpose - Pydantic's would fire first and produce a 422, which
+    sendRequest.js renders as the useless "Invalid request". SizingService length-checks and
+    raises ValueError, which the route turns into a 400 naming the offending value.
+    """
+
+    us_sizes: List[UsSizeEntry] = Field(
+        ..., min_length=1, description="Size rows to fill in. Fill-only; never overwrites."
+    )
+
+
 class SaveSizeMappingRequest(BaseModel):
 
     sizing_scheme_entry_id: str = Field(..., description="UUID of the sizing_schemes entry")
@@ -645,6 +665,12 @@ class SizingSchemeData(BaseModel):
 
     sizing_scheme: str = Field(..., description="Sizing scheme name")
     sizes: List[str] = Field(..., description="Available sizes in order")
+    # Drives whether the platform size-mapping surfaces are editable: when this and the
+    # platform's require_us_size are both on, the US size IS the value, so hand-mapping is
+    # meaningless and the grid goes read-only.
+    require_us_size: bool = Field(
+        False, description="Whether this scheme requires a us_size on every size."
+    )
     size_entries: Optional[List[SizeEntry]] = Field(
         None, description="Size entries with IDs for mapping lookups"
     )

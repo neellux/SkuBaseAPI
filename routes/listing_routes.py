@@ -25,6 +25,7 @@ from models.api_models import (
     QueueSummaryResponse,
     QueueWindowResponse,
     SaveSizeMappingRequest,
+    SaveUsSizesRequest,
     SizingSchemeData,
     SizingSchemesResponse,
     SubmitListingRequest,
@@ -217,6 +218,7 @@ async def get_sizing_schemes(
         result = await conn.execute_query_dict(
             """
             SELECT t.sizing_types, ss.sizing_scheme,
+                   bool_or(ss.require_us_size) as require_us_size,
                    array_agg(ss.size ORDER BY ss."order") as sizes,
                    json_agg(json_build_object('id', ss.id::text, 'size', ss.size,
                                               'us_size', ss.us_size) ORDER BY ss."order") as size_entries
@@ -236,6 +238,7 @@ async def get_sizing_schemes(
             SizingSchemeData(
                 sizing_scheme=row["sizing_scheme"],
                 sizes=row["sizes"],
+                require_us_size=row["require_us_size"],
                 size_entries=(
                     orjson.loads(row["size_entries"])
                     if isinstance(row.get("size_entries"), str)
@@ -262,6 +265,29 @@ async def get_platform_size_records(
         return {"sizes": records}
     except Exception as e:
         logger.error(f"Failed to fetch platform size records: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post("/save_us_sizes")
+async def save_us_sizes(body: SaveUsSizesRequest):
+    """Fill in US sizes for size rows that have none.
+
+    `global` permission, matching /listings/save_size_mapping: a lister hits this from the submit
+    flow, and requiring edit_sizing_schemes would hard-block them - unable to submit and unable to
+    fix the thing blocking them. Fill-only in the service bounds that permission.
+    """
+    try:
+        result = await SizingService.save_us_sizes(body.us_sizes)
+        if result["written"] < result["requested"]:
+            logger.info(
+                "save_us_sizes: %s of %s rows written (rest already set or missing)",
+                result["written"], result["requested"],
+            )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to save US sizes: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
