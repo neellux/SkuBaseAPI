@@ -99,19 +99,16 @@ _EXPORTS = {
                 cp.parent_sku,
                 cp.sku,
                 cp.size,
-                cp.is_primary,
-                cu.upc AS primary_upc
+                cp.is_primary
             FROM child_products cp
-            LEFT JOIN child_upcs cu
-                ON cu.child_sku = cp.sku AND cu.is_primary_upc = TRUE
             WHERE (cp.is_primary = TRUE AND cp.is_active = TRUE)
                OR EXISTS (
                     SELECT 1 FROM secondary_skus s WHERE s.secondary_sku = cp.sku
                   )
             ORDER BY cp.parent_sku, cp.is_primary DESC, cp.sku
         """,
-        "raw_columns": ["parent_sku", "sku", "primary_upc", "is_primary"],
-        "display_columns": ["Parent SKU", "SKU", "Primary UPC", "Is Primary"],
+        "raw_columns": ["sku", "parent_sku", "is_primary"],
+        "display_columns": ["SKU", "Parent SKU", "Is Primary"],
         "filename": "parent_skus.csv",
         "key_tail": lambda r: (0 if r["is_primary"] else 1, r["sku"]),
     },
@@ -156,11 +153,9 @@ async def export_public(
     """Export product tables as CSV (publicly accessible).
 
     Supported types:
-    - 'parent_skus': each row is a parent SKU mapped to one of its child SKUs
-      and that child's primary UPC. Covers active primary children plus the
-      secondary children tracked in the secondary_skus matview, with an
-      Is Primary column telling them apart. Secondaries have no UPC, because
-      merging moves it onto the primary they were reassigned into.
+    - 'parent_skus': each row is a child SKU mapped to its parent SKU. Covers
+      active primary children plus the secondary children tracked in the
+      secondary_skus matview, with an Is Primary column telling them apart.
     - 'product_info': every child SKU in the internal catalog (active and
       inactive) joined to its parent's product info, with columns SKU, Parent
       SKU, Title, Style Name, Brand, Type, General Type, Size, Sizing Scheme.

@@ -684,11 +684,8 @@ async def export_products(
                     cp.parent_sku,
                     cp.sku,
                     cp.size,
-                    cp.is_primary,
-                    cu.upc AS primary_upc
+                    cp.is_primary
                 FROM child_products cp
-                LEFT JOIN child_upcs cu
-                    ON cu.child_sku = cp.sku AND cu.is_primary_upc = TRUE
                 WHERE (cp.is_primary = TRUE AND cp.is_active = TRUE)
                    OR EXISTS (
                         SELECT 1 FROM secondary_skus s WHERE s.secondary_sku = cp.sku
@@ -699,10 +696,8 @@ async def export_products(
             await ProductService.apply_size_sort(
                 results, key_tail=lambda r: (0 if r["is_primary"] else 1, r["sku"])
             )
-            df = pd.DataFrame(
-                results, columns=["parent_sku", "sku", "primary_upc", "is_primary"]
-            )
-            df.columns = ["Parent SKU", "SKU", "Primary UPC", "Is Primary"]
+            df = pd.DataFrame(results, columns=["sku", "parent_sku", "is_primary"])
+            df.columns = ["SKU", "Parent SKU", "Is Primary"]
             filename = "parent_skus_export.csv"
         elif type == "secondary_skus":
             query = """
