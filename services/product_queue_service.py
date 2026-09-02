@@ -1,8 +1,9 @@
 """The global work queue: pending products across open batches, most valuable first.
 
 The batch list answers "which batch next". This answers "which product next", across
-every open batch at once, ordered by the merchandise value already computed at batch
-creation. Nothing here writes.
+every open batch at once, ordered by the merchandise value on the batch - taken at
+creation and refreshed nightly for products that are still pending
+(batch_value_service.BatchValueRefreshPoller). Nothing here writes.
 
 Value is read from batches.product_values, the per-parent-SKU breakdown that
 batch_value_service.aggregate_values stores:
@@ -33,15 +34,23 @@ from services.product_resolver import resolve_parents
 logger = logging.getLogger(__name__)
 
 
-# One definition of "the queue", shared by every query below. A second copy of this
-# predicate anywhere is a bug waiting to happen: what counts as pending work has to
-# mean the same thing to the table, the strip and the arrows.
-#
+# The one definition of pending work, shared by every query below and by the nightly
+# value refresh in batch_value_service. A second copy of this predicate anywhere is a bug
+# waiting to happen: what counts as pending work has to mean the same thing to the table,
+# the strip, the arrows and the job that re-prices it.
+PENDING_ROWS = """
+FROM listings l
+JOIN batches b ON b.id = l.batch_id
+WHERE NOT l.submitted
+  AND b.status = ANY($1::text[])
+"""
+
+
 # created_at is the LISTING's, because it is both the tie-break and the age the row
 # shows. The date-range filter deliberately reads the BATCH's instead (see
 # build_filters), so that switching between the two views keeps a date filter meaning
 # what it meant on the batch cards.
-QUEUE_SELECT = """
+QUEUE_SELECT = f"""
 SELECT
   l.id                      AS listing_id,
   l.product_id,
@@ -63,11 +72,7 @@ SELECT
   (b.product_values -> l.product_id ->> 'qty')::int      AS qty,
   (b.product_values -> l.product_id ->> 'children')::int AS children,
   (b.product_values -> l.product_id ->> 'priced')::int   AS priced
-FROM listings l
-JOIN batches b ON b.id = l.batch_id
-WHERE NOT l.submitted
-  AND b.status = ANY($1::text[])
-"""
+{PENDING_ROWS}"""
 
 # The single source of truth for order. The page query and the rank window both read
 # it, the way BATCH_SORTS and _sorts_after share one tuple in batch_service: an
@@ -333,3 +338,62 @@ FROM queue
         "unvalued": 0,
         "zero_valued": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# The nightly value refresh's worklist
+#
+# Lives here rather than in batch_value_service so that the products re-priced every
+# night and the products this queue shows are selected by the same PENDING_ROWS, not by
+# two predicates that agree today.
+# ---------------------------------------------------------------------------
+
+REFRESH_TARGETS = f"""
+SELECT l.batch_id,
+       b.value_computed_at,
+       array_agg(DISTINCT l.product_id) AS parents
+{PENDING_ROWS}
+  AND l.product_id IS NOT NULL
+GROUP BY l.batch_id, b.value_computed_at
+ORDER BY l.batch_id
+"""
+
+
+async def get_refresh_targets() -> List[Dict[str, Any]]:
+    """Open batches holding pending work, each with its distinct pending parent SKUs.
+
+    A parent is pending if ANY of its listings in that batch is unsubmitted, which is what
+    array_agg over the filtered rows gives - the right answer for the few batches holding
+    duplicate listings of one parent.
+    """
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(REFRESH_TARGETS, [list(OPEN_BATCH_STATUSES)])
+    return [
+        {
+            "batch_id": row["batch_id"],
+            "value_computed_at": row["value_computed_at"],
+            "parents": list(row["parents"] or []),
+        }
+        for row in rows
+    ]
+
+
+async def get_all_parents(batch_ids: List[int]) -> Dict[int, List[str]]:
+    """Every parent SKU on each batch, submitted or not.
+
+    Two callers, neither of them the queue: a batch whose creation snapshot failed has
+    nothing frozen worth preserving and must be valued whole, and the refresher needs to
+    know which product_values entries no longer belong to the batch at all. A plain GROUP
+    BY over listings - no join, no status filter - because the caller has already chosen
+    the batches.
+    """
+    if not batch_ids:
+        return {}
+    conn = connections.get("default")
+    rows = await conn.execute_query_dict(
+        "SELECT batch_id, array_agg(DISTINCT product_id) AS parents "
+        "FROM listings WHERE batch_id = ANY($1::int[]) AND product_id IS NOT NULL "
+        "GROUP BY batch_id",
+        [list(batch_ids)],
+    )
+    return {row["batch_id"]: list(row["parents"] or []) for row in rows}

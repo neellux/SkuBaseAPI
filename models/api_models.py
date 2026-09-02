@@ -460,11 +460,12 @@ class BatchResponse(BaseModel):
     progress_percentage: float = Field(..., description="Completion percentage")
     total_value: Decimal = Field(
         Decimal(0),
-        description="Merchandise value snapshot at creation (physical qty x SitePrice)",
+        description="Merchandise value (physical qty x SitePrice): taken at creation, "
+        "then refreshed nightly for products not yet submitted",
     )
     value_computed_at: Optional[datetime] = Field(
         None,
-        description="When the value snapshot was taken; null means it has not been computed, "
+        description="When the value was last computed; null means it has not been computed, "
         "which is not the same as a batch genuinely worth 0",
     )
     product_values: Dict[str, Any] = Field(
@@ -495,11 +496,12 @@ class BatchListResponse(BaseModel):
     progress_percentage: float = Field(..., description="Completion percentage")
     total_value: Decimal = Field(
         Decimal(0),
-        description="Merchandise value snapshot at creation (physical qty x SitePrice)",
+        description="Merchandise value (physical qty x SitePrice): taken at creation, "
+        "then refreshed nightly for products not yet submitted",
     )
     value_computed_at: Optional[datetime] = Field(
         None,
-        description="When the value snapshot was taken; null means it has not been computed, "
+        description="When the value was last computed; null means it has not been computed, "
         "which is not the same as a batch genuinely worth 0",
     )
     product_values: Dict[str, Any] = Field(

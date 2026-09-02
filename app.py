@@ -36,6 +36,7 @@ from services.sellercloud_sync_poller import sellercloud_sync_poller
 from services.gallery_image_sync_poller import gallery_image_sync_poller
 from services.ai_search_poller import ai_search_poller
 from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
+from services.batch_value_service import batch_value_refresh_poller
 from services.ebay_poller import ebay_poller
 from services.spo_poller import spo_poller
 from services.grailed_poller import grailed_poller
@@ -160,6 +161,7 @@ async def startup_event():
     await secondary_inventory_transfer_poller.start()
     await daily_image_import_poller.start()
     await daily_sellercloud_sync_poller.start()
+    await batch_value_refresh_poller.start()
     # Both default enabled=false. They act on live Shopify storefronts and the source
     # store still lacks write_products, so nothing starts writing on deploy.
     await internal_platform_dest_poller.start()
@@ -172,6 +174,7 @@ async def shutdown_event():
 
     await internal_platform_source_poller.stop()
     await internal_platform_dest_poller.stop()
+    await batch_value_refresh_poller.stop()
     await daily_sellercloud_sync_poller.stop()
     await daily_image_import_poller.stop()
     await secondary_inventory_transfer_poller.stop()

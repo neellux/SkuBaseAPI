@@ -287,7 +287,12 @@ class BatchService:
 
     @staticmethod
     async def _snapshot_value(batch: Batch, parent_skus: List[str]) -> None:
-        """Freeze the batch's merchandise value. Never raises.
+        """Take the batch's opening merchandise value. Never raises.
+
+        The creation half of the story: from here on
+        batch_value_service.BatchValueRefreshPoller re-reads this nightly for whichever of
+        the batch's products are still unsubmitted, so this snapshot is what the batch is
+        worth on day one, not for good.
 
         Called AFTER create_batch's transaction commits, not inside it. The photography
         service posts to /api/create_batch with no pre-validation, so a SellerCloud outage
@@ -305,7 +310,7 @@ class BatchService:
         except Exception:  # noqa: BLE001
             logger.exception(
                 f"Batch {batch.id} created, but its value snapshot failed; left uncomputed "
-                f"for backfill_batch_values.py to pick up"
+                f"for the nightly refresh (or backfill_batch_values.py) to pick up"
             )
             return
 
@@ -528,7 +533,12 @@ class BatchService:
             for field, value in update_dict.items():
                 setattr(batch, field, value)
 
-            await batch.save()
+            # Only the fields the request actually set. A bare save() writes back every
+            # column from an instance read moments earlier, which means editing a comment
+            # can revert the trigger's counts and undo the night's value refresh
+            # (batch_value_service.BatchValueRefreshPoller) with numbers that were already
+            # stale when this request started.
+            await batch.save(update_fields=list(update_dict) + ["updated_at"])
             logger.info(f"Updated batch {batch_id}")
 
             return await BatchService._to_list_response(batch)
