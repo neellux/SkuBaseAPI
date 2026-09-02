@@ -769,26 +769,8 @@ def _batch_ids(submissions: list[ListingSubmission]) -> list[int]:
 
 
 def _revise_filename(import_id: int, batch_ids: list[int]) -> str:
-    """Name the download after the batch, because that is what the operator is working on.
-
-    The import id alone said nothing an operator could match to the batch page they came
-    from. Sent on Content-Disposition and read back by ImportDetailDialog, so the name lives
-    on the one side that knows what went into the file.
-
-    Truncated past three batches rather than listing them all, so a flush that swept a dozen
-    batches cannot produce a filename a file manager refuses to write.
-    """
-    if not batch_ids:
-        return f"ebay_image_revise_import_{import_id}.csv"
-    if len(batch_ids) == 1:
-        return f"ebay_image_revise_batch_{batch_ids[0]}_import_{import_id}.csv"
-    if len(batch_ids) <= 3:
-        joined = "-".join(str(b) for b in batch_ids)
-        return f"ebay_image_revise_batches_{joined}_import_{import_id}.csv"
-    return (
-        f"ebay_image_revise_batches_{batch_ids[0]}-and-{len(batch_ids) - 1}-more"
-        f"_import_{import_id}.csv"
-    )
+    """Return the standard filename used by the eBay image upload download."""
+    return f"ebay_images_import_{import_id}.csv"
 
 
 @router.post("/imports/image_revise_template")
