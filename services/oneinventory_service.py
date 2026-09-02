@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 import httpx
@@ -51,9 +52,20 @@ from services.template_render import render_template, resolve_field_template
 
 logger = logging.getLogger(__name__)
 
+
+def _iso_to_epoch(value: str | None) -> float:
+    """Shopify timestamps are RFC3339 with a Z; datetime wants +00:00."""
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
 PLATFORM_ID = "1nventory"
 STORE = "high-end-merchandise"
 GCS_ROOT = "https://storage.googleapis.com/lux_products"
+GCS_LIST_API = "https://storage.googleapis.com/storage/v1/b/lux_products/o"
 
 # Present on every product, from the AppScript's DEFAULT_TAGS.
 DEFAULT_TAGS: tuple[str, ...] = ("couponcollection", "channelenable-all", "shop375")
@@ -282,6 +294,102 @@ class OneInventoryService:
 
         results = await asyncio.gather(*(probe(i) for i in range(1, limit + 1)))
         return [url for url in results if url]
+
+    async def _gallery_generations(self, parent_sku: str,
+                                   limit: int = 8) -> dict[str, str]:
+        """{url: generation} for the same slots _gallery_images resolves.
+
+        One JSON-API list call instead of up to sixteen HEADs, and it returns the
+        generation, which is what makes cache busting and staleness possible at all.
+        """
+        params = {"prefix": f"{parent_sku}/", "fields": "items(name,generation)",
+                  "maxResults": "200"}
+        async with httpx.AsyncClient(timeout=20) as client:
+            try:
+                r = await client.get(GCS_LIST_API, params=params)
+                r.raise_for_status()
+            except httpx.HTTPError:
+                return {}
+        blobs = {i["name"]: i["generation"] for i in (r.json().get("items") or [])}
+        out: dict[str, str] = {}
+        for index in range(1, limit + 1):
+            for suffix in ("fullsize", "1500"):
+                name = f"{parent_sku}/{index}_{suffix}.jpg"
+                if name in blobs:
+                    out[f"{GCS_ROOT}/{name}"] = blobs[name]
+                    break
+        return out
+
+    async def _sync_media(self, admin: ShopifyAdmin, gid: str,
+                          parent_sku: str) -> str:
+        """Bring a product's Shopify images up to what GCS holds. Never raises.
+
+        Shopify copies image bytes once and never re-reads the source, so an edited photo
+        reaches a product already on the store ONLY through a replace. productUpdate has
+        no media field, which is why a resubmit used to leave the old pictures in place -
+        and why ADS-MSNK-2038 sat live with mediaCount 0 while GCS held nine photos.
+
+        ORDER IS THE SAFETY ARGUMENT: add, wait for READY, then delete. A product is never
+        left with no images, and if Shopify fails to fetch a replacement the originals are
+        still attached. The reverse order blanks a live product on any failure.
+
+        Cache busting is not optional. The URL is the same path Shopify already fetched,
+        so ?v={generation} is what makes it treat the source as new rather than reusing the
+        bytes it holds.
+
+        Never raises: the product itself is already correct at this point, and losing a
+        submission over a picture is the wrong trade. Returns a short status for the step
+        log.
+        """
+        gallery = await self._gallery_generations(parent_sku)
+        if not gallery:
+            return "no_images_in_gcs"
+
+        current = await admin.product_media(gid)
+        wanted = [f"{u}?v={g}" for u, g in gallery.items()]
+
+        # Nothing to compare against - the product has no pictures at all.
+        if not current:
+            made = await admin.create_media(gid, wanted)
+            return f"added {len(made)} (product had none)"
+
+        # A replace is warranted when the set size changed or GCS has moved on. Media
+        # createdAt is when Shopify fetched the bytes; a generation minted after that is
+        # a photo the storefront has never seen.
+        newest_gcs = max(int(g) for g in gallery.values()) / 1_000_000
+        oldest_fetch = min(
+            _iso_to_epoch(n.get("createdAt")) for n in current
+            if n.get("createdAt")
+        ) if any(n.get("createdAt") for n in current) else 0.0
+        if len(current) == len(wanted) and newest_gcs <= oldest_fetch:
+            return "up_to_date"
+
+        made = await admin.create_media(gid, wanted)
+        new_ids = {m["id"] for m in made}
+        if not new_ids:
+            return "replace_refused"
+        ok = await self._await_media_ready(admin, gid, new_ids)
+        if not ok:
+            return "new_media_not_ready; originals kept"
+        removed = await admin.delete_media(gid, [n["id"] for n in current])
+        return f"replaced {len(new_ids)} (removed {removed})"
+
+    @staticmethod
+    async def _await_media_ready(admin: ShopifyAdmin, gid: str,
+                                 new_ids: set[str], timeout_s: int = 120) -> bool:
+        """True once every new media reports READY. False on FAILED or timeout."""
+        waited = 0
+        while waited < timeout_s:
+            nodes = await admin.product_media(gid)
+            mine = [n for n in nodes if n["id"] in new_ids]
+            statuses = {n.get("status") for n in mine}
+            if "FAILED" in statuses:
+                return False
+            if len(mine) == len(new_ids) and statuses <= {"READY"}:
+                return True
+            await asyncio.sleep(3)
+            waited += 3
+        return False
 
     # -- assembly ----------------------------------------------------------
 
@@ -573,7 +681,7 @@ class OneInventoryService:
             stage = "update"
             try:
                 result = await self._update(
-                    admin, existing, product_fields, tags, variants
+                    admin, existing, product_fields, tags, variants, product_id
                 )
             except ShopifySemanticError as exc:
                 if not self._is_missing_product(exc):
@@ -676,12 +784,18 @@ class OneInventoryService:
         product_fields: Mapping[str, Any],
         tags: Sequence[str],
         variants: Sequence[Mapping[str, Any]],
+        parent_sku: str,
     ) -> dict[str, Any]:
         """Additive. Adds missing variants, refreshes descriptive fields, removes nothing."""
         gid = existing["id"]
 
         await admin.update_product_details(gid, product_fields)
         await admin.add_tags(gid, tags)
+
+        # Pictures too. Everything else on this path is additive-and-descriptive, and
+        # images were the one field a resubmit could never fix.
+        media_status = await self._sync_media(admin, gid, parent_sku)
+        logger.info("1inventory: %s media sync -> %s", parent_sku, media_status)
 
         by_sku = {v["inventoryItem"]["sku"]: v for v in variants}
 

@@ -734,6 +734,12 @@ class ShopifyAdmin:
               productCreate(product: $product, media: $media) {
                 product { id handle title status }
                 userErrors { field message }
+                # Requested because a media-only failure used to pass SILENTLY: the
+                # product was created with no images and nothing reported it.
+                # ADS-MSNK-2038 sat live on 1nventory with mediaCount 0 while GCS held
+                # nine edited photos. shopify_client raises on whichever error array is
+                # populated, so asking for this is what makes the failure visible.
+                mediaUserErrors { field message }
               }
             }
             """,
@@ -915,6 +921,71 @@ class ShopifyAdmin:
         )
 
     # -- delete (BLOCKED on Phase 5; irreversible) -------------------------
+
+    # -- media ---------------------------------------------------------------
+    #
+    # Shopify copies an image's BYTES at attach time and never re-reads the source URL,
+    # exactly like SellerCloud. So an edited photo reaches a product already on the store
+    # only if something replaces the media; productUpdate cannot do it and neither can
+    # re-running productCreate.
+
+    async def product_media(self, gid: str) -> list[dict[str, Any]]:
+        """Current media on a product, newest-relevant fields only."""
+        data = await self.client.execute(
+            """
+            query($id: ID!) {
+              product(id: $id) {
+                media(first: 50) {
+                  nodes {
+                    id status
+                    ... on MediaImage { createdAt image { url width height } }
+                  }
+                }
+              }
+            }
+            """,
+            {"id": gid}, operation=f"product.media[{self.store_id}]",
+        )
+        return ((data.get("product") or {}).get("media") or {}).get("nodes") or []
+
+    async def create_media(self, gid: str, sources: Sequence[str]) -> list[dict[str, Any]]:
+        """productCreateMedia. Shopify fetches each URL asynchronously."""
+        if not sources:
+            return []
+        data = await self.client.execute(
+            """
+            mutation($productId: ID!, $media: [CreateMediaInput!]!) {
+              productCreateMedia(productId: $productId, media: $media) {
+                media { id status }
+                mediaUserErrors { field message }
+              }
+            }
+            """,
+            {"productId": gid,
+             "media": [{"originalSource": u, "mediaContentType": "IMAGE"} for u in sources]},
+            operation=f"productCreateMedia[{self.store_id}]",
+            mutation_name="productCreateMedia", is_write=True,
+        )
+        return (data.get("productCreateMedia") or {}).get("media") or []
+
+    async def delete_media(self, gid: str, media_ids: Sequence[str]) -> int:
+        """productDeleteMedia. Call ONLY after the replacements are READY."""
+        if not media_ids:
+            return 0
+        data = await self.client.execute(
+            """
+            mutation($productId: ID!, $mediaIds: [ID!]!) {
+              productDeleteMedia(productId: $productId, mediaIds: $mediaIds) {
+                deletedMediaIds
+                mediaUserErrors { field message }
+              }
+            }
+            """,
+            {"productId": gid, "mediaIds": list(media_ids)},
+            operation=f"productDeleteMedia[{self.store_id}]",
+            mutation_name="productDeleteMedia", is_write=True,
+        )
+        return len((data.get("productDeleteMedia") or {}).get("deletedMediaIds") or [])
 
     async def delete_product(self, gid: str) -> bool:
         """productDelete. IRREVERSIBLE - no undelete API exists.

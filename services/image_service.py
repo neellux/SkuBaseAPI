@@ -33,6 +33,23 @@ SERVICE_ACCOUNT_FILE = config.get("gcs_service_account", "service-account-2.json
 # "max-age=31536000, immutable" promised the opposite and was why an edited image kept
 # showing the old photo for a year, in the UI and on every platform that fetched the URL.
 GCS_CACHE_CONTROL = "public, no-cache"
+
+# Extension -> MIME. Both the upload and the COPY path must set this explicitly.
+_CONTENT_TYPES = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "png": "image/png", "webp": "image/webp",
+}
+
+
+def content_type_for(blob_path: str) -> str:
+    """MIME type for a blob path, defaulting to JPEG.
+
+    Not cosmetic. A blob served as application/octet-stream is refused outright by
+    Shopify - "UNSUPPORTED_IMAGE_FILE_TYPE ... is not a recognized format" - even when the
+    bytes are a perfectly valid JPEG, so a wrong value here silently costs a product its
+    pictures on every storefront that fetches by URL.
+    """
+    return _CONTENT_TYPES.get(blob_path.rsplit(".", 1)[-1].lower(), "image/jpeg")
 MAX_PRODUCT_IMAGES = 8
 MAX_WASHTAG_IMAGES = 3
 MAX_CONCURRENT_RESIZE = 3
@@ -1391,15 +1408,10 @@ class ImageService:
                 else:
                     blob_path = f"{product_id}/washtag_{file_index}.{extension}"
 
-                content_type_map = {
-                    "jpg": "image/jpeg",
-                    "png": "image/png",
-                    "webp": "image/webp",
-                }
-                content_type = content_type_map.get(extension, "image/jpeg")
-
                 upload_tasks.append(
-                    self._upload_blob(blob_path, img_data, content_type, storage_class)
+                    self._upload_blob(
+                        blob_path, img_data, content_type_for(blob_path), storage_class
+                    )
                 )
                 upload_targets.append(blob_path)
             upload_results = await asyncio.gather(*upload_tasks)
@@ -1461,6 +1473,13 @@ class ImageService:
         metadata = {
             "cache-control": GCS_CACHE_CONTROL,
             "content-disposition": "inline",
+            # REQUIRED. Supplying `metadata` to rewriteTo REPLACES the source object's
+            # metadata rather than merging into it, so omitting content-type does not
+            # inherit image/jpeg - it falls back to the bucket default,
+            # application/octet-stream. Shopify then rejects the image as an unsupported
+            # file type: ADS-MSNK-2038 went live with zero pictures because every blob it
+            # copied carried the wrong MIME.
+            "content-type": content_type_for(dest_path),
         }
         if storage_class:
             metadata["storage-class"] = storage_class
