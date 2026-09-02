@@ -3913,7 +3913,8 @@ class DatabaseService:
                         ss.sizing_types,
                         ss.id,
                         ss.size,
-                        ss."order"
+                        ss."order",
+                        ss.us_size
                     FROM "{DatabaseService._table("sizing_schemes")}" ss
                     WHERE EXISTS (
                         SELECT 1 FROM "{DatabaseService._table("types")}" t
@@ -4076,7 +4077,8 @@ class DatabaseService:
                         ss.sizing_types,
                         ss.id,
                         ss.size,
-                        ss."order"
+                        ss."order",
+                        ss.us_size
                     FROM "{DatabaseService._table("sizing_schemes")}" ss
                     JOIN matching_types mt ON ss.sizing_types @> to_jsonb(mt.sizing_types)
                 )
