@@ -421,6 +421,25 @@ class EbayService:
         return rows[0]["company_code"] if rows else None
 
     @staticmethod
+    def not_ebay_enabled(children: List[Dict[str, Any]]) -> List[str]:
+        """The active children SellerCloud has eBayEnabled switched off for.
+
+        `is False`, never falsy. A caller that assembles its own children list
+        (scripts/ebay_list_priority.py reads them out of the products DB, which has no such
+        column) reports None, and "SellerCloud did not say" is not "SellerCloud said no".
+
+        Inactive variants are skipped for the reason they are skipped everywhere else: they
+        are never submitted, so their flag decides nothing.
+        """
+        return sorted(
+            c["id"]
+            for c in children
+            if c.get("id")
+            and c.get("is_active", True)
+            and c.get("ebay_enabled") is False
+        )
+
+    @staticmethod
     async def build_rows(
         listing: Listing,
         children: Optional[List[Dict[str, Any]]] = None,
@@ -467,6 +486,26 @@ class EbayService:
                 problems.append(f"could not fetch children: {type(e).__name__}: {e}")
                 return [], problems
             children = children_data.get("children") or []
+
+        # SellerCloud's own eBay opt-in, checked before four round trips are spent on the
+        # batch. Publishing a product with it off is refused outright -- "Product is not
+        # ready for eBay. Product is not eBay Enabled." is 7 of the 23 failed eBay
+        # submissions on file, the single largest cause -- and nothing in the catalog
+        # import or the specifics import turns it on, so the refusal is guaranteed rather
+        # than likely.
+        #
+        # ANY disabled child blocks the whole listing, which is the rule catalog_faults
+        # already applies for the same reason: a submission that publishes some of its
+        # variations and silently not others is worse than one that publishes none. Every
+        # family measured is uniform anyway -- HLS-XTSH-0002, HLS-XTSH-0004 and
+        # PRP-XACC-0007 each reported it on every child.
+        not_enabled = EbayService.not_ebay_enabled(children)
+        if not_enabled:
+            shown = ", ".join(not_enabled[:5])
+            if len(not_enabled) > 5:
+                shown += f" and {len(not_enabled) - 5} more"
+            problems.append(f"not eBay Enabled in SellerCloud: {shown}")
+            return [], problems
 
         overrides = data.get("child_size_overrides") or {}
 

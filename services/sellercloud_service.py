@@ -1126,6 +1126,15 @@ class SellerCloudService:
                     "parent_id": parent_product_id,
                     "size": size,
                     "is_active": _is_active(product),
+                    # SellerCloud's own per-product eBay opt-in, carried up so the gate can
+                    # run at load time instead of an hour later at publish, where it reads
+                    # "Product is not ready for eBay. Product is not eBay Enabled." Free:
+                    # eBayEnabled is one of the 200 keys the /Catalog row above already
+                    # returns, so nothing extra is fetched for it.
+                    #
+                    # Taken verbatim, NOT coerced. None means the key was absent, which is
+                    # not the same answer as False and must not block anything.
+                    "ebay_enabled": product.get("eBayEnabled"),
                 }
             )
 

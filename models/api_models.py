@@ -642,6 +642,15 @@ class ChildProductData(BaseModel):
     is_active: bool = Field(
         True, description="False for a disabled variant, shown read-only in the UI"
     )
+    # SellerCloud's eBayEnabled. Declared here because Pydantic drops keys the model does
+    # not know about -- adding it to the service alone would return a dict that has it and
+    # a response that does not.
+    #
+    # Optional with no default value of its own: None is "SellerCloud did not say", which
+    # the eBay gate treats as unknown rather than as a refusal.
+    ebay_enabled: Optional[bool] = Field(
+        None, description="SellerCloud's eBayEnabled flag; None when unknown"
+    )
 
 
 class ChildrenResponse(BaseModel):
