@@ -290,6 +290,197 @@ class EbayAspectService:
         return default or candidates[0]["category_id"]
 
     @staticmethod
+    def search_patterns(query: str) -> List[str]:
+        """A search string as one ILIKE pattern per whitespace token.
+
+        Tokenised rather than matched whole because the operator is choosing by BREADCRUMB,
+        which is what the dropdown shows. "men blazer" has to find
+        "... > Men's Vintage Clothing > Suit Jackets & Blazers", and no single substring of
+        that string contains both words in the order typed.
+
+        Every token must match (ILIKE ALL), so each word narrows the result rather than
+        widening it. `%` and `_` are escaped: a stray underscore in an operator's search
+        would otherwise match any character and quietly return the wrong categories.
+        """
+        out = []
+        for token in (query or "").split():
+            escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            out.append(f"%{escaped}%")
+        return out
+
+    @staticmethod
+    async def search_categories(
+        query: str, limit: int = 50, marketplace_id: str = DEFAULT_MARKETPLACE
+    ) -> List[Dict[str, Any]]:
+        """Leaf categories whose name or breadcrumb matches every token in `query`.
+
+        Searched server-side because all 15,111 categories cannot ship to the browser on
+        every listing load. No is_leaf filter: every row in pm_ebay_categories is a leaf
+        (15,111 of 15,111), so there is nothing to exclude.
+
+        Ranked by whether the LEAF NAME matches everything typed, so a search for "boots"
+        offers the Boots categories before the dozens of paths that merely pass through one.
+        Then shortest name first, which favours the plain category over its qualified
+        variants.
+        """
+        patterns = EbayAspectService.search_patterns(query)
+        if not patterns:
+            return []
+
+        conn = Tortoise.get_connection("default")
+        rows = await conn.execute_query_dict(
+            """
+            SELECT s.category_id, s.name, s.path
+            FROM (
+                SELECT c.category_id, c.name, c.path,
+                       c.name || ' ' || array_to_string(
+                           ARRAY(SELECT jsonb_array_elements_text(c.path)), ' > ') AS haystack
+                FROM pm_ebay_categories c
+                WHERE c.marketplace_id = $2
+            ) s
+            WHERE s.haystack ILIKE ALL($1::text[])
+            ORDER BY (s.name ILIKE ALL($1::text[])) DESC, length(s.name), s.name
+            LIMIT $3
+            """,
+            [patterns, marketplace_id, limit],
+        )
+        for row in rows:
+            row["path"] = decode_json(row.get("path"), [])
+        return rows
+
+    @staticmethod
+    async def add_type_category(
+        product_type: str, category_id: str, marketplace_id: str = DEFAULT_MARKETPLACE
+    ) -> List[Dict[str, Any]]:
+        """Give a Lux type another eBay category. Returns the type's refreshed candidates.
+
+        TWO WRITE PATHS, and which one runs is forced by where each reader looks. The submit
+        gate (listing_options_service.get_platform_type) reads the mapping ROW in
+        listingoptions_types_default_list; the listing form reads the ARRAY
+        listingoptions_types.ebay_category_id. That table is UNIQUE on
+        (primary_id, platform_id, primary_table_column), so a type holds exactly ONE eBay row
+        and the row can never carry a second category.
+
+            no row yet   ->  write the row; sync_ebay_category_id fills the array, and
+                             require_type_mapping starts passing
+            row exists   ->  append to the array; the row is already there and the gate
+                             already passes
+
+        Raises ValueError for anything the caller should see as a 400.
+        """
+        conn = Tortoise.get_connection("default")
+
+        # The CANONICAL type, not what the caller passed. Aliases are matched here the way
+        # get_categories_for_type matches them, but sync_default_list_internal_values
+        # resolves internal_values with `"type" = ANY($1)` -- exact and case-sensitive -- so
+        # passing a listing's alias through would resolve to no primary_id and write nothing
+        # at all, silently.
+        type_rows = await conn.execute_query_dict(
+            """
+            SELECT id, type, ebay_category_id
+            FROM listingoptions_types
+            WHERE LOWER(type) = LOWER($1)
+               OR EXISTS (
+                    SELECT 1 FROM jsonb_array_elements_text(aliases) AS alias
+                    WHERE LOWER(alias) = LOWER($1))
+            LIMIT 1
+            """,
+            [product_type],
+        )
+        if not type_rows:
+            raise ValueError(f"Unknown product type {product_type!r}")
+        type_id = type_rows[0]["id"]
+        canonical_type = type_rows[0]["type"]
+
+        # VALIDATED BEFORE ANYTHING IS WRITTEN, and this is the most important guard here.
+        # sync_ebay_category_id reads platform_meta ->> 'category_id' off the row it is
+        # given; an id eBay does not have yields no meta, the trigger no-ops, and the result
+        # is a type whose row satisfies require_type_mapping while get_categories_for_type
+        # (an INNER JOIN on pm_ebay_categories) returns nothing -- so the listing submits
+        # and renders no eBay section. Four types and 63 listings are in exactly that state
+        # already; this is what put them there.
+        cat_rows = await conn.execute_query_dict(
+            "SELECT category_id, path FROM pm_ebay_categories "
+            "WHERE category_id = $1 AND marketplace_id = $2 LIMIT 1",
+            [category_id, marketplace_id],
+        )
+        if not cat_rows:
+            raise ValueError(f"eBay category {category_id} is not in the {marketplace_id} taxonomy")
+
+        # A type excluded from eBay is not listed there at all, so a category for it is
+        # contradictory. Refused rather than resolved either way: the route this would
+        # otherwise take (POST /listingoptions/lists/default/internal_values) calls
+        # clear_excluded_platform_for_internal_values and would silently drop the exclusion,
+        # which is a bigger decision than the operator is making with this button.
+        if "ebay" in await listing_options_service.get_excluded_platforms(
+            "types", "type", canonical_type
+        ):
+            raise ValueError(f"{canonical_type} is excluded from eBay; remove the exclusion first")
+
+        existing = await conn.execute_query_dict(
+            "SELECT 1 FROM listingoptions_types_default_list "
+            "WHERE primary_id = $1 AND platform_id = 'ebay' AND primary_table_column = 'type' "
+            "LIMIT 1",
+            [type_id],
+        )
+
+        if existing:
+            # The array is the only place a second category can live. Appended in ONE
+            # guarded statement rather than read-modify-write, so two operators adding at
+            # once cannot lose one another's write, and a repeat add is a no-op instead of a
+            # duplicate. Appended, never prepended: element 0 is the type's default and
+            # sync_ebay_category_id_from_mappings.sql is explicit that a new mapping must not
+            # change what existing listings get.
+            await conn.execute_query(
+                """
+                UPDATE listingoptions_types
+                   SET ebay_category_id = COALESCE(ebay_category_id, '[]'::jsonb)
+                                          || to_jsonb($2::text)
+                 WHERE id = $1
+                   AND NOT (COALESCE(ebay_category_id, '[]'::jsonb) ? $2)
+                """,
+                [type_id, category_id],
+            )
+        else:
+            # platform_value is the ' > '-joined path, and it is LOOKED UP rather than
+            # re-joined: sync_default_list_internal_values inherits platform_meta from a
+            # sibling row matched on (platform_id, platform_value), so a string that differs
+            # by a byte inherits nothing and the trigger no-ops. Every one of the 15,111
+            # categories has such a row today (measured), so the join is the reliable
+            # source and the re-join below is a logged fallback for a future taxonomy load.
+            pv_rows = await conn.execute_query_dict(
+                "SELECT platform_value FROM listingoptions_types_default_list "
+                "WHERE platform_id = 'ebay' AND platform_meta ->> 'category_id' = $1 LIMIT 1",
+                [category_id],
+            )
+            if pv_rows:
+                platform_value = pv_rows[0]["platform_value"]
+            else:
+                platform_value = " > ".join(decode_json(cat_rows[0].get("path"), []))
+                logger.warning(
+                    "No eBay vocabulary row for category %s; synthesising platform_value %r. "
+                    "The sync trigger will not fire without inheritable platform_meta.",
+                    category_id,
+                    platform_value,
+                )
+
+            # append_only is MANDATORY, not defensive. internal_values is otherwise the
+            # complete replacement set for this platform_value, so naming one type would
+            # unlink every other type mapped to the same category -- category 3001 has three.
+            # This is the flag the SPO mapping wipe added.
+            from listingoptions.services.database_service import DatabaseService
+
+            await DatabaseService.sync_default_list_internal_values(
+                table_name="types",
+                platform_id="ebay",
+                platform_value=platform_value,
+                internal_values=[canonical_type],
+                append_only=True,
+            )
+
+        return await EbayAspectService.get_categories_for_type(canonical_type, marketplace_id)
+
+    @staticmethod
     async def platform_excluded_for(
         product_type: Optional[str], brand: Optional[str] = None
     ) -> Optional[str]:

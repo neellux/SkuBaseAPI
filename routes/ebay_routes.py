@@ -75,6 +75,56 @@ async def list_mapped_categories(
         raise HTTPException(status_code=500, detail="Could not load eBay categories")
 
 
+@router.get("/category_search")
+async def search_categories(
+    q: str = Query(..., description="Search text; every whitespace token must match"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum categories to return"),
+    marketplace_id: str = Query(DEFAULT_MARKETPLACE),
+):
+    """Leaf categories matching `q`, for the listing form's category picker.
+
+    Unlike /categories, which is deliberately scoped to categories some Lux type already
+    maps to, this searches the whole taxonomy: its entire purpose is reaching a category
+    nothing maps to yet.
+    """
+    try:
+        categories = await ebay_aspect_service.search_categories(q, limit, marketplace_id)
+    except Exception as e:
+        logger.error(f"Error searching eBay categories for {q!r}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not search eBay categories")
+    return {"categories": categories, "count": len(categories)}
+
+
+@router.post("/type_category")
+async def add_type_category(
+    product_type: str = Query(..., description="Lux product type"),
+    category_id: str = Query(..., description="eBay leaf category id to add"),
+    marketplace_id: str = Query(DEFAULT_MARKETPLACE),
+):
+    """Add an eBay category to a Lux type, and return the type's refreshed candidates.
+
+    Returned refreshed for the same reason PUT /aspect_settings does it: the caller needs the
+    new candidate list to rebuild the form, and a second round trip would race the write.
+
+    TYPE-LEVEL. Every listing on the type gains the category as an option; the type's default
+    (element 0) is untouched, so no existing listing changes what it resolves to.
+    """
+    try:
+        candidates = await ebay_aspect_service.add_type_category(
+            product_type, category_id, marketplace_id
+        )
+    except ValueError as e:
+        # These are the operator's to fix (unknown type, unknown category, type excluded from
+        # eBay), and the message is shown verbatim in a snackbar, so it stays short.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(
+            f"Error adding eBay category {category_id} to {product_type!r}: {e}", exc_info=True
+        )
+        raise HTTPException(status_code=500, detail="Could not add the eBay category")
+    return {"categories": candidates, "count": len(candidates)}
+
+
 @router.get("/category_aspects")
 async def get_category_aspects(
     category_id: str = Query(..., description="eBay leaf category id"),
