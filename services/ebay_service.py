@@ -133,6 +133,25 @@ ENFORCED_COLUMNS = ("StartPrice", "BuyItNowPrice", "eBaySellerProfileID_Shipping
 # prefix and 544 prefixed SKUs sit under a different company.
 EBAY_COMPANY_CODE = 182
 
+# Company codes are integers everywhere: parent_products.company_code is the ONLY company
+# column in either database, and no name is stored anywhere, so the names live here. Taken
+# from SellerCloud's own /Companies list, the same source oneinventory_service.py:73 cites
+# for 249 (confirmed 2026-08-12). Only these two appear on any parent: 182 holds 33,363
+# parents and 249 holds 8,520.
+#
+# A CONSTANT, not a lookup: naming a company is not worth a ~5s SellerCloud round trip on a
+# request the form fires on every brand, type and colour edit. The trade is that a rename in
+# SellerCloud does not reach this map, which is why an unrecognised code falls back to its
+# number rather than to a guess -- the number is always right, just less readable.
+COMPANY_NAMES = {182: "nymilan", 249: "EssxNYC"}
+
+
+def company_label(code: Optional[int]) -> str:
+    """A company for an operator to read: its name where we know one, else its number."""
+    if code is None:
+        return "unknown"
+    return COMPANY_NAMES.get(code, str(code))
+
 # The size-word casing changed in product_service ("... SIZE L $325" -> "... Size L $325"),
 # leaving 3,175 live eBay children on the old spelling. Fixed by EDITING the title
 # SellerCloud already holds rather than rewriting it from the listing: the listing's own

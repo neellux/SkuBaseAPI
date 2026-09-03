@@ -900,7 +900,21 @@ class ListingService:
                 product_type, category_id
             )
             if not category_id:
-                return []
+                # The type maps to no eBay category. Return the PICKER ALONE rather than
+                # nothing, so the "+" that adds one has somewhere to live. These 88 of 234
+                # types are precisely the ones that need it, and they were the only ones it
+                # could not reach: with no eBay field in the schema there is no eBay section,
+                # and with no section there is nothing to hang the button on.
+                #
+                # No candidates, so _convert_template_to_schema sets neither `enum` nor
+                # ui:widget "select" -- an empty options list is falsy there -- and the field
+                # arrives as a plain string that buildUiSchema still routes to
+                # EbayCategoryWidget by name.
+                #
+                # An excluded type stays hidden regardless: the form drops the whole section
+                # from ebayDefaults.excluded_by, which this function cannot answer for anyway
+                # because it never sees the brand.
+                return [ListingService._ebay_category_field([], None)]
             candidates = await ebay_aspect_service.get_categories_for_type(product_type)
             ebay_settings = (
                 (settings.platform_settings if settings else None) or {}

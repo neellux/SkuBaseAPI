@@ -38,7 +38,12 @@ from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import DEFAULT_BATCH_SORT, BatchService
 from services.ebay_aspect_service import ebay_aspect_service
-from services.ebay_service import ebay_service, EbayService, EBAY_COMPANY_CODE
+from services.ebay_service import (
+    ebay_service,
+    EbayService,
+    EBAY_COMPANY_CODE,
+    company_label,
+)
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
@@ -600,6 +605,10 @@ async def get_mapping_status(
         "standard_color": color,
         "brand_name": brand,
         "company_code": company,
+        # Named, not numbered: "Company 249" says nothing to an operator. The code is still
+        # returned beside it for anything that compares rather than displays, and is what the
+        # label falls back to for a company the map does not know.
+        "company_name": company_label(company),
         "company_excluded": company_excluded,
         **status,
     }
