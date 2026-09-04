@@ -806,6 +806,29 @@ async def submit_listing(
         # 3. Sizes (skip platforms whose brand or type is excluded here)
         sizing_scheme = form_data.get("SIZING_SCHEME")
         child_sizes = list(set(v for v in child_size_overrides.values() if v and v.strip()))
+        # eBay cannot be submitted without a category that actually resolves. The type gate
+        # above does NOT cover this: it reads the mapping ROW via get_platform_type, and a
+        # type can hold a row pointing at a category eBay has retired -- Men's Track Pants
+        # has a row for 185075, absent from pm_ebay_categories, so the gate passes while
+        # get_categories_for_type returns nothing.
+        #
+        # DNT-MBTM-0079 submitted in exactly that state on 2026-08-31. build_rows produced no
+        # rows, so the poller left it out of every stage after the build and it sat in
+        # PROCESSING with no error until it was found by hand. 62 more listings are on those
+        # types today.
+        #
+        # A plain 400, not one of the 422 mapping dialogs: none of them can fix this. The
+        # operator picks a category with the "+" on the field, which is what the message says.
+        if "ebay" in non_sc_platforms and "ebay" not in excluded:
+            if not await ebay_aspect_service.resolve_listing_category(
+                product_type, form_data.get("ebay_category_id")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{product_type or 'This type'} has no eBay category. "
+                           "Add one with + on the eBay category field.",
+                )
+
         size_platforms = [p for p in non_sc_platforms if p not in excluded]
         # eBay only wants a size where the chosen category has a size aspect. Necklaces &
         # Pendants and Sunglasses have none, so a size mapping there would be a value that

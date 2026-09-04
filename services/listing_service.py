@@ -864,6 +864,21 @@ class ListingService:
         }
         if len(candidates) == 1:
             field["default"] = candidates[0]["category_id"]
+        elif not candidates:
+            # Nothing to choose from, so the operator has to act: either the type maps to no
+            # eBay category (88 of 234), or it maps to one eBay has since retired -- Men's
+            # Track Pants points at 185075, which is no longer in pm_ebay_categories, so
+            # get_categories_for_type's INNER JOIN drops it and the type resolves to nothing.
+            #
+            # is_required puts the field in the schema's `required`, which buildUiSchema turns
+            # into ui:isRequired and AutocompleteWidget renders as a red field while empty. It
+            # also blocks the submit, which is the point: DNT-MBTM-0079 submitted in this
+            # state, produced no rows, and was orphaned mid-batch. A red field the operator
+            # can fix with the "+" beats a submission that dies an hour later.
+            #
+            # Only while eBay is SELECTED. unrequiredSections drops a deselected platform's
+            # section from `required`, so this never blocks a listing going elsewhere.
+            field["is_required"] = True
         return field
 
     @staticmethod

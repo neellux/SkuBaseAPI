@@ -470,18 +470,53 @@ class EbayPoller(BasePoller):
             )
             return {"submission_count": 0, "rows": 0, "sent": False, "blocked": blocked}
 
+        # Submissions that resolved to no rows at all. The batch is going ahead without
+        # them -- they are not in `rows`, so nothing about them reaches SellerCloud -- and
+        # before this they were simply abandoned in PROCESSING: every later stage writes to
+        # `sent_ids`, so they never gained a `published` step or a terminal status, and
+        # recover_stale_processing deliberately skips a row whose last step is past
+        # `submitting`, reading it as "a later stage owns this". No later stage did.
+        #
+        # DNT-MBTM-0079 sat like that in import 3: its type, Men's Track Pants, maps to eBay
+        # category 185075, which is not in pm_ebay_categories, so resolve_listing_category
+        # returned None and build_rows produced nothing. It stopped at specifics_imported and
+        # stayed PROCESSING with no error, while its 24 siblings finished.
+        #
+        # Failed HERE, before the first SellerCloud call, with the reason build_rows gave --
+        # which is the only place that reason exists, since `blocked` is returned to the
+        # caller and never persisted.
+        sent_ids = [sid for sid in submission_ids if sid in per_submission]
+        orphan_ids = [sid for sid in submission_ids if sid not in per_submission]
+        for sid in orphan_ids:
+            reasons = blocked.get(sid) or ["nothing to submit for this listing"]
+            await ListingSubmission.filter(id=sid).update(
+                status=SubmissionStatus.FAILED,
+                error_display="; ".join(reasons)[:200],
+            )
+            await record_step(sid, "failed", stage="build", reason="; ".join(reasons)[:400])
+        if orphan_ids:
+            logger.warning(
+                "%s: %d submission(s) produced no rows and were failed: %s",
+                self.name, len(orphan_ids), orphan_ids,
+            )
+
         # Recorded IMMEDIATELY before the first write, and written by nothing else. That
         # makes the step a commitment marker: a row in PROCESSING without it provably never
         # reached SellerCloud, which is what lets recover_stale_processing requeue it safely
         # rather than failing everything for manual review.
-        await record_step(submission_ids, "submitting", rows=len(rows))
+        #
+        # sent_ids from here on, not submission_ids: an orphan is already FAILED above, and
+        # adding catalog/specifics steps to it would describe work its rows were never part
+        # of. That mismatch is what made 13862 look like it had got as far as
+        # specifics_imported.
+        await record_step(sent_ids, "submitting", rows=len(rows))
         jobs: dict[str, Any] = {}
         try:
             # --- step 1: catalog info, export then diff then import ------------------
             catalog_skus = sorted({r[0] for r in rows})
             current, export_job = await ebay_service.export_catalog_fields(catalog_skus)
             jobs["export"] = export_job
-            await self._stage(submission_ids, "catalog_exported", jobs,
+            await self._stage(sent_ids, "catalog_exported", jobs,
                               job=export_job, skus=len(catalog_skus))
             # A self-contradictory price pair, or a band that cannot be decided, makes a
             # WRONG listing rather than a refused one -- it goes live at the wrong price or
@@ -501,12 +536,15 @@ class EbayPoller(BasePoller):
                         blocked.setdefault(owner, []).append(f"{sku}: {reason}")
                 logger.warning("%s: %d catalog fault(s), nothing imported: %s",
                                self.name, len(faults), sorted(faults.items())[:5])
-                await ListingSubmission.filter(id__in=submission_ids).update(
+                # sent_ids, not submission_ids: an orphan is already FAILED with the
+                # reason build_rows gave, and a batch-wide message would overwrite the only
+                # record of why that particular listing produced nothing.
+                await ListingSubmission.filter(id__in=sent_ids).update(
                     status=SubmissionStatus.FAILED,
                     error_display=f"{len(faults)} product(s) have a price or weight fault",
                 )
                 await self._stage(
-                    submission_ids, "failed", jobs, stage="catalog",
+                    sent_ids, "failed", jobs, stage="catalog",
                     reason="; ".join(f"{sku}: {why}"
                                      for sku, why in sorted(faults.items()))[:600],
                 )
@@ -518,12 +556,12 @@ class EbayPoller(BasePoller):
                     ebay_service.render_catalog_tsv(catalog_rows)
                 )
                 jobs["catalog"] = cat.get("job_id")
-                await self._stage(submission_ids, "catalog_imported", jobs,
+                await self._stage(sent_ids, "catalog_imported", jobs,
                                   rows=len(catalog_rows), job=cat.get("job_id"))
             else:
                 # Everything already correct. A normal outcome, not a failure: sending a
                 # file that changes nothing would still queue a job and still take a minute.
-                await self._stage(submission_ids, "catalog_unchanged", jobs,
+                await self._stage(sent_ids, "catalog_unchanged", jobs,
                                   skus=len(catalog_skus))
 
             # --- step 2: specifics ----------------------------------------------------
@@ -537,12 +575,13 @@ class EbayPoller(BasePoller):
             # extension 'txt' is not supported...") while raise_for_status only carries the
             # status line. Without this the step reads "500" and says nothing actionable.
             detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
-            await ListingSubmission.filter(id__in=submission_ids).update(
+            # sent_ids for the same reason as the catalog fault above.
+            await ListingSubmission.filter(id__in=sent_ids).update(
                 status=SubmissionStatus.FAILED,
                 error_display="eBay specifics import failed to send",
             )
             await self._stage(
-                submission_ids, "failed", jobs, stage="import",
+                sent_ids, "failed", jobs, stage="import",
                 reason=f"{type(exc).__name__}: {detail}"[:600],
             )
             raise
@@ -550,9 +589,8 @@ class EbayPoller(BasePoller):
         ok = 200 <= int(result.get("status_code", 0)) < 300
         job_id = result.get("job_id")
         jobs["specifics"] = job_id
-        sent_ids = [sid for sid in submission_ids if sid in per_submission]
         if ok:
-            await self._stage(submission_ids, "specifics_imported", jobs,
+            await self._stage(sent_ids, "specifics_imported", jobs,
                               job=job_id, rows=len(rows))
 
         # --- step 3: publish ---------------------------------------------------------

@@ -190,6 +190,18 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         # Imports that predate that field fall back to the oldest submission's
         # created_at, which can be days earlier than the real upload.
         uploaded_ats = []
+        # When the batch CLAIMED its rows, from the queued_batch step ebay_poller.begin_batch
+        # writes. An eBay submission sits in `pending` until a person clicks Submit on the
+        # submissions dashboard, so its created_at is when the LISTING was submitted, not
+        # when the import happened -- import 3 held submissions from 26 Aug to 2 Sep and was
+        # actually claimed on 3 Sep, so the oldest-submission fallback dated it eight days
+        # early. No eBay import carries uploaded_at, which is the SPO sweep's field, so
+        # without this every one of them is wrong.
+        #
+        # Read generically rather than under `if platform_id == "ebay"`: only ebay_poller
+        # writes this step today, so the list is simply empty everywhere else, and a poller
+        # that adopts it later is right for free.
+        batch_claimed_ats = []
         stored_file_name = None
         batch_number = None
         for s in group:
@@ -200,16 +212,24 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                     uploaded_ats.append(datetime.fromisoformat(raw))
                 except (TypeError, ValueError):
                     pass
+            for step in meta.get("steps") or []:
+                if step.get("step") == "queued_batch" and step.get("at"):
+                    try:
+                        batch_claimed_ats.append(datetime.fromisoformat(step["at"]))
+                    except (TypeError, ValueError):
+                        pass
+                    break
             if not stored_file_name and meta.get("file_name"):
                 stored_file_name = meta["file_name"]
             if batch_number is None and meta.get("batch_number") is not None:
                 batch_number = meta["batch_number"]
 
-        created_at = (
-            min(uploaded_ats)
-            if uploaded_ats
-            else min((s.created_at for s in group), default=None)
-        )
+        if uploaded_ats:
+            created_at = min(uploaded_ats)
+        elif batch_claimed_ats:
+            created_at = min(batch_claimed_ats)
+        else:
+            created_at = min((s.created_at for s in group), default=None)
 
         # Prefer the persisted file name; older SPO imports predate that field, so
         # reconstruct the same spo_products_<timestamp>.xlsx name from created_at.
