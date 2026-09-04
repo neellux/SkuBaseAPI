@@ -932,7 +932,19 @@ async def submit_listing(
                     .first()
                 )
 
-                if latest and latest.status in ("queued", "pending", "processing"):
+                # awaiting_action sits with the in-flight three: the platform accepted the
+                # submission and a person owes it a manual step, so a new attempt cannot
+                # advance it. For eBay the item is already live, and a resubmit returns
+                # "already active on eBay" for every child -- AMR-MTPS-0085 was resubmitted
+                # in this state on 2 Sep and produced the same three item ids as its first
+                # attempt, for four SellerCloud round trips.
+                #
+                # Enforced here as well as in the pill, because the pill is a prompt and this
+                # is the gate. recompute_listing_submitted reads the LATEST attempt, so a new
+                # row does not even clear the block it looks like it is clearing.
+                if latest and latest.status in (
+                    "queued", "pending", "processing", "awaiting_action",
+                ):
                     logger.info(f"Skipping {platform_id}: already in {latest.status}")
                     continue
 
