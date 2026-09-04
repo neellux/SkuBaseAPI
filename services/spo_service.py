@@ -40,6 +40,10 @@ DISPLAY_HEADERS = [
     "Womens Clothing Tops Size",
     "Womens Clothing Bottoms Size",
     "Ring Size",
+    # Appended rather than slotted next to Normalized Color. SPO identifies columns by
+    # the api-code header row, so position does not matter to it, and appending leaves
+    # the 18 columns of every previously accepted import in their exact places.
+    "Designer Color",
 ]
 
 API_HEADERS = [
@@ -61,6 +65,7 @@ API_HEADERS = [
     "womens-clothing-tops-size",
     "womens-clothing-bottoms-size",
     "ring-size",
+    "color",
 ]
 
 OFFER_HEADERS = [
@@ -79,6 +84,21 @@ TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED", "REJECTED"}
 MAX_ERROR_DISPLAY_LENGTH = 500
 
 SKU_PATTERN = re.compile(r"^[A-Za-z0-9\-_/. ]+$")
+
+
+# Zero-width characters and a stray BOM. They arrive in SellerCloud's COLOR column
+# (two Asics colourways carry a trailing U+200B today), flow into brand_color and from
+# there into the title through the title template, and are invisible in every UI that
+# would otherwise show them up. SPO stores what it is given, so they are removed at the
+# file boundary rather than left to surface as an odd-looking listing.
+INVISIBLE_CHARS = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+
+
+def _clean_cell(value: Any) -> Any:
+    """Strip invisible characters and edge whitespace from a cell. Non-strings pass through."""
+    if not isinstance(value, str):
+        return value
+    return INVISIBLE_CHARS.sub("", value).strip()
 
 
 def _sanitize_error_text(text: str) -> str:
@@ -198,6 +218,25 @@ class SpoService:
                     f"SPO: require_type_mapping is on and no platform type mapping exists "
                     f"for product_type {category!r}"
                 )
+
+        # SPO requires `color` (Designer Color) and rejects the whole row without it:
+        #   1000|The attribute 'color' (Designer Color) is required
+        # Nothing maps to it in the default template, so it is filled here. This is the
+        # brand's own name for the colour ("Cobalt Blue", "Black Beauty"), which is
+        # precisely what brand_color holds; normalized-color carries the canonical one
+        # ("Blue", "Black") and is a different, mapped attribute. An explicit template
+        # mapping still wins, since this only fills a value that is not already set.
+        if not str(row_data.get("color") or "").strip():
+            row_data["color"] = form_data.get("brand_color") or form_data.get(
+                "standard_color"
+            )
+        if not str(row_data.get("color") or "").strip():
+            # Loud rather than a row SPO will reject on its side, where the failure
+            # arrives days later in a transformation error report.
+            raise ValueError(
+                "SPO: no color for the listing; SPO requires the 'color' (Designer "
+                "Color) attribute and neither brand_color nor standard_color is set"
+            )
 
         standard_color = form_data.get("standard_color")
         if standard_color:
@@ -338,7 +377,7 @@ class SpoService:
         ws.append(DISPLAY_HEADERS)
         ws.append(API_HEADERS)
         for product in products:
-            row = [product.get(field_id) for field_id in API_HEADERS]
+            row = [_clean_cell(product.get(field_id)) for field_id in API_HEADERS]
             ws.append(row)
 
         wb.save(output_path)
