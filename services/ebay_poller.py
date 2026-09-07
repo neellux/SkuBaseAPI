@@ -11,6 +11,7 @@ for SPO and Grailed; neither of those has a preview either.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -27,7 +28,7 @@ from services.base_poller import BasePoller
 from services.ebay_service import ebay_service, render_tsv, weight_oz
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
-from utils.submission_steps import record_step
+from utils.submission_steps import last_step, record_step
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,12 @@ logger = logging.getLogger(__name__)
 # stages after it.
 PUBLISHED_STAGE = "published"
 AWAITING_IMAGES_STAGE = "awaiting_images"
+
+# Steps a row passes through between `submitting` and `published`. A row stale at one
+# of these was abandoned mid-batch; nothing downstream reads them.
+MID_BATCH_STEPS = frozenset(
+    {"catalog_exported", "catalog_imported", "catalog_unchanged", "specifics_imported"}
+)
 
 
 class EbayPoller(BasePoller):
@@ -90,10 +97,41 @@ class EbayPoller(BasePoller):
             names = [st.get("step") for st in steps]
             last = names[-1] if names else None
 
+            if last == PUBLISHED_STAGE:
+                # Answered by SellerCloud and waiting on its publish job.
+                # collect_item_ids owns this row for as long as that takes.
+                continue
+
+            if last in MID_BATCH_STEPS:
+                # Past the first SellerCloud write but never published: the batch
+                # died between stages (a crash, or publish_to_channel raising
+                # before it was guarded). The catalog and specifics files it sent
+                # are in SellerCloud, so this cannot be retried blind, and no
+                # later stage will ever pick it up: row 13862 sat like this from
+                # 3 September with `specifics_imported` as its last step.
+                sub.status = SubmissionStatus.FAILED
+                sub.platform_status = None
+                sub.error_display = (
+                    f"Import interrupted after {last.replace('_', ' ')} - "
+                    "check SellerCloud before resubmitting"
+                )
+                await sub.save(
+                    update_fields=["status", "platform_status", "error_display", "updated_at"]
+                )
+                await record_step(
+                    sub.id, "failed", stage="stale_processing",
+                    reason=f"interrupted after {last}; files already sent to SellerCloud",
+                )
+                failed += 1
+                continue
+
             if last != "submitting" and "submitting" in names:
-                # Got past the call and was answered, so a later stage owns this row.
-                # collect_item_ids picks up a published one; anything else stopped
-                # somewhere worth looking at rather than silently retrying or failing.
+                # Some later step this sweep does not know. Left alone but said out
+                # loud, rather than silently skipped forever.
+                logger.warning(
+                    "%s: submission %s stale in processing at unknown step %r",
+                    self.name, sub.id, last,
+                )
                 continue
 
             if last == "submitting":
@@ -314,11 +352,14 @@ class EbayPoller(BasePoller):
                 sub.error_display = (
                     next(iter(errors.values()), "")[:200] or "No eBay listing was created"
                 )
+                # The per-child map, so the technical column carries every reason and
+                # not only the first one the display line shows.
+                sub.error = json.dumps(errors) if errors else "No eBay listing was created"
             # platform_meta deliberately absent from update_fields: record_step below owns
             # that column, and this instance is carrying a stale copy of it.
             await sub.save(
                 update_fields=["status", "platform_status", "external_id",
-                               "error_display", "updated_at"]
+                               "error", "error_display", "updated_at"]
             )
             # Per submission, not per import: the errors differ per row, and record_step
             # writes one `meta` to every id it is handed. Only rows that actually have
@@ -335,6 +376,15 @@ class EbayPoller(BasePoller):
                 listed=len(item_ids),
                 children=len(kids),
             )
+            if not item_ids:
+                # Every other platform ends a failed row on a `failed` step; without
+                # this one an eBay failure ended on `item_ids_read` and read as still
+                # in progress to anything walking the timeline.
+                await record_step(
+                    [sub.id], "failed", stage="publish",
+                    reason=sub.error_display[:300],
+                    sku_errors=errors or None,
+                )
             settled += 1
 
         logger.info(
@@ -468,6 +518,11 @@ class EbayPoller(BasePoller):
             await ListingSubmission.filter(id__in=submission_ids).update(
                 status=SubmissionStatus.PENDING, platform_status=None
             )
+            for sid in submission_ids:
+                await record_step(
+                    sid, "requeued", stage="build",
+                    reason="; ".join(blocked.get(sid) or ["no rows built"])[:400],
+                )
             return {"submission_count": 0, "rows": 0, "sent": False, "blocked": blocked}
 
         # Submissions that resolved to no rows at all. The batch is going ahead without
@@ -595,7 +650,25 @@ class EbayPoller(BasePoller):
 
         # --- step 3: publish ---------------------------------------------------------
         if ok:
-            published = await ebay_service.publish_to_channel(catalog_skus)
+            try:
+                published = await ebay_service.publish_to_channel(catalog_skus)
+            except Exception as exc:  # noqa: BLE001 - recorded on the rows, not swallowed
+                # This call sat outside the guard above, so a transport error here
+                # left the rows in PROCESSING at `specifics_imported` with nothing
+                # recorded, where the stale sweep would not touch them. The
+                # specifics file is already in SellerCloud, so failed for review
+                # rather than requeued, the same as the import POST above.
+                logger.exception("%s: eBay publish call failed", self.name)
+                detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
+                await ListingSubmission.filter(id__in=sent_ids).update(
+                    status=SubmissionStatus.FAILED,
+                    error_display="eBay publish call failed - check SellerCloud before resubmitting",
+                )
+                await self._stage(
+                    sent_ids, "failed", jobs, stage="publish",
+                    reason=f"{type(exc).__name__}: {detail}"[:600],
+                )
+                raise
             jobs["publish"] = published.get("job_id")
             if not published.get("ok"):
                 # 200 with Success=false. Treated as the failure it is.

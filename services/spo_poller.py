@@ -13,10 +13,14 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services.base_poller import BasePoller
-from services.spo_service import spo_service, TERMINAL_STATUSES
+from services.spo_service import (
+    SpoApiError,
+    is_terminal_import_status,
+    spo_service,
+)
 from services.template_service import TemplateService
 from tortoise.transactions import in_transaction
-from utils.submission_steps import record_step
+from utils.submission_steps import last_step, merge_meta, record_step
 
 logger = logging.getLogger(__name__)
 
@@ -64,14 +68,30 @@ class SpoPoller(BasePoller):
 
         for sub in stale:
             logger.warning(f"{self.name}: stale processing submission {sub.id}, marking failed")
+            # The last P42 outcome, if the status loop recorded one. A dead API key
+            # failed 1,276 rows with a bare "timed out" in mid-2026; the row should
+            # say the checks were failing, not that SPO was slow.
+            check = (sub.platform_meta or {}).get("last_status_check") or {}
+            check_error = check.get("error") if isinstance(check, dict) else None
+            display = f"Import timed out after {timeout_label}"
+            if check_error:
+                display = f"{display}; last status check: {check_error}"[:500]
             sub.status = SubmissionStatus.FAILED
-            sub.error_display = f"Import timed out after {timeout_label}"
-            await sub.save(update_fields=["status", "error_display", "updated_at"])
+            sub.error_display = display
+            sub.error = (
+                f"Stale processing submission recovered at "
+                f"{datetime.now(timezone.utc).isoformat()} "
+                f"(platform_status={sub.platform_status}, last_status_check={check})"
+            )
+            await sub.save(
+                update_fields=["status", "error", "error_display", "updated_at"]
+            )
             await record_step(
                 sub.id,
                 "failed",
                 stage=sub.platform_status or "unknown",
                 reason=f"import timed out after {timeout_label}",
+                last_status_check=check_error or None,
             )
 
     async def _resume_products_complete(self) -> None:
@@ -155,7 +175,37 @@ class SpoPoller(BasePoller):
 
         logger.info(f"{self.name}: batch uploading {len(submission_ids)} SPO submissions")
 
-        # Recorded outside the transaction above: record_step uses its own
+        # Everything past the claim used to run unguarded. A template fetch, a
+        # prefetch or a record_step raising left every claimed row at
+        # products_uploading with no import id, which _check_processing ignores,
+        # so nothing touched them until the stale sweep (7 days in prod).
+        # _run_batch drops each id from `submission_ids` as it finalises the row,
+        # so on an unexpected exception the list holds exactly the rows still in
+        # flight. Nothing has been sent to P41 for those (the upload has its own
+        # handler that fails rather than raises), and a re-sent offer is deduped
+        # by the AppScript, so requeueing is safe.
+        try:
+            return await self._run_batch(submission_ids)
+        except Exception as e:
+            logger.exception(f"{self.name}: batch aborted, requeueing claimed rows")
+            live = await ListingSubmission.filter(
+                id__in=submission_ids, status=SubmissionStatus.PROCESSING
+            ).values_list("id", flat=True)
+            if live:
+                await ListingSubmission.filter(id__in=live).update(
+                    status=SubmissionStatus.PENDING,
+                    platform_status=None,
+                )
+                await record_step(
+                    list(live),
+                    "requeued",
+                    stage="products_uploading",
+                    reason=f"batch aborted before upload: {type(e).__name__}: {str(e)[:250]}",
+                )
+            raise
+
+    async def _run_batch(self, submission_ids: list[int]) -> dict[str, Any]:
+        # Recorded outside the claim transaction: record_step uses its own
         # connection and would block on the rows that transaction has locked.
         await record_step(submission_ids, "products_uploading", batch_size=len(submission_ids))
 
@@ -367,10 +417,17 @@ class SpoPoller(BasePoller):
 
         except Exception as e:
             logger.exception(f"{self.name}: P41 upload failed")
+            # The HTTP status is the actionable part: "HTTP 401 Unauthorized"
+            # says rotate the key, "Failed to submit to SPO" said nothing, and
+            # four identical auth failures went unnoticed behind it.
+            display = (
+                e.display() if isinstance(e, SpoApiError)
+                else f"Failed to submit to SPO: {type(e).__name__}"
+            )
             await ListingSubmission.filter(id__in=submission_ids).update(
                 status=SubmissionStatus.FAILED,
                 error=traceback.format_exc(),
-                error_display="Failed to submit to SPO",
+                error_display=display[:500],
             )
             await record_step(
                 submission_ids, "failed", stage="products_upload", reason=str(e)[:300]
@@ -421,19 +478,30 @@ class SpoPoller(BasePoller):
         for import_id, subs in product_groups.items():
             try:
                 status_data = await spo_service.check_import_status(import_id)
+            except Exception as e:
+                await self._note_status_check_failure(import_id, subs, e)
+                continue
+
+            try:
+                await self._clear_status_check_failure(subs)
                 current_status = (status_data.get("import_status") or "UNKNOWN").upper()
+                has_transform_errors = bool(
+                    status_data.get("has_transformation_error_report", False)
+                )
+                lines_in_error = int(status_data.get("transform_lines_in_error") or 0)
 
-                has_transform_errors = status_data.get("has_transformation_error_report", False)
-                lines_read = status_data.get("transform_lines_read", 0)
-                lines_in_error = status_data.get("transform_lines_in_error", 0)
+                # COMPLETE is checked FIRST. It used to come after the transformation
+                # branch, so an import with one bad line never reached this handler:
+                # the affected rows were failed and every sibling was re-routed to
+                # the transformation branch each cycle, which had nothing left to do
+                # for them. Import 835085 lost 91 of 97 rows to the 7-day sweep that
+                # way while their products were live on SPO.
+                if current_status == "COMPLETE":
+                    await self._handle_products_complete(
+                        import_id, subs, include_transformation=has_transform_errors
+                    )
 
-                if has_transform_errors and lines_in_error > 0:
-                    await self._handle_transformation_errors(import_id, subs)
-
-                elif current_status == "COMPLETE":
-                    await self._handle_products_complete(import_id, subs)
-
-                elif current_status in TERMINAL_STATUSES:
+                elif is_terminal_import_status(current_status):
                     # Batched: every submission in this import gets the identical
                     # message, so one statement replaces one per row. Both status
                     # triggers are FOR EACH ROW and still fire per submission.
@@ -450,8 +518,22 @@ class SpoPoller(BasePoller):
                         reason=error_msg,
                         product_import_id=import_id,
                     )
+
+                elif has_transform_errors and lines_in_error > 0:
+                    # Still running, but the transformation report is already
+                    # final. Fail the rows it names now rather than at COMPLETE;
+                    # the siblings keep waiting for the import to finish.
+                    await self._handle_transformation_errors(import_id, subs)
+
+                else:
+                    logger.debug(
+                        f"{self.name}: import {import_id} still {current_status}, "
+                        f"{len(subs)} submission(s) waiting"
+                    )
             except Exception:
-                logger.exception(f"{self.name}: error checking P42 for import {import_id}")
+                logger.exception(
+                    f"{self.name}: error handling P42 result for import {import_id}"
+                )
 
         for import_id, subs in offer_groups.items():
             try:
@@ -460,7 +542,7 @@ class SpoPoller(BasePoller):
 
                 if current_status == "COMPLETE":
                     await self._handle_offers_complete(import_id, subs)
-                elif current_status in TERMINAL_STATUSES:
+                elif is_terminal_import_status(current_status):
                     # Batched for the same reason as the product branch above.
                     error_msg = f"Offer import {current_status.lower()}"
                     sub_ids = [s.id for s in subs]
@@ -478,6 +560,67 @@ class SpoPoller(BasePoller):
             except Exception:
                 logger.exception(f"{self.name}: error checking OF02 for import {import_id}")
 
+    async def _note_status_check_failure(
+        self, import_id: int, submissions: list[ListingSubmission], exc: Exception
+    ) -> None:
+        """Persist a failed P42 call on the rows it was checking.
+
+        A failing status check used to be a log line and nothing else, so a
+        revoked API key looked identical to a slow import right up to the 7-day
+        sweep. The outcome goes on platform_meta.last_status_check every cycle
+        (a merge, not a step, so the timeline does not grow by one entry per
+        cycle), and a `status_check_failed` step is recorded once, when the
+        failures start, so the history shows when.
+        """
+        reason = (
+            exc.display() if isinstance(exc, SpoApiError)
+            else f"{type(exc).__name__}: {str(exc)[:200]}"
+        )
+        logger.error(
+            f"{self.name}: P42 status check failed for import {import_id}: {reason}",
+            exc_info=not isinstance(exc, SpoApiError),
+        )
+        sub_ids = [s.id for s in submissions]
+        await merge_meta(
+            sub_ids,
+            {
+                "last_status_check": {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "product_import_id": import_id,
+                    "error": reason[:300],
+                }
+            },
+        )
+        first_failure = [s.id for s in submissions if last_step(s) != "status_check_failed"]
+        if first_failure:
+            await record_step(
+                first_failure,
+                "status_check_failed",
+                stage="products_processing",
+                product_import_id=import_id,
+                reason=reason[:300],
+            )
+
+    async def _clear_status_check_failure(self, submissions: list[ListingSubmission]) -> None:
+        """Drop a recorded check failure once P42 answers again, so the stale
+        sweep does not blame a since-recovered key. Only rows carrying one are
+        written, so a healthy cycle costs nothing."""
+        carrying = [
+            s.id
+            for s in submissions
+            if ((s.platform_meta or {}).get("last_status_check") or {}).get("error")
+        ]
+        if carrying:
+            await merge_meta(
+                carrying,
+                {
+                    "last_status_check": {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "ok": True,
+                    }
+                },
+            )
+
     async def _handle_transformation_errors(
         self, import_id: int, submissions: list[ListingSubmission]
     ) -> None:
@@ -485,6 +628,9 @@ class SpoPoller(BasePoller):
         failed_skus = {e["sku"]: e["error"] for e in errors}
 
         if not failed_skus:
+            # Not an error for the rows: the import is still running and COMPLETE
+            # will settle them from the regular error report. Logged so a P47
+            # format change is noticed rather than silently ignored.
             logger.warning(
                 f"{self.name}: P47 flagged but no parseable errors for import {import_id}"
             )
@@ -520,10 +666,21 @@ class SpoPoller(BasePoller):
                 logger.info(f"{self.name}: submission {sub.id} failed with transformation errors")
 
     async def _handle_products_complete(
-        self, import_id: int, submissions: list[ListingSubmission]
+        self,
+        import_id: int,
+        submissions: list[ListingSubmission],
+        *,
+        include_transformation: bool = False,
     ) -> None:
         errors = await spo_service.get_error_report(import_id)
         failed_skus = {e["sku"]: e["error"] for e in errors}
+        if include_transformation:
+            # A line the transformation rejected never reached the import, so it
+            # is absent from the regular error report. When COMPLETE is the first
+            # status this row is seen in, that report is the only record that the
+            # SKU is not on SPO; without it the row would be marked `listed`.
+            for e in await spo_service.get_transformation_error_report(import_id):
+                failed_skus.setdefault(e["sku"], e["error"])
 
         listed_ids: list[int] = []
         for sub in submissions:

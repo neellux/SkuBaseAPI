@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import json
 
 import logging
 import os
@@ -79,7 +80,52 @@ OFFER_HEADERS = [
 
 IMAGE_BASE_URL = "https://storage.googleapis.com/lux_products"
 
-TERMINAL_STATUSES = {"COMPLETE", "FAILED", "CANCELLED", "REJECTED"}
+# P42 import_status values that mean the import will never move again. Mirakl
+# also ends an import in TRANSFORMATION_FAILED (the whole file was rejected before
+# import) and EXPIRED (never picked up); both used to fall through every branch of
+# the status loop and sit until the 7-day sweep.
+TERMINAL_STATUSES = {
+    "COMPLETE",
+    "FAILED",
+    "CANCELLED",
+    "REJECTED",
+    "TRANSFORMATION_FAILED",
+    "EXPIRED",
+}
+
+
+def is_terminal_import_status(status: str) -> bool:
+    status = (status or "").upper()
+    return status in TERMINAL_STATUSES or status.endswith("_FAILED")
+
+
+class SpoApiError(Exception):
+    """An SPO HTTP call answered with an error status.
+
+    Carries the status so the row can say "HTTP 401 Unauthorized" instead of the
+    generic "Failed to submit to SPO" that hid four identical auth failures in a
+    row in August 2026.
+    """
+
+    def __init__(self, operation: str, status_code: int, body: str) -> None:
+        self.operation = operation
+        self.status_code = status_code
+        self.body = (body or "").strip()
+        super().__init__(f"SPO {operation} failed: HTTP {status_code} - {self.body}")
+
+    def display(self) -> str:
+        message = ""
+        try:
+            parsed = json.loads(self.body)
+            if isinstance(parsed, dict):
+                message = str(parsed.get("message") or parsed.get("error") or "")
+        except (ValueError, TypeError):
+            message = self.body
+        message = _sanitize_error_text(message)[:120]
+        return f"SPO {self.operation} failed: HTTP {self.status_code}" + (
+            f" {message}" if message else ""
+        )
+
 
 MAX_ERROR_DISPLAY_LENGTH = 500
 
@@ -473,13 +519,14 @@ class SpoService:
             logger.info(f"SPO P41 upload successful: import_id={import_id}")
             return import_id
         else:
-            raise Exception(f"SPO P41 upload failed: HTTP {response.status_code} - {response.text}")
+            raise SpoApiError("P41 upload", response.status_code, response.text)
 
     async def check_import_status(self, import_id: int) -> dict[str, Any]:
         client = await self._get_client()
         url = f"{self.api_endpoint}/products/imports/{import_id}"
         response = await client.get(url, timeout=30.0)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            raise SpoApiError("P42 status check", response.status_code, response.text)
         return response.json()
 
     async def get_error_report(self, import_id: int) -> list[dict[str, str]]:
@@ -609,9 +656,7 @@ class SpoService:
             logger.info(f"SPO OF01 upload successful: import_id={import_id}")
             return import_id
         else:
-            raise Exception(
-                f"SPO OF01 upload failed: HTTP {response.status_code} - {response.text}"
-            )
+            raise SpoApiError("OF01 upload", response.status_code, response.text)
 
     async def check_offer_status(self, import_id: int) -> dict[str, Any]:
         client = await self._get_client()

@@ -108,3 +108,37 @@ async def record_step(
         [ids, json.dumps(meta or {}), json.dumps([new_step(step, **details)])],
     )
     logger.debug(f"recorded step '{step}' for {len(ids)} submission(s)")
+
+
+# Top-level merge only, no step appended. For state that is rewritten every poll
+# cycle (the last status-check outcome) and must not grow the timeline by one
+# entry per cycle. updated_at is deliberately NOT touched: the stale sweeps key on
+# it, and a row whose status check fails every cycle must still age out.
+_MERGE_META_SQL = (
+    "UPDATE listing_submissions "
+    "SET platform_meta = COALESCE(platform_meta, '{}'::jsonb) || $2::jsonb "
+    "WHERE id = ANY($1::bigint[])"
+)
+
+
+async def merge_meta(submission_ids: Sequence[int] | int, meta: dict[str, Any]) -> None:
+    """Merge `meta` into the top level of platform_meta without recording a step
+    and without bumping updated_at."""
+    ids = (
+        [submission_ids]
+        if isinstance(submission_ids, int)
+        else [int(i) for i in submission_ids]
+    )
+    if not ids or not meta:
+        return
+    conn = connections.get("default")
+    await conn.execute_query(_MERGE_META_SQL, [ids, json.dumps(meta)])
+
+
+def last_step(submission: Any) -> str | None:
+    """Name of the most recent step on a submission, or None if it has none."""
+    steps = (getattr(submission, "platform_meta", None) or {}).get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        return None
+    entry = steps[-1]
+    return entry.get("step") if isinstance(entry, dict) else None

@@ -15,7 +15,7 @@ from services.grailed_service import grailed_service
 from services.template_service import TemplateService
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
-from utils.submission_steps import record_step
+from utils.submission_steps import last_step, record_step
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,9 @@ class GrailedPoller(BasePoller):
     def __init__(self) -> None:
         super().__init__(config_section="grailed_poller", name="GrailedPoller")
         cfg = config.get("grailed_poller", {})
+        # A row in PROCESSING this long was abandoned by a flush that died. It is
+        # requeued (see _requeue_interrupted), so the cost of the timeout being too
+        # short is a duplicate AppScript call that dedups, not a wrong status.
         self.stale_timeout_minutes: int = cfg.get("stale_processing_timeout_minutes", 60)
 
     async def _get_grailed_settings(self) -> dict[str, Any]:
@@ -67,21 +70,46 @@ class GrailedPoller(BasePoller):
             updated_at__lt=cutoff,
         ).all()
 
-        for sub in stale:
-            # A row stuck in PROCESSING means a flush was interrupted after we
-            # committed to sending it. The AppScript call may have created the
-            # listing, so we fail (not requeue) to avoid double-listing and leave
-            # it for manual review.
-            logger.warning(f"{self.name}: stale processing submission {sub.id}, marking failed")
-            sub.status = SubmissionStatus.FAILED
-            sub.error_display = "Batch interrupted - verify on Grailed before resubmitting"
-            await sub.save(update_fields=["status", "error_display", "updated_at"])
-            await record_step(
-                sub.id,
-                "failed",
-                stage="stale_processing",
-                reason="batch interrupted after commit to send; may already be on Grailed",
+        if stale:
+            logger.warning(
+                f"{self.name}: {len(stale)} stale processing submission(s), requeueing"
             )
+            await self._requeue_interrupted(stale, cause="no progress in "
+                                            f"{self.stale_timeout_minutes} minutes")
+
+    async def _requeue_interrupted(
+        self, subs: list[ListingSubmission], *, cause: str
+    ) -> None:
+        """Hand interrupted rows back to PENDING, saying how far each one got.
+
+        Requeued, not failed, in both cases. These used to be failed with "verify
+        on Grailed before resubmitting" on the theory that the AppScript call may
+        have landed, but submit_batch already relies on addListings deduping by
+        SKU to retry a call with no definitive answer, and the same property makes
+        a resend of an interrupted chunk an update rather than a duplicate. A
+        failed row cost an operator a manual check and a resubmit for nothing.
+
+        The `sending` step (recorded immediately before the AppScript call) is what
+        says whether the call was made; `submitting` alone means the chunk never
+        got that far.
+        """
+        made_call = [s.id for s in subs if last_step(s) == "sending"]
+        not_sent = [s.id for s in subs if last_step(s) != "sending"]
+        for ids, reason in (
+            (made_call, f"interrupted after the AppScript call was made ({cause}); "
+                        "addListings dedups by SKU so a resend updates in place"),
+            (not_sent, f"interrupted before the AppScript call ({cause}); nothing was sent"),
+        ):
+            if not ids:
+                continue
+            await ListingSubmission.filter(
+                id__in=ids, status=SubmissionStatus.PROCESSING
+            ).update(
+                status=SubmissionStatus.PENDING,
+                platform_status=None,
+                error_display="Grailed batch interrupted, will retry",
+            )
+            await record_step(ids, "requeued", stage="submitting", reason=reason)
 
     async def _batch_upload_pending(self, force: bool = False) -> dict[str, Any]:
         grailed_settings = await self._get_grailed_settings()
@@ -142,7 +170,14 @@ class GrailedPoller(BasePoller):
             chunk_size=batch_size,
         )
 
-        template = await TemplateService.get_template_by_id("default")
+        try:
+            template = await TemplateService.get_template_by_id("default")
+        except Exception:
+            # Nothing has been sent; every claimed row goes back.
+            logger.exception(f"{self.name}: template fetch failed, requeueing batch")
+            subs = await ListingSubmission.filter(id__in=submission_ids)
+            await self._requeue_interrupted(subs, cause="template fetch failed")
+            raise
         field_definitions = template.field_definitions if template else []
 
         total_success = 0
@@ -155,6 +190,29 @@ class GrailedPoller(BasePoller):
         return {"submission_count": total_success, "batch_count": chunk_count}
 
     async def _submit_chunk(
+        self, chunk_ids: list[int], field_definitions: list[dict[str, Any]]
+    ) -> int:
+        """One chunk, isolated: a crash in this chunk must not abandon the next.
+
+        An unexpected exception (a DB write failing mid-attribution, say) used to
+        propagate out of the chunk loop, so chunks two onward were never sent and
+        every row of theirs sat in PROCESSING until the stale sweep. The rows of
+        THIS chunk that are still PROCESSING are requeued the same way the sweep
+        would, and the loop carries on.
+        """
+        try:
+            return await self._run_chunk(chunk_ids, field_definitions)
+        except Exception as e:
+            logger.exception(f"{self.name}: chunk of {len(chunk_ids)} aborted")
+            live = await ListingSubmission.filter(
+                id__in=chunk_ids, status=SubmissionStatus.PROCESSING
+            )
+            await self._requeue_interrupted(
+                live, cause=f"{type(e).__name__}: {str(e)[:200]}"
+            )
+            return 0
+
+    async def _run_chunk(
         self, chunk_ids: list[int], field_definitions: list[dict[str, Any]]
     ) -> int:
         submissions = await ListingSubmission.filter(id__in=chunk_ids).prefetch_related("listing")
@@ -206,6 +264,12 @@ class GrailedPoller(BasePoller):
 
         if not all_products or not active_ids:
             return 0
+
+        # The commitment marker, written by nothing else: a row whose last step is
+        # `sending` got as far as the call. _requeue_interrupted reads it.
+        await record_step(
+            active_ids, "sending", rows=len(all_products), submissions=len(active_ids)
+        )
 
         try:
             response_data = await grailed_service.submit_batch(all_products)
