@@ -782,13 +782,18 @@ class ShopifyAdmin:
             mutation($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
               productCreate(product: $product, media: $media) {
                 product { id handle title status }
+                # userErrors is the ONLY error array on ProductCreatePayload. There is no
+                # mediaUserErrors here - introspected against 2026-01, the type carries
+                # exactly product, shop and userErrors - so selecting one makes Shopify
+                # reject the whole document and no product is created at all. That field
+                # belongs to ProductCreateMediaPayload and ProductDeleteMediaPayload,
+                # where it is selected below.
+                #
+                # The consequence is that a media-only failure during productCreate is
+                # still silent, which is how ADS-MSNK-2038 went live with mediaCount 0
+                # while GCS held nine photos. What catches it is _sync_media on the next
+                # submit, not anything askable here.
                 userErrors { field message }
-                # Requested because a media-only failure used to pass SILENTLY: the
-                # product was created with no images and nothing reported it.
-                # ADS-MSNK-2038 sat live on 1nventory with mediaCount 0 while GCS held
-                # nine edited photos. shopify_client raises on whichever error array is
-                # populated, so asking for this is what makes the failure visible.
-                mediaUserErrors { field message }
               }
             }
             """,
@@ -975,8 +980,18 @@ class ShopifyAdmin:
     #
     # Shopify copies an image's BYTES at attach time and never re-reads the source URL,
     # exactly like SellerCloud. So an edited photo reaches a product already on the store
-    # only if something replaces the media; productUpdate cannot do it and neither can
-    # re-running productCreate.
+    # only if something replaces the media - re-running productCreate will not do it.
+    #
+    # Both calls below are deprecated on 2026-01. create_media has moved to its
+    # replacement; delete_media cannot until the app is granted write_files, and says so
+    # at length. The deprecation is not the only reason to move: both old mutations
+    # report failures in `mediaUserErrors`, and shopify_client inspects `userErrors` and
+    # nothing else, so a media failure was silent even with the field selected.
+    # productUpdate returns `userErrors`, so create_media now raises where it used to
+    # swallow; delete_media logs, which is the most it can do.
+    #
+    # MEDIA_PAGE bounds both the read and the diff below. MAX_PRODUCT_IMAGES is 8 in
+    # image_service and a replace transiently holds both sets, so 50 is ample.
 
     async def product_media(self, gid: str) -> list[dict[str, Any]]:
         """Current media on a product, newest-relevant fields only."""
@@ -998,27 +1013,66 @@ class ShopifyAdmin:
         return ((data.get("product") or {}).get("media") or {}).get("nodes") or []
 
     async def create_media(self, gid: str, sources: Sequence[str]) -> list[dict[str, Any]]:
-        """productCreateMedia. Shopify fetches each URL asynchronously."""
+        """Attach images by URL. Shopify fetches each one asynchronously.
+
+        productUpdate's `media` argument, which APPENDS. productCreateMedia is deprecated
+        on 2026-01 - "Use `productUpdate` or `productSet` instead". productSet is the
+        other suggestion and is deliberately NOT used: it is declarative over the whole
+        media list, so a source Shopify fails to fetch would leave the product holding
+        nothing, which destroys the add-then-delete ordering the caller depends on to
+        never blank a live product.
+
+        The `product` input carries ONLY the id. productUpdate also accepts `tags` and
+        that field is replace-mode - see the prohibition at the top of this module.
+
+        ProductUpdatePayload has no media field of its own, so the newly attached nodes
+        are found by diffing against what the product held a moment ago rather than being
+        handed back the way productCreateMedia handed them back. Nothing else writes media
+        for one product concurrently, so the diff is exact.
+        """
         if not sources:
             return []
+        before = {n["id"] for n in await self.product_media(gid)}
         data = await self.client.execute(
             """
-            mutation($productId: ID!, $media: [CreateMediaInput!]!) {
-              productCreateMedia(productId: $productId, media: $media) {
-                media { id status }
-                mediaUserErrors { field message }
+            mutation($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+              productUpdate(product: $product, media: $media) {
+                product { media(first: 50) { nodes { id status } } }
+                userErrors { field message }
               }
             }
             """,
-            {"productId": gid,
+            {"product": {"id": gid},
              "media": [{"originalSource": u, "mediaContentType": "IMAGE"} for u in sources]},
-            operation=f"productCreateMedia[{self.store_id}]",
-            mutation_name="productCreateMedia", is_write=True,
+            operation=f"productUpdate.media[{self.store_id}]",
+            mutation_name="productUpdate", is_write=True,
         )
-        return (data.get("productCreateMedia") or {}).get("media") or []
+        nodes = ((((data.get("productUpdate") or {}).get("product") or {})
+                  .get("media") or {}).get("nodes") or [])
+        return [n for n in nodes if n["id"] not in before]
 
     async def delete_media(self, gid: str, media_ids: Sequence[str]) -> int:
-        """productDeleteMedia. Call ONLY after the replacements are READY."""
+        """productDeleteMedia. Call ONLY once the replacements are READY.
+
+        STILL ON THE DEPRECATED MUTATION, and not by oversight. 2026-01 deprecates it in
+        favour of `fileUpdate` with referencesToRemove, which was written and tested and
+        then reverted: fileUpdate is refused by this app's credential.
+
+            Access denied for fileUpdate field. Required access: `write_files` access
+            scope or `write_themes` access scope.
+
+        The 1nventory app holds write_products and write_publications only, so migrating
+        this call needs a scope grant and a re-authorisation first. productCreateMedia,
+        the other half of the pair, moved to productUpdate without any of that because
+        productUpdate is covered by write_products.
+
+        NOTE ON ERRORS: ProductDeleteMediaPayload has no `userErrors` field at all - its
+        only error array is `mediaUserErrors`, and shopify_client inspects `userErrors`
+        and nothing else. So a failure here CANNOT raise through the transport, and the
+        warning below is the only place it surfaces. The returned count comes from
+        deletedMediaIds, so a partial failure shows up as a short number in the caller's
+        step log rather than being reported as a clean removal.
+        """
         if not media_ids:
             return 0
         data = await self.client.execute(
@@ -1034,7 +1088,14 @@ class ShopifyAdmin:
             operation=f"productDeleteMedia[{self.store_id}]",
             mutation_name="productDeleteMedia", is_write=True,
         )
-        return len((data.get("productDeleteMedia") or {}).get("deletedMediaIds") or [])
+        payload = data.get("productDeleteMedia") or {}
+        errors = payload.get("mediaUserErrors") or []
+        if errors:
+            logger.warning(
+                "productDeleteMedia[%s] %s refused %d of %d: %s",
+                self.store_id, gid, len(errors), len(media_ids), errors,
+            )
+        return len(payload.get("deletedMediaIds") or [])
 
     async def delete_product(self, gid: str) -> bool:
         """productDelete. IRREVERSIBLE - no undelete API exists.
