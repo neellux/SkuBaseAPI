@@ -319,26 +319,16 @@ class GoatPoller(BasePoller):
         list_name = config.get("goat", {}).get("email_list_name", "")
         if not list_name:
             return
-        subject = (
-            f"GOAT batch {tab['tab_title']} - "
-            f"{written} listing{'s' if written != 1 else ''} ready"
-        )
-        # PLAIN TEXT, not HTML. The AppScript takes only (to, subject, body) and
-        # passes the body straight to MailApp.sendEmail, which sends it as text -
-        # HTML arrives as visible tags. Probed htmlBody / html / isHtml / bodyHtml
-        # and all four were accepted-and-ignored, so none can be relied on.
-        # A bare URL on its own line is auto-linked by every mail client.
-        body = (
-            f"A new GOAT batch is ready for review.\n\n"
-            f"Sheet:    {tab['tab_title']}\n"
-            f"Listings: {written}\n"
-            f"Batch:    {import_id}\n\n"
-            f"{tab['sheet_url']}\n\n"
-            f"For each row, fill SKU (GOAT), or tick Denied.\n"
-            f"Tick STV where it applies.\n"
-            f"Progress is tracked on the Master Sheet.\n"
-        )
-        await email_service.send_to_list(list_name, subject, body)
+        # M/D/YYYY with slashes in the subject, matching how the sheet is
+        # referred to in conversation. The tab itself is named with dots.
+        now = datetime.now(timezone.utc)
+        subject = f"New PT Sheet: {now.month}/{now.day}/{now.year}"
+        url = tab["sheet_url"]
+        # Plain-text fallback spells the URL out, because the AppScript may render
+        # only this one. The HTML version carries the "here" hyperlink.
+        body = f"Please see the new PT sheet here: {url}"
+        html_body = f'<p>Please see the new PT sheet <a href="{url}">here</a></p>'
+        await email_service.send_to_list(list_name, subject, body, html_body)
 
     # -- stage 2 -----------------------------------------------------------
 

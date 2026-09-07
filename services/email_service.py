@@ -76,6 +76,7 @@ async def send(
     subject: str,
     body: str,
     *,
+    html_body: str | None = None,
     cc: Sequence[str] = (),
     bcc: Sequence[str] = (),
 ) -> bool:
@@ -84,6 +85,14 @@ async def send(
     The AppScript wants comma-separated recipient strings, not arrays, and
     answers 200 with {"success": false, "error": ...} on a bad payload rather
     than an HTTP error - so the body has to be checked, not just the status.
+
+    ALWAYS SEND BOTH BODIES. The AppScript documents only (to, subject, body) and
+    hands `body` to MailApp.sendEmail, which renders it as plain text - an HTML
+    string there arrives as visible tags. Whether it honours `htmlBody` could not
+    be determined from the API (it accepts and ignores unknown params, answering
+    success either way). Sending both means the message is correct under either
+    behaviour: the rich version if it is supported, a readable plain-text version
+    with the URL spelled out if it is not.
     """
     if not (ENDPOINT and API_KEY):
         logger.debug("email: [email] endpoint/api_key not configured, skipping")
@@ -98,6 +107,8 @@ async def send(
         "subject": subject,
         "body": body,
     }
+    if html_body:
+        payload["htmlBody"] = html_body
     if cc:
         payload["cc"] = ", ".join(cc)
     if bcc:
@@ -125,14 +136,16 @@ async def send(
     return True
 
 
-async def send_to_list(name: str, subject: str, body: str) -> bool:
+async def send_to_list(
+    name: str, subject: str, body: str, html_body: str | None = None
+) -> bool:
     """Resolve a named list and send to it. Never raises."""
     try:
         recipients = await resolve_list(name)
         if not recipients or not recipients["to"]:
             return False
         return await send(
-            recipients["to"], subject, body,
+            recipients["to"], subject, body, html_body=html_body,
             cc=recipients["cc"], bcc=recipients["bcc"],
         )
     except Exception:  # noqa: BLE001 - a notification must never break a caller
