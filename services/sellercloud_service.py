@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 
 CUSTOM_COLUMN_FIELDS = {"SIZING_SCHEME", "GENDER", "HTMLDESCRIPTION_FIXED"}
 
+# SellerCloud field ids submit_listing_to_sellercloud fills in itself. Sent
+# whether or not a template field happens to map to them.
+DERIVED_SELLERCLOUD_FIELDS = {"ShippingWeight", "LongDescription"}
+
 CHILD_UPDATE_CONCURRENCY = 3
 
 FIELD_NAME_OVERRIDES = {
@@ -1450,6 +1454,22 @@ class SellerCloudService:
                     transformed_form_data[key] = value
 
             form_data = transformed_form_data
+
+            # Every field id SellerCloud is willing to hear about. listings.data
+            # holds the whole listing, not the SellerCloud part of it: the eBay
+            # aspects (Type, Style, Department, Inseam, ebay_category_id) live on
+            # the same row, and the payload loop below used to forward every
+            # unrecognised key verbatim. SellerCloud answered "Column NOT found"
+            # for each, so nothing was ever written by them, but a MULTI
+            # cardinality aspect is a LIST, and a non-scalar Value makes
+            # SellerCloud reject the WHOLE AdvancedInfo request with 400
+            # "Invalid Request." - which failed every child of DNT-MACC-0073 on
+            # 2026-09-07 over an eBay Style of ["Western Belt"].
+            sellercloud_field_ids = (
+                {mapping["field_id"] for mapping in sc_field_mapping.values()}
+                | CUSTOM_COLUMN_FIELDS
+                | DERIVED_SELLERCLOUD_FIELDS
+            )
             logger.debug(
                 f"Transformed {len(sc_field_mapping)} fields to SellerCloud field IDs"
             )
@@ -1601,6 +1621,12 @@ class SellerCloudService:
                     continue
 
                 if field_name in SKIP_FIELDS:
+                    continue
+
+                if field_name not in sellercloud_field_ids:
+                    logger.debug(
+                        f"Skipping '{field_name}': not a SellerCloud field for this template"
+                    )
                     continue
 
                 if field_name in CUSTOM_COLUMN_FIELDS:
