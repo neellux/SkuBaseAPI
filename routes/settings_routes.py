@@ -223,12 +223,37 @@ EBAY_DEFAULT_SETTINGS = {
 }
 
 
+# require_size_mapping is FALSE and must stay so: check_unmapped_sizes defaults it to
+# True, and GOAT never sends a Sizes column, so leaving it out would 422 every submit on
+# unmapped_sizes for a column that is always blank. require_type_mapping is off because
+# GOAT's Product Type comes from listingoptions_types.sizing_types, not from a goat type
+# mapping.
+#
+# THESE DEFAULTS DO NOT REACH THE DATABASE. _hydrate_platform_settings decorates the GET
+# response only; every consumer that matters (recompute_listing_submitted,
+# check_unmapped_sizes, submission_poller's stale sweep, _get_platform_settings_for) reads
+# the raw app_settings.platform_settings column. They must be written with
+# set_platform_setting() BEFORE 'goat' is added to app_settings.platforms - see
+# API/migrations/add_goat_platform.sql.
+GOAT_DEFAULT_SETTINGS = {
+    "manual_fallback": True,
+    "min_batch_size": 100,
+    "allow_resubmit": True,
+    "requires_images": True,
+    "require_size_mapping": False,
+    "require_type_mapping": False,
+    "require_color_mapping": True,
+    "require_brand_mapping": True,
+}
+
+
 def _hydrate_platform_settings(platform_settings: dict) -> dict:
     merged = dict(platform_settings or {})
     for platform_id, defaults in (
         ("spo", SPO_DEFAULT_SETTINGS),
         ("grailed", GRAILED_DEFAULT_SETTINGS),
         ("ebay", EBAY_DEFAULT_SETTINGS),
+        ("goat", GOAT_DEFAULT_SETTINGS),
     ):
         platform = dict(merged.get(platform_id) or {})
         for key, default_value in defaults.items():

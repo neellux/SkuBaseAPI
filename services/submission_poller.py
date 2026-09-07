@@ -15,12 +15,14 @@ from services.base_poller import BasePoller
 from services.oneinventory_service import oneinventory_service
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
+from tortoise.functions import Count
 from tortoise.transactions import in_transaction
 from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
 
 STALE_PENDING_MINUTES = 10
+STALE_QUEUED_DAYS = 30
 
 
 class SubmissionPoller(BasePoller):
@@ -33,7 +35,29 @@ class SubmissionPoller(BasePoller):
 
     async def _poll_cycle(self) -> None:
         await self._recover_stale_submissions()
+        await self._report_aged_queued()
         await self._process_queued_submissions()
+
+    async def _report_aged_queued(self) -> None:
+        """Say out loud how many rows have been QUEUED for longer than anyone
+        intends. A queued row waits for its listing's photos to upload, and nothing
+        sweeps or ages it: on 2026-09-05 prod carried 60 Grailed and 56 SPO rows
+        queued since May and June for listings whose photos never came. Status is
+        left alone, this is a warning only, so the decision stays with a person."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=STALE_QUEUED_DAYS)
+        aged = await (
+            ListingSubmission.filter(
+                status=SubmissionStatus.QUEUED, created_at__lt=cutoff
+            )
+            .group_by("platform_id")
+            .annotate(n=Count("id"))
+            .values("platform_id", "n")
+        )
+        if aged:
+            logger.warning(
+                f"{self.name}: queued for more than {STALE_QUEUED_DAYS} days: "
+                + ", ".join(f"{row['platform_id']}={row['n']}" for row in aged)
+            )
 
     async def _recover_stale_submissions(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_PENDING_MINUTES)
@@ -166,9 +190,10 @@ class SubmissionPoller(BasePoller):
                 # run_submission owns the status/step/external_id writes, so a row from
                 # here is indistinguishable from one submitted inline by listing_routes.
                 await oneinventory_service.run_submission(submission, listing)
-            elif submission.platform_id in ("grailed", "spo", "ebay"):
+            elif submission.platform_id in ("grailed", "spo", "ebay", "goat"):
                 # manual_fallback batch platforms handled by their own pollers
-                # (grailed_poller / spo_poller); nothing to do per-listing.
+                # (grailed_poller / spo_poller / goat_poller); nothing to do
+                # per-listing.
                 #
                 # ebay is listed here before it has a poller on purpose. It is disabled
                 # (absent from app_settings.platforms) so no rows should exist, but the

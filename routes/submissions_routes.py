@@ -25,6 +25,7 @@ from models.db_models import (
 from services import spo_service as spo_service_module
 from services.ebay_poller import ebay_poller
 from services.grailed_poller import grailed_poller
+from services.goat_poller import goat_poller
 from services.spo_poller import spo_poller
 from services.spo_service import spo_service
 from services.template_service import TemplateService
@@ -32,6 +33,11 @@ from tortoise import connections
 from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
+
+# asyncio.create_task returns a task the event loop only weakly references, so a
+# backgrounded batch can be garbage collected while it is still running. Every
+# create_task in this module should be registered here.
+_background_tasks: set[asyncio.Task] = set()
 router = APIRouter(prefix="/submissions", tags=["submissions"])
 
 
@@ -397,6 +403,36 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
                 logger.exception("Background eBay batch %s failed", import_id)
 
         asyncio.create_task(_run_ebay_batch())
+        return CreateBatchResponse(
+            platform=platform,
+            submission_count=len(submission_ids),
+            product_import_id=import_id,
+        )
+
+    if platform == "goat":
+        # eBay's shape, not Grailed's. The rows are claimed under the lock here so
+        # submission_count is the real number: counting first and claiming later in a
+        # background task lets the scheduled cycle claim the same rows in the gap and
+        # report a batch that never happened.
+        #
+        # Backgrounded because a flush is a Drive copy plus one permission call per GOAT
+        # address plus the append, which is seconds of network the browser should not hold.
+        import_id, submission_ids = await goat_poller.begin_batch(force=True)
+        if not submission_ids or import_id is None:
+            return CreateBatchResponse(
+                platform=platform, submission_count=0, product_import_id=None
+            )
+
+        async def _run_goat_batch():
+            try:
+                await goat_poller.run_batch(import_id, submission_ids)
+            except Exception:
+                # run_batch records its own failures on the rows; this only catches a
+                # crash outside them, which would otherwise vanish with the task.
+                logger.exception("Background GOAT batch %s failed", import_id)
+
+        _background_tasks.add(task := asyncio.create_task(_run_goat_batch()))
+        task.add_done_callback(_background_tasks.discard)
         return CreateBatchResponse(
             platform=platform,
             submission_count=len(submission_ids),

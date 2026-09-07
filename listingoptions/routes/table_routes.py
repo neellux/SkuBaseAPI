@@ -40,7 +40,7 @@ EXCLUDED_SENTINEL = "__EXCLUDED__"
 # Platforms integrated in our listing/submission flow. A blank ("skip") mapping
 # is only allowed for these; every other platform must have a value or be
 # explicitly Excluded. Hardcoded for now — will move to DB/settings later.
-LISTING_PLATFORM_IDS = {"spo", "grailed", "ebay"}
+LISTING_PLATFORM_IDS = {"spo", "grailed", "ebay", "goat"}
 
 
 @router.post("/create", response_model=SuccessResponse)

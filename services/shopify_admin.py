@@ -365,6 +365,55 @@ class ShopifyAdmin:
             is_write=True,
         )
 
+    # -- metafield writes --------------------------------------------------
+
+    # metafieldsSet takes up to 25 inputs per call and they may target DIFFERENT
+    # owners, so a 100-product batch is 4 calls rather than 100. Its cost is NOT
+    # in the measured set at the top of this file (that covers tagsAdd,
+    # tagsRemove and productUpdate at 10 flat); treat the chunk size as a limit
+    # from the API rather than as a cost estimate until it is measured live.
+    METAFIELDS_SET_CHUNK = 25
+
+    async def set_metafields(
+        self, entries: Sequence[Mapping[str, Any]]
+    ) -> dict[str, str]:
+        """Write product metafields in bulk. Returns {ownerId: error} for failures.
+
+        `entries` are {ownerId, namespace, key, type, value} dicts.
+
+        `elementIndex` in the userErrors selection is load-bearing, not
+        decoration: without it a failure cannot be attributed to one input, and
+        the caller would have to treat the whole chunk of 25 as ambiguous.
+        """
+        if not entries:
+            return {}
+        failures: dict[str, str] = {}
+        for start in range(0, len(entries), self.METAFIELDS_SET_CHUNK):
+            chunk = list(entries[start : start + self.METAFIELDS_SET_CHUNK])
+            data = await self.client.execute(
+                """
+                mutation($metafields: [MetafieldsSetInput!]!) {
+                  metafieldsSet(metafields: $metafields) {
+                    metafields { id key namespace }
+                    userErrors { field message code elementIndex }
+                  }
+                }
+                """,
+                {"metafields": chunk},
+                operation=f"metafieldsSet[{self.store_id}]",
+                mutation_name="metafieldsSet",
+                is_write=True,
+            )
+            for err in (data.get("metafieldsSet") or {}).get("userErrors") or []:
+                index = err.get("elementIndex")
+                owner = (
+                    chunk[index]["ownerId"]
+                    if isinstance(index, int) and 0 <= index < len(chunk)
+                    else "unknown"
+                )
+                failures[owner] = err.get("message", "metafieldsSet rejected the value")
+        return failures
+
     async def remove_tags(self, gid: str, tags: Sequence[str]) -> None:
         """Remove ONLY tags this automation owns. Never a blanket replace."""
         if not tags:
