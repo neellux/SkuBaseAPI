@@ -199,6 +199,15 @@ class Listing(Model):
         null=True,
         description="Full SellerCloud product ID, including variations",
     )
+    company_code = fields.IntField(
+        null=True,
+        description=(
+            "parent_products.company_code for this product, copied in at creation. "
+            "listing_required_platforms needs it to drop a platform that does not "
+            "list this company (eBay takes 182 only) and cannot reach the products "
+            "database itself. Write-once: a product does not change company"
+        ),
+    )
 
     assigned_to = fields.CharField(
         max_length=100,

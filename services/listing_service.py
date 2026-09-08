@@ -633,8 +633,26 @@ class ListingService:
             if await ListingService._check_photos_uploaded(request.product_id):
                 upload_status = "uploaded"
 
+            # Copied in once, because listing_required_platforms has to see it and
+            # lives in a database that cannot reach parent_products: no dblink or
+            # FDW, and the company is not readable off the SKU prefix. A platform
+            # that refuses this company (eBay takes 182 only) is then dropped from
+            # the required set the same way a brand exclusion drops one, instead of
+            # sitting pending on a submission that can never be made.
+            #
+            # None on failure, never fatal: an unknown company keeps every platform
+            # required, which is the behaviour that existed before this column.
+            try:
+                company_code = await EbayService.company_code(request.product_id)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"Could not resolve company for {request.product_id}: {e}"
+                )
+                company_code = None
+
             listing = await Listing.create(
                 product_id=request.product_id,
+                company_code=company_code,
                 info_product_id=request.info_product_id,
                 assigned_to=request.assigned_to,
                 data=prefilled_data,
@@ -1289,9 +1307,18 @@ class ListingService:
         return ListingResponse(
             id=str(listing.id),
             product_id=listing.product_id,
-            company_code=await EbayService.company_code(listing.product_id)
-            if listing.product_id
-            else None,
+            # The stored copy where there is one, which is every listing created
+            # since the column landed. The live lookup stays as the fallback for
+            # rows the backfill could not resolve, so the eBay section keeps
+            # deciding what it always did rather than reading a NULL as "no
+            # company on record".
+            company_code=listing.company_code
+            if listing.company_code is not None
+            else (
+                await EbayService.company_code(listing.product_id)
+                if listing.product_id
+                else None
+            ),
             info_product_id=listing.info_product_id,
             assigned_to=listing.assigned_to,
             data=listing.data,
