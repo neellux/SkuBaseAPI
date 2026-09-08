@@ -35,7 +35,7 @@ import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
-from models.db_models import Listing
+from models.db_models import AppSettings, Listing
 from services.ebay_aspect_service import ebay_aspect_service
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.listing_options_service import listing_options_service
@@ -410,6 +410,36 @@ class EbayService:
         return bool(EbayService.size_specific_names(detail))
 
     @staticmethod
+    async def raw_size_is_enough(
+        product_type: Optional[str], requested_category: Optional[str] = None
+    ) -> bool:
+        """True when this category asks for nothing the raw size cannot answer.
+
+        The whole test is whether a SIZE TYPE aspect is in play. `US Shoe Size` on sneakers
+        (15709) takes "13" and the category has no Size Type aspect at all, so a US scheme's
+        size is already the complete answer. `Size` on hoodies (155183) sits beside a
+        REQUIRED `Size Type`, and "M" cannot say whether that is Regular M or Big & Tall M --
+        only the mapping carries that, which is exactly what its "Regular " prefix is for.
+
+        So this is NOT "is the scheme US". Men's SML is region US and still needs its mapping
+        on apparel. Region says the size VALUE needs no conversion; this says nothing else is
+        being asked for beside it. Both have to hold.
+
+        Conservative on every unknown: no category, no aspects, or aspects that include a
+        size type all return False, leaving the mapping demanded exactly as before.
+        """
+        category_id = await ebay_aspect_service.resolve_listing_category(
+            product_type, requested_category
+        )
+        if not category_id:
+            return False
+        detail = await ebay_aspect_service.get_category_aspects(category_id)
+        if not detail:
+            return False
+        names = EbayService.size_specific_names(detail)
+        return bool(names) and not any("type" in n.lower() for n in names)
+
+    @staticmethod
     async def _value_from_mapping(resolved_by: str, data: Dict[str, Any]) -> Optional[str]:
         """The eBay value a brand or colour mapping already holds for this listing.
 
@@ -558,6 +588,25 @@ class EbayService:
             elif sizes:
                 problems.append("listing has no SIZING_SCHEME, sizes cannot be mapped")
 
+        # Resolved once, not per child: one settings read and one scheme read for the whole
+        # listing. Only consulted when eBay actually wants a size AND says it wants US ones.
+        us_native = False
+        if size_names and data.get("SIZING_SCHEME"):
+            app_settings = await AppSettings.first()
+            ebay_settings = (
+                (app_settings.platform_settings if app_settings else None) or {}
+            ).get("ebay") or {}
+            # BOTH conditions. Region says the size value needs no conversion; the aspect
+            # check says nothing else is asked for beside it. Men's SML is region US and
+            # still needs its mapping on apparel, where Size Type is a separate required
+            # aspect the raw size cannot answer.
+            if ebay_settings.get("require_us_size") and not any(
+                "type" in n.lower() for n in size_names
+            ):
+                us_native = await listing_options_service.scheme_sizes_are_platform_ready(
+                    data.get("SIZING_SCHEME")
+                )
+
         rows: List[Tuple[str, str, str, str, str]] = []
         for child_id, size in targets:
             for name, value in pairs:
@@ -565,10 +614,27 @@ class EbayService:
             if not size_names:
                 continue
             mapped = size_map.get(size) if size else None
-            if not mapped:
+            if not mapped and us_native and size:
+                # The other half of the submit gate's US-native short-circuit. A US scheme's
+                # sizes already ARE eBay's values -- every US footwear mapping on file is the
+                # identity (7 -> "Standard 7"), while every EU one converts (40 -> "Standard
+                # 7") -- so a child with no mapping row still has a size to send.
+                #
+                # Without this, skipping the mapping dialog would produce a listing carrying
+                # no Size specific at all, which eBay refuses outright. Skipping the ASK is
+                # only safe because the ANSWER is already known.
+                #
+                # No Size Type: the raw size carries no prefix, and split_size_value would
+                # read "13" as size type "13" with an empty size. The categories this reaches
+                # are the ones whose size aspect is US Shoe Size, which have no Size Type
+                # aspect at all -- a category that requires one still needs its mapping, and
+                # its scheme is not one an operator would mark US-native for this purpose.
+                size_type, ebay_size = None, size
+            elif not mapped:
                 problems.append(f"{child_id}: size {size!r} is not mapped for eBay")
                 continue
-            size_type, ebay_size = EbayService.split_size_value(mapped)
+            else:
+                size_type, ebay_size = EbayService.split_size_value(mapped)
             for specific_name in size_names:
                 # One mapping row feeds both aspects: "Regular L" is Size Type "Regular"
                 # and Size "L". Which of the two this aspect wants is decided by its name,

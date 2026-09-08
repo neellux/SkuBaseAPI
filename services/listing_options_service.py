@@ -440,6 +440,36 @@ class ListingOptionsService:
     # see docs/plans/2026-08-27-feat-us-size-mappings-plan.md.
     US_NATIVE_REGIONS = {"US", "UNIVERSAL"}
 
+    async def scheme_sizes_are_platform_ready(self, sizing_scheme: str) -> bool:
+        """True when this scheme's sizes can go to a US-size platform with no mapping.
+
+        BOTH the region and the scheme's own require_us_size flag, for the same reason
+        check_missing_us_sizes demands both: region says the sizes need no CONVERSION, and
+        the flag is the curator saying so deliberately. Inferring it from region alone would
+        change behaviour for every US scheme the moment this shipped, including ones nobody
+        has looked at.
+
+        The flag is inert for a US scheme in its original meaning -- check_missing_us_sizes
+        short-circuits on region before ever reading it -- so giving it this second meaning
+        collides with nothing. On a US scheme it now reads as "these sizes ARE the platform
+        value"; on a non-US scheme it keeps its original meaning untouched.
+
+        Case-folded because region_code is free text with no DB constraint: the editor offers
+        a dropdown but the column accepts anything, so 'us', 'USA' and 'US ' must not
+        silently read as "not US".
+        """
+        if not sizing_scheme:
+            return False
+        conn = connections.get("default")
+        rows = await conn.execute_query_dict(
+            'SELECT region_code, require_us_size FROM listingoptions_sizing_schemes '
+            'WHERE sizing_scheme = $1 ORDER BY "order" LIMIT 1',
+            [sizing_scheme],
+        )
+        if not rows or not rows[0]["require_us_size"]:
+            return False
+        return (rows[0]["region_code"] or "").strip().upper() in self.US_NATIVE_REGIONS
+
     async def check_missing_us_sizes(
         self,
         sizing_scheme: str,

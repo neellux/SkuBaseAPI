@@ -890,6 +890,29 @@ async def submit_listing(
             product_type, form_data.get("ebay_category_id")
         ):
             size_platforms = [p for p in size_platforms if p != "ebay"]
+        # A US-native scheme needs no mapping for a platform that wants US sizes: its sizes
+        # ALREADY ARE the platform's values. Measured across every footwear mapping on file,
+        # each EU row converts (EU 40 -> Standard 7) and each US row is the identity
+        # (US 7 -> Standard 7), so the mapping does real work for EU and none at all for US.
+        #
+        # The same short-circuit check_missing_us_sizes already makes, for the same stated
+        # reason, one gate further on: "a US or Universal scheme's sizes already ARE the US
+        # sizes". This is that sentence applied to the mapping rather than the conversion.
+        #
+        # Keyed on the platform's require_us_size, not on eBay by name: the claim is only
+        # true for a platform that wants US sizes, and any platform that says so gets it.
+        # build_rows carries the other half -- it falls back to the raw size for exactly
+        # this case, so skipping the dialog does not mean sending nothing.
+        if (
+            "ebay" in size_platforms
+            and sizing_scheme
+            and (platform_settings.get("ebay") or {}).get("require_us_size")
+            and await listing_options_service.scheme_sizes_are_platform_ready(sizing_scheme)
+            and await ebay_service.raw_size_is_enough(
+                product_type, form_data.get("ebay_category_id")
+            )
+        ):
+            size_platforms = [p for p in size_platforms if p != "ebay"]
         if sizing_scheme and child_sizes and size_platforms:
             # Scheme order, not the hash order the set() above produced. Both gates below
             # preserve the order they are handed, and both feed a dialog that reads top to
