@@ -233,27 +233,48 @@ async def get_queue_around(
     listing_id: str,
     before: int = 2,
     after: int = 6,
+    assigned_to: Optional[List[str]] = None,
+    priority: Optional[List[str]] = None,
+    date_from: Optional[datetime] = None,
+    date_to: Optional[datetime] = None,
+    search: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Optional[int], int]:
     """(rows, position, total) for the window around one listing.
 
     Feeds the queue strip, the arrows and the position readout in one request.
 
-    Deliberately takes no filters. Table filters narrow the table only, never the walk,
-    so an operator who has filtered to one assignee still advances to the most valuable
-    product on the floor.
+    Takes the same filters as the table, because the walk is over the queue the
+    operator was looking at. An operator who filtered to one assignee is working that
+    assignee's pile, and an arrow that jumped out of it to the most valuable product on
+    the floor would leave the filter meaning nothing past the first product.
+
+    `position` and `total` are ranks within the FILTERED queue, so the strip's counter
+    reads against the same set the arrows walk.
 
     `position` is the anchor's rank, or None when the anchor is no longer in the queue
-    (it was just submitted, or a finished listing was opened to review it). In that
-    case the COALESCE below makes the window the front of the line, which is exactly
-    where the operator is about to go. Keying on the listing id rather than
-    reconstructing an ordering tuple is what buys that: no _sorts_after style OR
-    expansion, and the not-in-queue case falls out for free.
+    (it was just submitted, a finished listing was opened to review it, or it falls
+    outside the filters). In that case the COALESCE below makes the window the front of
+    the line, which is exactly where the operator is about to go. Keying on the listing
+    id rather than reconstructing an ordering tuple is what buys that: no _sorts_after
+    style OR expansion, and the not-in-queue case falls out for free.
     """
+    # The fixed four go in first, so build_filters numbers its placeholders from $5.
     params: List[Any] = [list(OPEN_BATCH_STATUSES), listing_id, before, after]
+    exact, like = await resolve_search(search)
+    where = build_filters(
+        params,
+        assigned_to=assigned_to,
+        priority=priority,
+        date_from=date_from,
+        date_to=date_to,
+        search_exact=exact,
+        search_like=like,
+    )
 
     sql = f"""
 WITH queue AS (
 {QUEUE_SELECT}
+  {where}
 ),
 ranked AS (
   SELECT *,

@@ -1609,17 +1609,33 @@ async def get_product_queue_around(
     listing_id: str = Query(..., description="Listing to centre the window on"),
     before: int = Query(2, ge=0, le=20, description="Rows before the anchor"),
     after: int = Query(6, ge=0, le=20, description="Rows after the anchor"),
+    assigned_to: Optional[List[str]] = Query(None, description="Filter by batch assignee"),
+    priority: Optional[List[str]] = Query(None, description="Filter by batch priority"),
+    date_from: Optional[str] = Query(None, description="Batch created from (YYYY-MM-DD)"),
+    date_to: Optional[str] = Query(None, description="Batch created to (YYYY-MM-DD)"),
+    search: Optional[str] = Query(None, description="Search by product ID"),
 ):
     """The window around one listing: the queue strip, the arrows and the position.
 
-    Takes no filters on purpose. Table filters narrow the table only, never the walk.
+    Takes the same filters as /listings/queue, because the walk is over the queue the
+    operator was looking at. Passing none of them walks the whole floor, which is what
+    a batch view opened outside the queue table does.
 
-    A null position means the anchor has left the queue (it was just submitted, or a
-    finished listing was opened to review it) and the rows are the front of the queue
-    instead of a window around it.
+    A null position means the anchor has left the queue (it was just submitted, a
+    finished listing was opened to review it, or it falls outside the filters) and the
+    rows are the front of the queue instead of a window around it.
     """
+    date_from_obj, date_to_obj = _queue_dates(date_from, date_to)
+
     rows, position, total = await product_queue_service.get_queue_around(
-        listing_id=listing_id, before=before, after=after
+        listing_id=listing_id,
+        before=before,
+        after=after,
+        assigned_to=assigned_to,
+        priority=priority,
+        date_from=date_from_obj,
+        date_to=date_to_obj,
+        search=search,
     )
     rows = await add_user_data(data=rows, keys=["assigned_to"], new_keys=["name"])
     return {"rows": rows, "position": position, "total": total}
