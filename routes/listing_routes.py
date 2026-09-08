@@ -38,6 +38,7 @@ from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import DEFAULT_BATCH_SORT, BatchService
 from services.ebay_aspect_service import ebay_aspect_service
+from services.external_listing_service import ExternalListingService
 from services.ebay_service import (
     ebay_service,
     EbayService,
@@ -508,6 +509,11 @@ async def get_submission_status(
 
     submissions = await ListingSubmission.filter(listing=listing_model).all()
 
+    settings = await AppSettings.first()
+    platform_settings = (
+        settings.platform_settings if settings and settings.platform_settings else {}
+    )
+
     # Platforms this listing's type/color/brand is excluded from are not part of
     # the listing at all, so they must not count toward its status (e.g. a
     # platform that failed and was later excluded must not keep the listing
@@ -551,9 +557,35 @@ async def get_submission_status(
         else True
     )
 
+    # A SIBLING key, not a synthetic entry in `platforms`.
+    #
+    # Two reasons it cannot live in `platforms`. First, that map has a second
+    # writer: submissionService replaces it wholesale from this response on every
+    # poll, so anything merged in here that is not a real submission is short
+    # lived. Second, `status` feeds paletteFor and LifecycleBadge, which are keyed
+    # to the DB's SubmissionStatus vocabulary; adding a value to it means adding a
+    # value to a CHECK-constrained enum's UI twin for something that is not a
+    # submission at all.
+    #
+    # Excluded platforms are dropped the same way they are dropped from
+    # `platforms` above: a platform this listing's brand or type is excluded from
+    # is not part of the listing, whatever the presence table says.
+    external_listings = {
+        pid: {**detail,
+              "allow_resubmit": platform_settings.get(pid, {}).get("allow_resubmit", True)}
+        for pid, detail in (
+            await ExternalListingService.coverage_for_parent(listing_model.product_id)
+        ).items()
+        if pid not in excluded_platforms
+    }
+
     return {
         "platforms": platform_statuses,
         "all_complete": all_complete,
+        # The UI subtracts child_skus from the children it already holds to get
+        # the coverage gap. Deliberately not computed here: child_products lives
+        # in lux_products_2 and this endpoint is polled every 1.5s.
+        "external_listings": external_listings,
     }
 
 
@@ -731,7 +763,26 @@ async def submit_listing(
             await sellercloud_service.validate_brand_color(color, brand_color)
             await sellercloud_service.add_color_alias(color, brand_color)
 
-    non_sc_platforms = [p for p in platforms if p != "sellercloud"]
+    # Platforms whose parent is ALREADY on them, per external_listing_ids, and
+    # that do not allow resubmission. One indexed query for the whole submit.
+    #
+    # Computed here, before non_sc_platforms, because it has to reach the
+    # no_children 422 below and the check_unmapped_mappings call that feeds the
+    # brand gate. Both read non_sc_platforms, and both run before `excluded`
+    # exists, so folding this into `excluded` further down would still 422 an
+    # operator into fixing a Grailed brand mapping for a submit Grailed is not
+    # part of.
+    already_listed = await ExternalListingService.platforms_for_parent(
+        listing.product_id
+    )
+    gated = ExternalListingService.gated_platforms(already_listed, platform_settings)
+
+    # NOT narrowed: `platforms`. It still drives the row-creation loop below,
+    # where the per-platform skip lives, and it is what both `return`s echo back
+    # to the UI. Shrinking it here would silently change that contract.
+    non_sc_platforms = [
+        p for p in platforms if p != "sellercloud" and p not in gated
+    ]
 
     # Platforms other than SellerCloud build one row per child/size, so they
     # require at least one child. Fail fast here with a clear error instead of
@@ -954,6 +1005,26 @@ async def submit_listing(
                     logger.info(f"Skipping {platform_id}: resubmission not allowed")
                     continue
 
+                # An external listing id says this parent is already on the
+                # platform, even though this listing has no successful row for it:
+                # listed before the platform existed in the tool, listed outside
+                # it, or listed under an earlier listing for the same parent.
+                #
+                # Blocks REGARDLESS of what the row says, including a failed one,
+                # because the question here is "would this post a duplicate", not
+                # "is the work done". recompute_listing_submitted is deliberately
+                # the other way round and uses an external id only when there is no
+                # row at all -- see external_ids_satisfy_completion.sql.
+                #
+                # `gated` already excludes sellercloud and any platform whose
+                # allow_resubmit is true.
+                if platform_id in gated:
+                    logger.info(
+                        f"Skipping {platform_id}: {listing.product_id} is already "
+                        f"listed there (external_listing_ids)"
+                    )
+                    continue
+
                 manual_fallback = ps.get("manual_fallback", False)
                 requires_images = ps.get("requires_images", False)
                 if manual_fallback or (listing_model.upload_status == "pending" and requires_images):
@@ -985,6 +1056,19 @@ async def submit_listing(
         )
 
     if not submission_records:
+        # Two different situations behind one status. The detail renders as a
+        # snackbar, so it says which, and the diagnostics stay in the log.
+        if gated and all(p in gated or p == "sellercloud" for p in platforms):
+            logger.info(
+                "Submit for %s produced no rows: every platform is already "
+                "listed externally (%s)",
+                listing.product_id,
+                ", ".join(sorted(gated)),
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Already listed on every selected platform",
+            )
         raise HTTPException(
             status_code=409,
             detail="No platforms available for submission",
@@ -1058,6 +1142,10 @@ async def _run_submissions_background(
             submission.status = "success"
             await submission.save(update_fields=["status", "updated_at"])
             await record_step(submission_id, "listed")
+            # Kept identical to the submission_poller branch, which is the point
+            # of the helper. See its docstring for why a SellerCloud row is a
+            # copy of info_product_id rather than anything the API returned.
+            await ExternalListingService.record_sellercloud(listing_id, product_id)
             logger.info(f"Successfully submitted listing {listing_id} to SellerCloud")
         except SellerCloudSubmitError as e:
             # Per-SKU and per-stage detail, so the dashboard can say which child

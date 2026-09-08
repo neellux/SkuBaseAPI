@@ -41,6 +41,7 @@ import httpx
 from tortoise import connections
 
 from models.db_models import AppSettings
+from services.external_listing_service import ExternalListingService
 from services.sellercloud_service import GENDER_MAPPING, sellercloud_service
 from services.shopify_admin import ShopifyAdmin
 from services.shopify_client import (
@@ -971,6 +972,30 @@ class OneInventoryService:
         await submission.save(
             update_fields=["status", "external_id", "updated_at"]
         )
+        # The richest shape of the five: a real parent id AND real per-child ids.
+        # Recorded here, inside the shared run_submission, so both dispatch paths
+        # produce the same rows for the same reason the rest of this function does.
+        #
+        # 1nventory runs with allow_resubmit true, so these rows gate nothing
+        # today. They exist so the table is a complete picture of where a parent
+        # lives, and because goat_poller already reads product_gid out of this
+        # submission's external_id -- a normalized home for it retires that.
+        if listing.product_id:
+            await ExternalListingService.record(
+                "1nventory",
+                [
+                    {"level": "parent", "sku": listing.product_id,
+                     "parent_sku": listing.product_id,
+                     "external_id": result["product_gid"],
+                     "external_meta": {"handle": result.get("handle")}},
+                    *(
+                        {"level": "child", "sku": sku, "parent_sku": listing.product_id,
+                         "external_id": gid}
+                        for sku, gid in (result.get("variant_gids") or {}).items()
+                        if sku
+                    ),
+                ],
+            )
 
         writeback = result.get("writeback") or {}
         await record_step(

@@ -26,6 +26,7 @@ from decimal import Decimal
 from models.db_models import AppSettings, ListingSubmission, SubmissionStatus
 from services.base_poller import BasePoller
 from services.ebay_service import ebay_service, render_tsv, weight_oz
+from services.external_listing_service import ExternalListingService
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
 from utils.submission_steps import last_step, record_step
@@ -384,6 +385,25 @@ class EbayPoller(BasePoller):
                     [sub.id], "failed", stage="publish",
                     reason=sub.error_display[:300],
                     sku_errors=errors or None,
+                )
+            # eBay is the one platform that issues real per-child ids and nothing at
+            # parent level, which is why the presence table carries parent_sku on
+            # child rows: a parent-only lookup would never see an eBay listing.
+            #
+            # Guarded on item_ids because the write above is unconditional and stores
+            # {"item_ids": {}} on a total failure. Asserting presence from that would
+            # claim a parent is on eBay when every child was refused.
+            #
+            # No parent row: eBay lists per child, and a parent row would read as full
+            # coverage when only some children published. The gap belongs on the pill.
+            if item_ids and parent:
+                await ExternalListingService.record(
+                    "ebay",
+                    [
+                        {"level": "child", "sku": sku, "parent_sku": parent,
+                         "external_id": item_id}
+                        for sku, item_id in item_ids.items()
+                    ],
                 )
             settled += 1
 

@@ -38,6 +38,7 @@ from services import goat_service
 from services import email_service
 from services.base_poller import BasePoller
 from services.goat_service import GoatStage
+from services.external_listing_service import ExternalListingService
 from services.goat_sheets import goat_sheets, tab_title_for
 from services.shopify_admin import ShopifyAdmin
 from services.shopify_client import (
@@ -439,7 +440,14 @@ class GoatPoller(BasePoller):
                 denied.append(sub.id)
             else:
                 seen_skus[parsed.goat_sku] = seen_skus.get(parsed.goat_sku, 0) + 1
-                approved[sub.id] = {"goat_sku": parsed.goat_sku, "stv": parsed.stv}
+                # parent_sku is carried from here because this is the only scope
+                # that holds the prefetched listing; _record_goat_skus is keyed by
+                # submission id alone.
+                approved[sub.id] = {
+                    "goat_sku": parsed.goat_sku,
+                    "stv": parsed.stv,
+                    "parent_sku": sub.listing.product_id if sub.listing else None,
+                }
 
         # A drag-fill down the SKU column would stamp one identifier onto many
         # products. Refuse them all rather than writing it to Shopify.
@@ -460,6 +468,26 @@ class GoatPoller(BasePoller):
             await self._record_goat_skus(approved)
             await ListingSubmission.filter(id__in=list(approved)).update(
                 platform_status=GoatStage.AWAITING_1NVENTORY
+            )
+            # GOAT's identifier is the SKU (GOAT) the team writes back into the
+            # sheet, and it lives in platform_meta, not external_id. Recorded here
+            # rather than in _record_goat_skus so that stays one statement.
+            #
+            # Parent level: GOAT takes one row per parent listing, so there are no
+            # per-child ids to have.
+            #
+            # This runs at the read-back, not at submit, which is the right moment:
+            # a row parked in the sheet with no SKU (GOAT) yet is not on GOAT.
+            await ExternalListingService.record(
+                "goat",
+                [
+                    {"level": "parent", "sku": info["parent_sku"],
+                     "parent_sku": info["parent_sku"],
+                     "external_id": info["goat_sku"],
+                     "external_meta": {"stv": info["stv"]}}
+                    for info in approved.values()
+                    if info.get("parent_sku")
+                ],
             )
             logger.info("GOAT: read back %d SKU(s) from tab %r", len(approved), tab_title)
 

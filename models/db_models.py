@@ -991,3 +991,77 @@ class EbayTypeAspectValue(Model):
 
     def __str__(self):
         return f"EbayTypeAspectValue({self.product_type_id}.{self.aspect_name})"
+
+
+class ExternalListingId(Model):
+    """A parent, or one of its children, is already live on a platform.
+
+    Independent of listing_submissions: the whole point is the case where SkuBase
+    has no submission row at all, because the platform was enabled after the item
+    was already listed, or the item was listed outside the tool entirely.
+
+    A row is a PRESENCE ASSERTION that optionally carries a platform id. Half the
+    platforms give us no id: grailed's listing_submissions.external_id is our own
+    child sku plus a batch date (a Google Sheet row key), spo captures nothing, and
+    sellercloud's "ProductID" is the sku we sent it. So external_id is nullable and
+    every consumer keys on the row EXISTING, never on its value.
+
+    Lives in skubase rather than lux_products_2 because recompute_listing_submitted
+    reads it and cannot cross the database boundary, the same constraint that put
+    listings.company_code here. There is no FK on parent_sku for the same reason,
+    and because rows legitimately exist for parents with no SkuBase listing at all
+    (7,224 of the ~9,394 SKUs on the Grailed sheet are in exactly that state).
+    """
+
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    platform_id = fields.CharField(
+        max_length=50,
+        index=True,
+        description="Platform identifier (grailed, ebay, goat, 1nventory, sellercloud)",
+    )
+    level = fields.CharField(
+        max_length=10,
+        description=(
+            "'parent' or 'child'. A parent row means the whole parent is covered; "
+            "partial coverage exists only when there are child rows and no parent row"
+        ),
+    )
+    # CharField, not TextField: Tortoise sets TextField.indexable = False, and a
+    # unique_together over one raises ConfigurationError at registration. The DDL
+    # keeps TEXT; only the model is narrowed.
+    sku = fields.CharField(
+        max_length=255,
+        description="parent_products.sku on a parent row, child_products.sku on a child row",
+    )
+    parent_sku = fields.CharField(
+        max_length=255,
+        description=(
+            "ALWAYS the parent, equal to sku on parent rows. Denormalized onto child "
+            "rows so the gate and the trigger answer 'is this parent on this platform' "
+            "with one index hit. This is what makes eBay work: eBay only ever produces "
+            "child rows, and a parent-level lookup would never see them"
+        ),
+    )
+    external_id = fields.TextField(
+        null=True,
+        description="The platform's own identifier, where one exists. NULL for grailed",
+    )
+    external_meta = fields.JSONField(
+        default=dict,
+        description="Anything else the platform gave us: handle, variant url, stv",
+    )
+    source = fields.CharField(
+        max_length=20,
+        default="manual",
+        description="submission (captured on success), backfill (loaded), or manual",
+    )
+
+    first_seen_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "external_listing_ids"
+        unique_together = (("platform_id", "level", "sku"),)
+
+    def __str__(self):
+        return f"ExternalListingId({self.platform_id}:{self.level}:{self.sku})"

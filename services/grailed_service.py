@@ -9,6 +9,7 @@ from config import config
 from fastapi import HTTPException
 from tortoise import Tortoise
 from models.db_models import AppSettings, Listing, ListingSubmission
+from services.external_listing_service import ExternalListingService
 from services.listing_options_service import listing_options_service
 from services.template_render import build_field_value
 
@@ -373,6 +374,26 @@ class GrailedService:
                 if added_refs:
                     submission.external_id = added_refs
                 await submission.save()
+                # Same presence write as grailed_poller._run_chunk, and for the
+                # same reason: added_references omits children that were merely
+                # refreshed in place, so the row set is built from the products
+                # actually sent, not from the response. This path is dead while
+                # grailed.manual_fallback is true (it is, on prod), but the two
+                # must not diverge.
+                await ExternalListingService.record(
+                    "grailed",
+                    [
+                        {"level": "parent", "sku": listing.product_id,
+                         "parent_sku": listing.product_id,
+                         "external_meta": {"submission_id": submission.id}},
+                        *(
+                            {"level": "child", "sku": p["sku"],
+                             "parent_sku": listing.product_id}
+                            for p in products
+                            if p.get("sku")
+                        ),
+                    ] if listing.product_id else [],
+                )
                 logger.info(
                     f"Grailed submission succeeded for listing {listing.id}: "
                     f"added={response_data.get('added', 0)}, "

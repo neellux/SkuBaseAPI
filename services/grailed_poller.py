@@ -11,6 +11,7 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services.base_poller import BasePoller
+from services.external_listing_service import ExternalListingService
 from services.grailed_service import grailed_service
 from services.template_service import TemplateService
 from tortoise import Tortoise
@@ -18,6 +19,30 @@ from tortoise.transactions import in_transaction
 from utils.submission_steps import last_step, record_step
 
 logger = logging.getLogger(__name__)
+
+
+def _grailed_presence_rows(sub: Any, sub_skus: list[str]) -> list[dict[str, Any]]:
+    """A parent row plus one child row per sku that went to the sheet.
+
+    The parent sku comes off the prefetched listing, never from splitting a child
+    sku: product_resolver forbids that, and a reassigned child still carries its
+    original parent's prefix. Without a listing there is no parent to assert, so
+    the child rows are dropped too rather than guessed at.
+    """
+    listing = getattr(sub, "listing", None)
+    parent_sku = getattr(listing, "product_id", None) if listing else None
+    if not parent_sku:
+        return []
+    rows: list[dict[str, Any]] = [
+        {"level": "parent", "sku": parent_sku, "parent_sku": parent_sku,
+         "external_meta": {"submission_id": sub.id}}
+    ]
+    rows.extend(
+        {"level": "child", "sku": sku, "parent_sku": parent_sku}
+        for sku in sub_skus
+        if sku
+    )
+    return rows
 
 
 class GrailedPoller(BasePoller):
@@ -404,6 +429,24 @@ class GrailedPoller(BasePoller):
                 batch_number=batch_meta["batch_number"],
                 references=sub_refs or None,
                 updated_references=sub_updated or None,
+            )
+            # Presence, recorded beside the reference list rather than derived
+            # from it later. Two reasons it is sub_skus and not sub_refs:
+            #
+            #   1. sub_refs holds only added_references. A submission whose
+            #      children were ALL already on the sheet succeeds with
+            #      external_id left NULL by the `if sub_refs:` above, and that is
+            #      exactly the parent this feature exists to remember.
+            #   2. a Grailed reference is "<sku>_<MMDDYYYY>", our own sku plus a
+            #      batch date. It is a sheet row key, not a Grailed id, so there
+            #      is nothing to store in external_id and it stays NULL.
+            #
+            # The parent row is what gates: a success means every child landed
+            # (a partial failure fails the whole submission, above), so the
+            # parent is fully covered and cannot read as partial.
+            await ExternalListingService.record(
+                "grailed",
+                _grailed_presence_rows(sub, sub_skus),
             )
             succeeded += 1
 

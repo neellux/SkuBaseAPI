@@ -12,6 +12,7 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services.base_poller import BasePoller
+from services.external_listing_service import ExternalListingService
 from services.oneinventory_service import oneinventory_service
 from services.sellercloud_service import sellercloud_service
 from services.template_service import TemplateService
@@ -180,6 +181,12 @@ class SubmissionPoller(BasePoller):
                 submission.status = SubmissionStatus.SUCCESS
                 await submission.save(update_fields=["status", "updated_at"])
                 await record_step(submission.id, "listed")
+                # Kept identical to the listing_routes branch, which is the point
+                # of the helper. See its docstring for why a SellerCloud row is a
+                # copy of info_product_id rather than anything the API returned.
+                await ExternalListingService.record_sellercloud(
+                    submission.listing_id, listing.product_id
+                )
             elif submission.platform_id == "1nventory":
                 # This is the PRIMARY path for 1inventory, not a fallback. Its
                 # requires_images setting parks the row QUEUED until photo_upload_poller
