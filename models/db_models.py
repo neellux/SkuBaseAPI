@@ -254,6 +254,28 @@ class Listing(Model):
         default="pending",
         description="Image upload status: pending (uploading) or uploaded (ready)",
     )
+    # A flag parks a listing: the value queue hides it by default, and "flagged" in the
+    # Priority filter shows only flagged ones (product_queue_service.build_filters). It does
+    # not change what counts as pending work, and it is not linked to batch completion: the
+    # update_batch_counts() trigger does not watch these columns. listings_flag_consistent
+    # keeps the four together, so a flag always has its note, who and when, and a clear
+    # listing has none of them. See migrations/add_listing_flag.sql.
+    #
+    # Written only by ListingService.set_flag and clear_flag, with update_fields. Any bare
+    # listing.save() elsewhere would write a stale flag back over a fresh one.
+    flagged = fields.BooleanField(
+        default=False, description="Whether the listing is flagged to skip in the value queue"
+    )
+    flag_note = fields.TextField(
+        null=True, description="Why the listing is flagged; required while flagged"
+    )
+    flagged_by = fields.CharField(
+        max_length=100, null=True, description="User ID who last set or edited the flag"
+    )
+    flagged_at = fields.DatetimeField(
+        null=True, description="When the flag was last set or edited"
+    )
+
     created_by = fields.CharField(max_length=100, description="User ID who created this listing")
 
     batch = fields.ForeignKeyField(

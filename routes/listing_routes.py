@@ -17,6 +17,8 @@ from models.api_models import (
     ChildrenResponse,
     CreateBatchRequest,
     CreateListingRequest,
+    FlagListingRequest,
+    ListingFlagResponse,
     ListingResponse,
     ListingSchemaResponse,
     NextOpenBatchResponse,
@@ -337,7 +339,7 @@ async def get_listing(listing_id: str = Query(..., description="Listing ID")):
 
     listing_dict = listing.model_dump()
     listing_dict = await add_user_data(
-        data=listing_dict, keys=["assigned_to", "created_by"], new_keys=["name"]
+        data=listing_dict, keys=["assigned_to", "created_by", "flagged_by"], new_keys=["name"]
     )
 
     # Bundled with the listing rather than left to a follow-up call: the category decides
@@ -460,6 +462,58 @@ async def get_listing_ai_search(
         "notes": (stored or {}).get("notes") or "",
         "conflict_count": sum(1 for v in fields.values() if v.get("status") == "conflict"),
     }
+
+
+async def _flag_response(listing: Listing) -> dict:
+    return await add_user_data(
+        data={
+            "listing_id": str(listing.id),
+            "flagged": listing.flagged,
+            "flag_note": listing.flag_note,
+            "flagged_by": listing.flagged_by,
+            "flagged_at": listing.flagged_at,
+        },
+        keys=["flagged_by"],
+        new_keys=["name"],
+    )
+
+
+@router.post("/flag", response_model=ListingFlagResponse)
+async def flag_listing(
+    request: Request,
+    body: FlagListingRequest,
+    listing_id: str = Query(..., description="Listing ID"),
+):
+    """Flag a listing so the value queue skips it, or change the note on one already flagged.
+
+    Registered for view_batches (testaddendpoints.py), which reaches operators the listing
+    form is otherwise read-only for. Parking a listing you cannot do yet is part of working
+    the queue, not an edit to the listing.
+
+    The note is checked before the lookup, so a bad note is a 400 with a message the
+    snackbar can show, and never gets mixed up with a malformed listing id.
+    """
+    try:
+        note = ListingService.normalize_flag_note(body.note)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    listing = await ListingService.set_flag(listing_id, note, request.state.user["id"])
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return await _flag_response(listing)
+
+
+@router.delete("/flag", response_model=ListingFlagResponse)
+async def unflag_listing(
+    request: Request,
+    listing_id: str = Query(..., description="Listing ID"),
+):
+    """Clear a listing's flag, note, who and when. Idempotent."""
+    listing = await ListingService.clear_flag(listing_id, request.state.user["id"])
+    if not listing:
+        raise HTTPException(status_code=404, detail="Listing not found")
+    return await _flag_response(listing)
 
 
 @router.post("/ai_search")

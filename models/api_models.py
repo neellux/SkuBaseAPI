@@ -340,6 +340,22 @@ class ListingResponse(BaseModel):
             "the next time the listing is opened."
         ),
     )
+    # Read by the listing form from /listings/detail and from the flag endpoints only.
+    # BatchView caches batch payloads for a whole queue walk, so a flag read from those
+    # would go stale.
+    flagged: bool = Field(
+        False, description="Whether the listing is flagged to skip in the value queue"
+    )
+    flag_note: Optional[str] = Field(None, description="Why the listing is flagged")
+    flagged_by: Optional[str] = Field(
+        None, description="User ID who last set or edited the flag"
+    )
+    flagged_by_name: Optional[str] = Field(
+        None, description="Name of the user who last set or edited the flag"
+    )
+    flagged_at: Optional[datetime] = Field(
+        None, description="When the flag was last set or edited"
+    )
     submitted: bool = Field(..., description="Whether listing is submitted")
     submitted_at: Optional[datetime] = Field(None, description="Submission timestamp")
     submitted_by: Optional[str] = Field(None, description="User ID who submitted this listing")
@@ -355,6 +371,30 @@ class ListingResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class FlagListingRequest(BaseModel):
+
+    # Unconstrained on purpose. The rules (trimmed, 1 to 500 characters) are checked in
+    # ListingService.normalize_flag_note, so a bad note comes back as a short 400 the snackbar
+    # can show, rather than a Pydantic 422 listing validation paths.
+    note: Optional[str] = Field(
+        None, description="Why the listing is flagged. Required; 500 characters at most"
+    )
+
+
+class ListingFlagResponse(BaseModel):
+
+    listing_id: str = Field(..., description="Listing UUID")
+    flagged: bool = Field(..., description="Whether the listing is flagged")
+    flag_note: Optional[str] = Field(None, description="Why the listing is flagged")
+    flagged_by: Optional[str] = Field(
+        None, description="User ID who last set or edited the flag"
+    )
+    flagged_by_name: Optional[str] = Field(None, description="Name of that user")
+    flagged_at: Optional[datetime] = Field(
+        None, description="When the flag was last set or edited"
+    )
 
 
 class ProductConfirmationData(BaseModel):
@@ -510,6 +550,11 @@ class BatchListResponse(BaseModel):
         "{sku: {value, qty, children, priced}}. Drives the card's value hover card; "
         "thumbnails are built client-side from the SKU, so no image data travels here.",
     )
+    flagged_listings: int = Field(
+        0,
+        description="Listings in this batch that are flagged, submitted or not. Never part of "
+        "the progress or completion counts",
+    )
     created_at: datetime = Field(..., description="Creation timestamp")
 
     class Config:
@@ -568,6 +613,9 @@ class QueueRowResponse(BaseModel):
         ),
     )
     created_at: datetime = Field(..., description="When the listing was created")
+    flagged: bool = Field(False, description="Whether the listing is flagged")
+    flag_note: Optional[str] = Field(None, description="Why the listing is flagged")
+    flagged_at: Optional[datetime] = Field(None, description="When the flag was last set")
     rank: Optional[int] = Field(
         None,
         description=(

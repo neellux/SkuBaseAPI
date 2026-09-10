@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from tortoise import connections
 
-from services.batch_service import OPEN_BATCH_STATUSES
+from services.batch_service import OPEN_BATCH_STATUSES, split_flagged_priority
 from services.product_resolver import resolve_parents
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,11 @@ SELECT
   l.product_id,
   l.batch_id,
   l.created_at,
+  -- The flag, for the in-product tab strip. The note travels with it because a tab edits
+  -- it in place; who set it does not, since nothing shows that.
+  l.flagged,
+  l.flag_note,
+  l.flagged_at,
   l.data ->> 'title'        AS title,
   l.data ->> 'brand_name'   AS brand_name,
   l.data ->> 'product_type' AS product_type,
@@ -109,6 +114,10 @@ def build_filters(
     BatchService.get_all_batches, so a filter carried across the view toggle keeps
     meaning what it meant on the cards.
 
+    The flag is the exception inside priority: "flagged" there is not a batch priority but
+    a listing filter, split out by split_flagged_priority before anything reaches
+    b.priority.
+
     Search is the one filter that does not copy the batch version. There it resolves a
     term to a parent SKU and then selects the batches CONTAINING a matching listing;
     here it has to match the listing itself, so the caller resolves first (see
@@ -123,8 +132,17 @@ def build_filters(
     if assigned_to:
         clauses.append(f"AND b.assigned_to = ANY({placeholder(list(assigned_to))}::text[])")
 
-    if priority:
-        clauses.append(f"AND b.priority = ANY({placeholder(list(priority))}::text[])")
+    # The flag filters the LISTING and binds no parameter, so it can sit anywhere in the
+    # clause without renumbering a single $n. It is always present: the default queue hides
+    # flagged listings under every priority selection, and "flagged" in the Priority filter
+    # turns the same clause round to show only them. It lives here rather than in
+    # PENDING_ROWS because the nightly value refresh shares that predicate and has to keep
+    # re-pricing flagged listings: flagged is parked work, not finished work.
+    batch_priorities, flagged_only = split_flagged_priority(priority)
+    clauses.append("AND l.flagged" if flagged_only else "AND NOT l.flagged")
+
+    if batch_priorities:
+        clauses.append(f"AND b.priority = ANY({placeholder(batch_priorities)}::text[])")
 
     if date_from:
         clauses.append(f"AND b.created_at >= {placeholder(date_from)}")

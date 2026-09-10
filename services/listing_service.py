@@ -3,7 +3,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from models.api_models import (
@@ -722,8 +722,16 @@ class ListingService:
             if not listing:
                 return None
 
+            # Only the fields this request sets reach the database. A bare save() writes back
+            # every column from an instance read moments earlier, and the listing form
+            # autosaves through here from the same screen the operator flags from: an autosave
+            # that loaded the row just before a flag committed would write flagged=false
+            # straight back over it. Same reason BatchService.update_batch narrows its save.
+            changed: List[str] = []
+
             if request.assigned_to is not None:
                 listing.assigned_to = request.assigned_to
+                changed.append("assigned_to")
 
             if request.data is not None:
                 # ID is server-owned. A client payload that omits it must not
@@ -738,28 +746,37 @@ class ListingService:
                 await ListingService._apply_product_type_derived(new_data)
                 ListingService.normalize_mpn(new_data)
                 listing.data = new_data
+                changed.append("data")
 
             if request.ai_response is not None:
                 listing.ai_response = request.ai_response
+                changed.append("ai_response")
 
             if request.ai_description is not None:
                 listing.ai_description = request.ai_description
+                changed.append("ai_description")
 
             if request.submitted is not None:
                 listing.submitted = request.submitted
+                changed.append("submitted")
                 if request.submitted and not listing.submitted_at:
                     listing.submitted_at = datetime.now()
+                    changed.append("submitted_at")
 
             if request.submitted_by is not None:
                 listing.submitted_by = request.submitted_by
+                changed.append("submitted_by")
 
             # Sent alongside `data` by the listing form, never on its own, so the flag and
             # the hand-edited title it protects land in the same write. Split across two
             # requests they would race, and the loser would be the edit.
             if request.title_auto_update is not None:
                 listing.title_auto_update = request.title_auto_update
+                changed.append("title_auto_update")
 
-            await listing.save()
+            # updated_at always, so an empty request still touches the row the way the bare
+            # save() it replaces did.
+            await listing.save(update_fields=changed + ["updated_at"])
 
             return await ListingService._to_response(listing)
 
@@ -1314,6 +1331,80 @@ class ListingService:
             logger.error(f"Error processing product data for template: {e}")
             return user_data
 
+    # The flag's writes. Nothing else writes these columns, and these write nothing else:
+    # see update_listing for why every listing save names its fields.
+    FLAG_UPDATE_FIELDS = ["flagged", "flag_note", "flagged_by", "flagged_at", "updated_at"]
+    FLAG_NOTE_MAX_LENGTH = 500
+
+    @staticmethod
+    def normalize_flag_note(note: Optional[str]) -> str:
+        """The note as stored: trimmed, and 1 to FLAG_NOTE_MAX_LENGTH characters.
+
+        Raises ValueError with a message short enough to show as a snackbar. A note that is
+        only whitespace counts as empty, which is what listings_flag_consistent enforces too.
+        """
+        cleaned = (note or "").strip()
+        if not cleaned:
+            raise ValueError("A note is required to flag")
+        if len(cleaned) > ListingService.FLAG_NOTE_MAX_LENGTH:
+            raise ValueError(
+                f"Keep the note under {ListingService.FLAG_NOTE_MAX_LENGTH} characters"
+            )
+        return cleaned
+
+    @staticmethod
+    async def set_flag(listing_id: str, note: Optional[str], user_id: str) -> Optional[Listing]:
+        """Flag a listing, or change the note on one already flagged.
+
+        An edit re-stamps flagged_by and flagged_at to whoever wrote the note, and the last
+        write wins. Two operators editing one note is left for them to sort out, the same
+        stance the value queue takes on collisions.
+
+        Logged with the note: unflagging deletes it, so the log is the only record of why a
+        listing was parked.
+        """
+        cleaned = ListingService.normalize_flag_note(note)
+        listing = await Listing.get_or_none(id=listing_id)
+        if not listing:
+            return None
+
+        was_flagged = listing.flagged
+        listing.flagged = True
+        listing.flag_note = cleaned
+        listing.flagged_by = user_id
+        # Aware, in UTC. Tortoise runs with use_tz and takes a naive now() as UTC, which is
+        # only right on a server whose clock already is.
+        listing.flagged_at = datetime.now(timezone.utc)
+        await listing.save(update_fields=ListingService.FLAG_UPDATE_FIELDS)
+
+        logger.info(
+            f"{'Edited flag on' if was_flagged else 'Flagged'} listing {listing.id} "
+            f"({listing.product_id}) by {user_id}: {cleaned!r}"
+        )
+        return listing
+
+    @staticmethod
+    async def clear_flag(listing_id: str, user_id: str) -> Optional[Listing]:
+        """Clear a listing's flag, note, who and when. Idempotent."""
+        listing = await Listing.get_or_none(id=listing_id)
+        if not listing:
+            return None
+
+        previous_note = listing.flag_note
+        was_flagged = listing.flagged
+        listing.flagged = False
+        listing.flag_note = None
+        listing.flagged_by = None
+        listing.flagged_at = None
+        await listing.save(update_fields=ListingService.FLAG_UPDATE_FIELDS)
+
+        if was_flagged:
+            logger.info(
+                f"Unflagged listing {listing.id} ({listing.product_id}) by {user_id}; "
+                f"note was {previous_note!r}"
+            )
+        return listing
+
     @staticmethod
     async def _to_response(listing: Listing) -> ListingResponse:
         successful_submissions = await listing.submissions.filter(status="success").all()
@@ -1346,6 +1437,10 @@ class ListingService:
             submitted_by=listing.submitted_by,
             submitted_platforms=submitted_platforms,
             upload_status=listing.upload_status,
+            flagged=listing.flagged,
+            flag_note=listing.flag_note,
+            flagged_by=listing.flagged_by,
+            flagged_at=listing.flagged_at,
             created_by=listing.created_by,
             created_at=listing.created_at,
             updated_at=listing.updated_at,

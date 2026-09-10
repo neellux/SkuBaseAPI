@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
 from tortoise import transactions
 from tortoise.expressions import Q, Subquery
+from tortoise.functions import Count
 from models.db_models import Batch, Listing, AppSettings
 from exceptions.batch_exceptions import BatchCreationError
 from models.api_models import (
@@ -44,6 +45,19 @@ BATCH_SORTS = {
     "created_desc": ("-created_at", "-id"),
 }
 DEFAULT_BATCH_SORT = "value_desc"
+
+# "flagged" rides in the Priority filter for now, but it is not a batch priority: it filters
+# LISTINGS. Every consumer of a priority list splits it out here first, so it can never reach
+# b.priority or priority__in, where it would match nothing and empty the view. Batch create
+# and update validate priority against Literal["low", "medium", "high"], so no batch can
+# actually carry it.
+FLAGGED_PRIORITY = "flagged"
+
+
+def split_flagged_priority(priority: Optional[List[str]]) -> tuple[List[str], bool]:
+    """(the batch priorities, in their original order; whether "flagged" was selected)."""
+    values = list(priority or [])
+    return [p for p in values if p != FLAGGED_PRIORITY], FLAGGED_PRIORITY in values
 
 # Above this many products, the AI web/tag search is queued for the poller
 # instead of running inline with the aspects call.
@@ -187,7 +201,9 @@ class BatchService:
 
                             if existing_listing:
                                 existing_listing.batch = batch
-                                await existing_listing.save()
+                                # batch_id only. A bare save() would write every column back
+                                # from this instance, including a flag set since it was read.
+                                await existing_listing.save(update_fields=["batch_id", "updated_at"])
                                 logger.info(
                                     f"Linked existing listing {existing_listing.id} for product {full_product_id} to batch {batch.id}"
                                 )
@@ -210,7 +226,7 @@ class BatchService:
 
                                 listing = await Listing.get(id=listing_response.id)
                                 listing.batch = batch
-                                await listing.save()
+                                await listing.save(update_fields=["batch_id", "updated_at"])
 
                                 logger.info(
                                     f"Created new listing for product {full_product_id} in batch {batch.id}"
@@ -403,8 +419,17 @@ class BatchService:
             if assigned_to and len(assigned_to) > 0:
                 query = query.filter(assigned_to__in=assigned_to)
 
-            if priority and len(priority) > 0:
-                query = query.filter(priority__in=priority)
+            batch_priorities, flagged_only = split_flagged_priority(priority)
+            if batch_priorities:
+                query = query.filter(priority__in=batch_priorities)
+
+            # Batches CONTAINING a flagged listing, submitted or not: the same shape as the
+            # search subquery below. The cards view hides nothing by default, since a batch
+            # is not parked because one of its listings is.
+            if flagged_only:
+                query = query.filter(
+                    id__in=Subquery(Listing.filter(flagged=True).values("batch_id"))
+                )
 
             if status and len(status) > 0:
                 expanded_statuses = []
@@ -451,9 +476,15 @@ class BatchService:
                 .order_by(*order_by)
             )
 
+            # One grouped count for the page, not a query per card.
+            flagged_counts = await BatchService._flagged_counts([batch.id for batch in batches])
             response_batches = []
             for batch in batches:
-                response_batches.append(await BatchService._to_list_response(batch))
+                response_batches.append(
+                    await BatchService._to_list_response(
+                        batch, flagged_listings=flagged_counts.get(batch.id, 0)
+                    )
+                )
 
             return response_batches, total
 
@@ -579,7 +610,7 @@ class BatchService:
 
             return {
                 "users": users,
-                "priorities": ["low", "medium", "high"],
+                "priorities": ["low", "medium", "high", FLAGGED_PRIORITY],
                 "statuses": ["pending", "new", "in_progress", "completed"],
             }
 
@@ -614,7 +645,26 @@ class BatchService:
         )
 
     @staticmethod
-    async def _to_list_response(batch: Batch) -> BatchListResponse:
+    async def _flagged_counts(batch_ids: List[int]) -> dict:
+        """Flagged listings per batch, submitted or not. A batch with none is absent."""
+        if not batch_ids:
+            return {}
+        rows = await (
+            Listing.filter(flagged=True, batch_id__in=batch_ids)
+            .group_by("batch_id")
+            .annotate(n=Count("id"))
+            .values("batch_id", "n")
+        )
+        return {row["batch_id"]: row["n"] for row in rows}
+
+    @staticmethod
+    async def _to_list_response(
+        batch: Batch, flagged_listings: Optional[int] = None
+    ) -> BatchListResponse:
+        # Passed in by the list, which counts a whole page at once; counted here for the one
+        # batch otherwise (update_batch).
+        if flagged_listings is None:
+            flagged_listings = (await BatchService._flagged_counts([batch.id])).get(batch.id, 0)
         return BatchListResponse(
             id=batch.id,
             comment=batch.comment,
@@ -623,6 +673,7 @@ class BatchService:
             status=batch.status,
             total_listings=batch.total_listings,
             submitted_listings=batch.submitted_listings,
+            flagged_listings=flagged_listings,
             progress_percentage=batch.progress_percentage,
             total_value=batch.total_value,
             value_computed_at=batch.value_computed_at,
