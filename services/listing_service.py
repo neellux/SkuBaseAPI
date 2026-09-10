@@ -269,7 +269,21 @@ class ListingService:
                 for field in fields_needing_db_query:
                     field_name = field["name"]
                     if field_name in options_map:
-                        options_map[field_name] = sorted(set(options_map[field_name]))
+                        # casefold, not the default codepoint sort. Plain sorted() puts
+                        # every character of one case before any of the other ('A' 0x41 <
+                        # 'Z' 0x5A < 'a' 0x61), which clustered each letter's ALL-CAPS
+                        # entries ahead of its mixed-case ones: Acne Studios landed 25 rows
+                        # below AZZMMA, and adidas 24 below ADIDAS x ALEXANDER WANG. The
+                        # form's dropdowns render this order as sent and cap the list at
+                        # 100 matches, so a short query showed the shouty half of the list
+                        # and the operator had to type a brand's exact casing to reach it.
+                        #
+                        # The value is the tiebreak, so two spellings of one name keep a
+                        # stable order rather than swapping between requests.
+                        options_map[field_name] = sorted(
+                            set(options_map[field_name]),
+                            key=lambda value: (str(value).casefold(), str(value)),
+                        )
                         logger.debug(
                             f"Loaded {len(options_map[field_name])} options from database for {field_name}"
                         )
