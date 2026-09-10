@@ -309,19 +309,3 @@ class ExternalListingService:
             [{"level": PARENT, "sku": parent_sku, "parent_sku": parent_sku,
               "external_id": external_id}],
         )
-
-    @staticmethod
-    def parent_of(child_sku: str) -> str | None:
-        """The parent sku a child sku belongs to, by the '<parent>/<size>' rule.
-
-        product_resolver forbids deriving a parent this way for LOOKUPS, and it
-        is right: a sku that has been reassigned still carries its original
-        parent's prefix. Here the string IS the fact being recorded (this is the
-        sku that was sent to the platform), and the callers all have the real
-        parent to hand and pass it explicitly. This is the last-resort path for
-        backfills reading a platform export with nothing but skus in it, and its
-        output goes stale on reassignment exactly as the column comment says.
-        """
-        if not child_sku or "/" not in child_sku:
-            return None
-        return child_sku.rsplit("/", 1)[0]

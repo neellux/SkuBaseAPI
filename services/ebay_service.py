@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -338,10 +339,12 @@ class EbayService:
                 # eBay MULTI aspects. SellerCloud takes one value per row, so a multi-value
                 # aspect becomes several rows under the same SpecificName.
                 for item in value:
+                    item = EbayService.single_line(item)
                     if item not in (None, ""):
                         pairs.append((specific_name, item))
                 continue
 
+            value = EbayService.single_line(value)
             if value in (None, "", []):
                 if required:
                     problems.append(f"{name} is required by eBay and has no value")
@@ -350,6 +353,32 @@ class EbayService:
             pairs.append((specific_name, value))
 
         return pairs, size_names, problems
+
+    @staticmethod
+    def single_line(value: Any) -> Any:
+        """A multi-line value as one line, its lines joined with ", ".
+
+        Material is authored one part per line, and an item specific is one line of text:
+
+            Shell: 100% Cotton     ->   Shell: 100% Cotton, Trim: 100% Leather
+            Trim:100% Leather
+
+        Runs of spaces collapse, a trailing separator on a line is dropped so the join
+        never doubles one, and a label run into its value ("Trim:100%") gets its space
+        back. Commas already inside a line ("85% Nylon, 15% Spandex") are kept.
+
+        Only a value that actually spans lines is touched. A single-line string, or
+        anything that is not a string, comes back unchanged, so a Brand or Style that
+        happens to contain a colon is never rewritten.
+        """
+        if not isinstance(value, str) or ("\n" not in value and "\r" not in value):
+            return value
+        parts = []
+        for line in value.splitlines():
+            line = " ".join(line.split()).rstrip(",;.").rstrip()
+            if line:
+                parts.append(re.sub(r"(?<=[A-Za-z]):(?=\S)", ": ", line))
+        return ", ".join(parts)
 
     @staticmethod
     def size_specific_names(detail: Dict[str, Any]) -> List[str]:
