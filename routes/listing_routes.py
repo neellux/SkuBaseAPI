@@ -2,7 +2,7 @@ import asyncio
 import logging
 import traceback
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import orjson
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -700,6 +700,35 @@ async def get_mapping_status(
     }
 
 
+async def _ebay_in_flight_elsewhere(conn: Any, product_id: Optional[str], listing_id: Any) -> bool:
+    """Whether ANOTHER listing for this parent has an eBay attempt still in flight.
+
+    The latest attempt per listing, the same rule this route applies to a listing's own rows,
+    so an old attempt superseded by a later one does not block anything.
+    """
+    if not product_id:
+        return False
+    rows = await conn.execute_query_dict(
+        """
+        SELECT 1
+        FROM listings l
+        JOIN LATERAL (
+            SELECT s.status
+            FROM listing_submissions s
+            WHERE s.listing_id = l.id AND s.platform_id = 'ebay'
+            ORDER BY s.attempt_number DESC
+            LIMIT 1
+        ) latest ON true
+        WHERE l.product_id = $1
+          AND l.id <> $2::uuid
+          AND latest.status IN ('queued', 'pending', 'processing', 'awaiting_action')
+        LIMIT 1
+        """,
+        [product_id, str(listing_id)],
+    )
+    return bool(rows)
+
+
 @router.post("/submit")
 async def submit_listing(
     request: Request,
@@ -1074,6 +1103,20 @@ async def submit_listing(
                     "queued", "pending", "processing", "awaiting_action",
                 ):
                     logger.info(f"Skipping {platform_id}: already in {latest.status}")
+                    continue
+
+                # PARENT level for eBay, on top of this listing's own rows. Two listings for
+                # one parent each pass the check above on their own rows, and the second
+                # batch's export can run before the first batch's publish job has issued item
+                # ids, so both would launch the same children. Four of the Combine file's
+                # ready parents had a second listing on 2026-09-10.
+                if platform_id == "ebay" and await _ebay_in_flight_elsewhere(
+                    conn, listing_model.product_id, listing_model.id
+                ):
+                    logger.info(
+                        f"Skipping ebay: another listing for {listing_model.product_id} "
+                        f"is already in flight"
+                    )
                     continue
 
                 ps = platform_settings.get(platform_id, {})

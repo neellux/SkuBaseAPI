@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+import httpx
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -25,7 +27,13 @@ from decimal import Decimal
 
 from models.db_models import AppSettings, ListingSubmission, SubmissionStatus
 from services.base_poller import BasePoller
-from services.ebay_service import ebay_service, render_tsv, weight_oz
+from services.ebay_service import (
+    IMPORT_WAIT_SECONDS,
+    REVISE_CHUNK,
+    ebay_service,
+    render_tsv,
+    weight_oz,
+)
 from services.external_listing_service import ExternalListingService
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
@@ -38,11 +46,15 @@ logger = logging.getLogger(__name__)
 # stages after it.
 PUBLISHED_STAGE = "published"
 AWAITING_IMAGES_STAGE = "awaiting_images"
+# Terminal step for a submission whose every child was revised: it closes as SUCCESS in the
+# batch itself and never passes through `published`.
+REVISED_STAGE = "revised"
 
 # Steps a row passes through between `submitting` and `published`. A row stale at one
 # of these was abandoned mid-batch; nothing downstream reads them.
 MID_BATCH_STEPS = frozenset(
-    {"catalog_exported", "catalog_imported", "catalog_unchanged", "specifics_imported"}
+    {"catalog_exported", "catalog_imported", "catalog_unchanged", "specifics_imported",
+     "listing_ids_read", "revise_sent"}
 )
 
 
@@ -188,13 +200,19 @@ class EbayPoller(BasePoller):
             )
             if not pending:
                 return None, []
-            submission_ids = [s.id for s in pending]
+            submission_ids = await self._one_per_parent([s.id for s in pending], conn)
+            if not submission_ids:
+                return None, []
             await (
                 ListingSubmission.filter(id__in=submission_ids)
                 .using_db(conn)
                 .update(
                     status=SubmissionStatus.PROCESSING,
                     platform_status="submitting",
+                    # The stale sweep keys on updated_at, and a queryset update does not
+                    # touch an auto_now field, so without this a row that sat pending for a
+                    # day looks a day stale the moment it is claimed.
+                    updated_at=datetime.now(timezone.utc),
                 )
             )
 
@@ -210,6 +228,50 @@ class EbayPoller(BasePoller):
         logger.info("%s: batch %s claimed %d submission(s)",
                     self.name, import_id, len(submission_ids))
         return import_id, submission_ids
+
+    @staticmethod
+    async def _one_per_parent(pending_ids: list[int], conn: Any) -> list[int]:
+        """The pending ids to claim: at most one per parent, none for a parent in flight.
+
+        Two listings for the same parent each pass the submit route's check on their own
+        rows. Claimed together, both would send the same children; claimed in consecutive
+        batches, the second batch's export can run before the first batch's publish job has
+        issued item ids, and both would launch. Oldest first, and the rest stay pending for a
+        later batch, where the export will show what the first one listed.
+
+        A row with no listing is still claimed: _submit_batch fails it with the reason.
+        """
+        rows = await conn.execute_query_dict(
+            """
+            SELECT ls.id, l.product_id,
+                   EXISTS (
+                       SELECT 1
+                       FROM listings l2
+                       JOIN listing_submissions s2 ON s2.listing_id = l2.id
+                       WHERE l2.product_id = l.product_id
+                         AND s2.platform_id = 'ebay'
+                         AND s2.status IN ('processing', 'awaiting_action')
+                   ) AS parent_busy
+            FROM listing_submissions ls
+            LEFT JOIN listings l ON l.id = ls.listing_id
+            WHERE ls.id = ANY($1::int[])
+            ORDER BY ls.created_at, ls.id
+            """,
+            [pending_ids],
+        )
+        claimed: list[int] = []
+        seen: set[str] = set()
+        for row in rows:
+            parent = row["product_id"]
+            if parent is not None:
+                if row["parent_busy"] or parent in seen:
+                    continue
+                seen.add(parent)
+            claimed.append(row["id"])
+        if len(claimed) < len(pending_ids):
+            logger.info("%s: left %d pending row(s) for a later batch, one per parent",
+                        EbayPoller.name, len(pending_ids) - len(claimed))
+        return claimed
 
     async def run_batch(self, import_id: int, submission_ids: list[int]) -> dict[str, Any]:
         """The four SellerCloud round trips, for rows begin_batch already claimed."""
@@ -307,7 +369,11 @@ class EbayPoller(BasePoller):
         children = await self._children_by_parent(
             [sub.listing.product_id for sub in subs if sub.listing]
         )
-        all_children = [sku for skus in children.values() for sku in skus]
+        # The children each submission actually LAUNCHED. Revised children are not in the
+        # publish job, so counting them here would send a batch that listed cleanly to the
+        # catalog grid looking for ids it already has.
+        launched_by_sub = {sub.id: self._launched_children(sub, children) for sub in subs}
+        all_children = sorted({sku for kids in launched_by_sub.values() for sku in kids})
 
         # The job's own output is the source of item ids. The catalog grid is only read
         # when that output is missing -- SellerCloud 500s "There is no output file" often
@@ -325,23 +391,35 @@ class EbayPoller(BasePoller):
         settled = 0
         for sub in subs:
             parent = sub.listing.product_id if sub.listing else None
-            kids = children.get(parent, [])
-            item_ids = {
+            kids = launched_by_sub[sub.id]
+            launched = {
                 sku: str(item_id)
                 for sku in kids
                 if (item_id := job_item_ids.get(sku)
                     or (grid.get(sku) or {}).get("ebayItemID"))
             }
+            # Ids for children this attempt revised come from the batch's own export, as
+            # recorded when the split was made; nothing later would find them otherwise.
+            revised = ((sub.platform_meta or {}).get("ebay_split") or {}).get("revised") or {}
+            item_ids = {**revised, **launched}
             errors = {sku: publish_errors[sku] for sku in kids if sku in publish_errors}
 
-            sub.external_id = {"item_ids": item_ids}
+            sub.external_id = {
+                "item_ids": item_ids,
+                "revised": sorted(revised),
+                "launched": sorted(launched),
+            }
             # A submission that listed NOTHING is failed, not awaiting images. Every child
             # was refused -- an invalid return policy, no quantity, a category eBay would
             # not take -- so there is no live listing to attach a photo to, and parking it
             # in awaiting_action showed "Images needed" on a product that never reached
             # eBay. It also inflated the coverage denominator with children the file can
             # never contain, so "12 of 40" undercounted a complete upload.
-            if item_ids:
+            # Images are owed for LAUNCHED children only: a revised child already carries its
+            # pictures on eBay, and revision profile 1145 does not resend them. So when every
+            # launch was refused the submission fails even if its revised children are live:
+            # the new sizes are what it was sent for, and FAILED is what lets it go again.
+            if launched:
                 sub.status = SubmissionStatus.AWAITING_ACTION
                 sub.platform_status = AWAITING_IMAGES_STAGE
             else:
@@ -350,9 +428,9 @@ class EbayPoller(BasePoller):
                 # eBay's own words where the publish job gave them, rather than a generic
                 # line: "You've provided an invalid return policy" is actionable, "publish
                 # failed" is not.
-                sub.error_display = (
-                    next(iter(errors.values()), "")[:200] or "No eBay listing was created"
-                )
+                fallback = ("No eBay listing was created for the new sizes" if revised
+                            else "No eBay listing was created")
+                sub.error_display = next(iter(errors.values()), "")[:200] or fallback
                 # The per-child map, so the technical column carries every reason and
                 # not only the first one the display line shows.
                 sub.error = json.dumps(errors) if errors else "No eBay listing was created"
@@ -374,10 +452,11 @@ class EbayPoller(BasePoller):
                 # them. publish_errors is kept alongside because mark_images_uploaded reads
                 # it when it closes an import.
                 meta={"sku_errors": errors, "publish_errors": errors} if errors else None,
-                listed=len(item_ids),
-                children=len(kids),
+                listed=len(launched),
+                revised=len(revised),
+                children=len(kids) + len(revised),
             )
-            if not item_ids:
+            if not launched:
                 # Every other platform ends a failed row on a `failed` step; without
                 # this one an eBay failure ended on `item_ids_read` and read as still
                 # in progress to anything walking the timeline.
@@ -414,6 +493,21 @@ class EbayPoller(BasePoller):
             len(all_children),
         )
         return settled
+
+    @staticmethod
+    def _launched_children(
+        sub: ListingSubmission, children: dict[str, list[str]]
+    ) -> list[str]:
+        """Children this submission sent to LaunchOnChannel.
+
+        From the split _revise_listed recorded, where there is one. A row published before
+        revise existed has none, and every active child of its parent was launched.
+        """
+        split = (sub.platform_meta or {}).get("ebay_split")
+        if split is not None:
+            return list(split.get("launch") or [])
+        parent = sub.listing.product_id if sub.listing else None
+        return children.get(parent, [])
 
     @staticmethod
     async def _publish_results(job_id: str) -> dict[str, tuple[str, str]]:
@@ -474,6 +568,255 @@ class EbayPoller(BasePoller):
         for row in rows:
             out[row["parent_sku"]].append(row["sku"])
         return out
+
+    @staticmethod
+    async def _still_processing(ids: list[int]) -> list[int]:
+        """The ids still PROCESSING, in the order given.
+
+        The stale sweep runs alongside a batch. A row it has failed must not be revised or
+        launched after the fact: it would go live with no item ids recorded and no image row,
+        and the next export would be the first anyone knew of it.
+        """
+        if not ids:
+            return []
+        live = set(
+            await ListingSubmission.filter(
+                id__in=ids, status=SubmissionStatus.PROCESSING
+            ).values_list("id", flat=True)
+        )
+        return [sid for sid in ids if sid in live]
+
+    @staticmethod
+    async def _heartbeat(ids: list[int]) -> None:
+        """Refresh updated_at on rows still PROCESSING, so the sweep sees a working batch."""
+        if ids:
+            await ListingSubmission.filter(
+                id__in=ids, status=SubmissionStatus.PROCESSING
+            ).update(updated_at=datetime.now(timezone.utc))
+
+    @staticmethod
+    def _pack_by_submission(
+        groups: list[tuple[int, list[str]]], limit: int | None = None
+    ) -> list[list[tuple[int, list[str]]]]:
+        """Revise calls of up to `limit` children, never splitting one submission across two.
+
+        So a refused or timed-out call fails only the submissions it carried. A submission
+        larger than the limit gets a call of its own rather than being split.
+        """
+        limit = limit or REVISE_CHUNK
+        packs: list[list[tuple[int, list[str]]]] = []
+        current: list[tuple[int, list[str]]] = []
+        size = 0
+        for sid, skus in groups:
+            if current and size + len(skus) > limit:
+                packs.append(current)
+                current, size = [], 0
+            current.append((sid, skus))
+            size += len(skus)
+        if current:
+            packs.append(current)
+        return packs
+
+    async def _fail_rows(
+        self, ids: list[int], jobs: dict[str, Any], stage: str, display: str, reason: str
+    ) -> None:
+        """FAILED for review, for rows still PROCESSING only.
+
+        Guarded on PROCESSING so a row the stale sweep already failed, or one this batch
+        closed as revised, is never overwritten by a later stage of the same batch.
+        """
+        if not ids:
+            return
+        await ListingSubmission.filter(
+            id__in=ids, status=SubmissionStatus.PROCESSING
+        ).update(status=SubmissionStatus.FAILED, error_display=display[:200])
+        await self._stage(ids, "failed", jobs, stage=stage, reason=reason[:600])
+
+    async def _revise_listed(
+        self,
+        sent_ids: list[int],
+        catalog_skus: list[str],
+        current: dict[str, dict[str, str]],
+        sku_owner: dict[str, int],
+        jobs: dict[str, Any],
+    ) -> tuple[list[int], list[str]] | None:
+        """Wait for the imports, revise children already on eBay, and return what is left.
+
+        Returns (submission ids still to publish, children to publish), or None when the
+        whole batch was failed for review before anything reached eBay.
+
+        A child is revised when the batch's own export carries its eBay item id, so a
+        resubmit refreshes what is live instead of launching it again ("already active on
+        eBay"), and a partly listed parent can be finished: its listed sizes revise and the
+        missing ones launch in the same attempt.
+        """
+        await ListingSubmission.filter(
+            id__in=sent_ids, status=SubmissionStatus.PROCESSING
+        ).update(updated_at=datetime.now(timezone.utc))
+
+        # 1. The imports first. A revise or launch that overtakes a queued import sends the
+        #    old data: a launch that beat its catalog import is how "Description template is
+        #    not defined" happens, and a revise would push stale values onto a live listing.
+        # A catalog import is only in `jobs` when catalog rows were sent; if it is there with no
+        # id, that import cannot be waited on any more than a missing specifics job can.
+        missing = [name for name in ("catalog", "specifics")
+                   if (name in jobs or name == "specifics") and not jobs.get(name)]
+        if missing:
+            await self._fail_rows(
+                sent_ids, jobs, "imports",
+                "SellerCloud gave no import job to wait on - nothing revised or published",
+                f"{' and '.join(missing)} import returned no job id",
+            )
+            return None
+        waited = await ebay_service.wait_for_jobs(
+            [job for job in (jobs.get("catalog"), jobs.get("specifics")) if job]
+        )
+        await ListingSubmission.filter(
+            id__in=sent_ids, status=SubmissionStatus.PROCESSING
+        ).update(updated_at=datetime.now(timezone.utc))
+        stuck = sorted(job for job, state in waited.items() if state == "timeout")
+        if stuck:
+            await self._fail_rows(
+                sent_ids, jobs, "imports",
+                "SellerCloud imports still queued - nothing revised or published",
+                f"imports not finished after {IMPORT_WAIT_SECONDS}s: job(s) {', '.join(stuck)}",
+            )
+            return None
+
+        # 2. Which children are already on eBay, per submission. Recorded before any call,
+        #    so settle, the image file and the dashboard read the split this attempt made
+        #    rather than re-deriving it from a child list that may have changed since.
+        revise_map, launch_all = ebay_service.split_by_listing_id(current, catalog_skus)
+        revise_by_sub: dict[int, dict[str, str]] = defaultdict(dict)
+        launch_by_sub: dict[int, list[str]] = defaultdict(list)
+        for sku, item_id in revise_map.items():
+            if (owner := sku_owner.get(sku)) is not None:
+                revise_by_sub[owner][sku] = item_id
+        for sku in launch_all:
+            if (owner := sku_owner.get(sku)) is not None:
+                launch_by_sub[owner].append(sku)
+        for sid in sent_ids:
+            # One call per submission: record_step writes the same meta to every id it gets.
+            await record_step(
+                [sid], "listing_ids_read",
+                meta={"ebay_split": {"revised": dict(revise_by_sub.get(sid, {})),
+                                     "launch": sorted(launch_by_sub.get(sid, []))}},
+                revise=len(revise_by_sub.get(sid, {})),
+                launch=len(launch_by_sub.get(sid, [])),
+                imports=waited,
+            )
+
+        # 3. Revise, a bounded list per call, packed by WHOLE submission so a refused or
+        #    timed-out call fails only the submissions it carried. A failed call fails those
+        #    submissions and none of their other children launch: one genuine attempt per
+        #    submission, and nothing falls back to a launch on its own.
+        #
+        #    Each call first re-reads which of its rows are still PROCESSING: the stale sweep
+        #    runs alongside this batch, and a row it failed must not be revised after the fact.
+        failed: set[int] = set()
+        tasks: list[str] = []
+        packs = self._pack_by_submission(
+            [(sid, sorted(revise_by_sub[sid])) for sid in sent_ids if revise_by_sub.get(sid)]
+        )
+        for pack in packs:
+            owners = await self._still_processing([sid for sid, _ in pack])
+            failed.update(sid for sid, _ in pack if sid not in owners)
+            chunk = [sku for sid, skus in pack if sid in owners for sku in skus]
+            if not chunk:
+                continue
+            try:
+                result = await ebay_service.revise_on_ebay(chunk)
+            except Exception as exc:  # noqa: BLE001 - recorded on the rows, not swallowed
+                logger.exception("%s: eBay revise call failed", self.name)
+                detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
+                await self._fail_rows(
+                    owners, jobs, "revise",
+                    "eBay revise timed out - it may have been sent"
+                    if isinstance(exc, httpx.TimeoutException)
+                    else "eBay revise call failed - check SellerCloud before resubmitting",
+                    f"{type(exc).__name__}: {detail}",
+                )
+                failed.update(owners)
+                continue
+            if not result.get("ok"):
+                await self._fail_rows(
+                    owners, jobs, "revise", "eBay revise refused",
+                    str(result.get("message") or "Success=false"),
+                )
+                failed.update(owners)
+                continue
+            if result.get("task_id"):
+                tasks.append(result["task_id"])
+            await self._heartbeat(sent_ids)
+        jobs["revise_tasks"] = tasks
+
+        alive = set(await self._still_processing(sent_ids))
+        failed.update(sid for sid in sent_ids if sid not in alive)
+        revised_ok = [sid for sid in sent_ids if revise_by_sub.get(sid) and sid not in failed]
+        if revised_ok:
+            await self._stage(revised_ok, "revise_sent", jobs, tasks=tasks)
+
+        # 4. Close what needs nothing more; hand back what still needs a launch.
+        revise_only = [sid for sid in revised_ok if not launch_by_sub.get(sid)]
+        if revise_only:
+            await self._close_revised(revise_only, revise_by_sub, jobs)
+        launch_ids = [sid for sid in sent_ids if sid not in failed and launch_by_sub.get(sid)]
+        launch_skus = sorted(sku for sid in launch_ids for sku in launch_by_sub[sid])
+        return launch_ids, launch_skus
+
+    async def _close_revised(
+        self, ids: list[int], revise_by_sub: dict[int, dict[str, str]], jobs: dict[str, Any]
+    ) -> None:
+        """SUCCESS for submissions whose every child was revised.
+
+        Nothing downstream is owed for them: no publish job to wait on, no item ids to read
+        (the export already had them), and no image upload, because a revised child keeps
+        the pictures it has on eBay. Parked in `published` instead, collect_item_ids would
+        find the ids on the catalog grid and move them to awaiting_action for an upload
+        nobody owes.
+
+        SellerCloud's Success is the only signal a revise gives, so this is "sent", not
+        "confirmed on eBay"; see revise_on_ebay.
+        """
+        subs = await ListingSubmission.filter(
+            id__in=ids, status=SubmissionStatus.PROCESSING
+        ).prefetch_related("listing")
+        closed: list[int] = []
+        for sub in subs:
+            revised = revise_by_sub.get(sub.id) or {}
+            external_id = {
+                "item_ids": dict(revised), "revised": sorted(revised), "launched": [],
+            }
+            # A filtered update rather than a save: the stale sweep may have failed this row
+            # since it was read, and a save would overwrite that failure with SUCCESS. It also
+            # leaves platform_meta alone, which record_step owns.
+            changed = await ListingSubmission.filter(
+                id=sub.id, status=SubmissionStatus.PROCESSING
+            ).update(
+                status=SubmissionStatus.SUCCESS,
+                platform_status=None,
+                external_id=external_id,
+                updated_at=datetime.now(timezone.utc),
+            )
+            if not changed:
+                continue
+            sub.status = SubmissionStatus.SUCCESS
+            sub.external_id = external_id
+            parent = sub.listing.product_id if sub.listing else None
+            if parent and revised:
+                await ExternalListingService.record(
+                    "ebay",
+                    [
+                        {"level": "child", "sku": sku, "parent_sku": parent,
+                         "external_id": item_id}
+                        for sku, item_id in revised.items()
+                    ],
+                )
+            closed.append(sub.id)
+        if closed:
+            await self._stage(closed, REVISED_STAGE, jobs, sizes=sum(
+                len(revise_by_sub.get(sid) or {}) for sid in closed
+            ))
 
     async def _submit_batch(self, submission_ids: list[int]) -> dict[str, Any]:
         """One import file for these submissions."""
@@ -614,7 +957,9 @@ class EbayPoller(BasePoller):
                 # sent_ids, not submission_ids: an orphan is already FAILED with the
                 # reason build_rows gave, and a batch-wide message would overwrite the only
                 # record of why that particular listing produced nothing.
-                await ListingSubmission.filter(id__in=sent_ids).update(
+                await ListingSubmission.filter(
+                    id__in=sent_ids, status=SubmissionStatus.PROCESSING
+                ).update(
                     status=SubmissionStatus.FAILED,
                     error_display=f"{len(faults)} product(s) have a price or weight fault",
                 )
@@ -651,7 +996,9 @@ class EbayPoller(BasePoller):
             # status line. Without this the step reads "500" and says nothing actionable.
             detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
             # sent_ids for the same reason as the catalog fault above.
-            await ListingSubmission.filter(id__in=sent_ids).update(
+            await ListingSubmission.filter(
+                id__in=sent_ids, status=SubmissionStatus.PROCESSING
+            ).update(
                 status=SubmissionStatus.FAILED,
                 error_display="eBay specifics import failed to send",
             )
@@ -668,10 +1015,40 @@ class EbayPoller(BasePoller):
             await self._stage(sent_ids, "specifics_imported", jobs,
                               job=job_id, rows=len(rows))
 
-        # --- step 3: publish ---------------------------------------------------------
+        # --- step 3: wait for the imports, then revise what is already on eBay ---------
+        # From here the rows still to publish are `launch_ids`, not `sent_ids`: a submission
+        # whose children were all revised is closed as SUCCESS inside _revise_listed, and
+        # one whose revise failed is already FAILED.
+        specifics_ok = ok
+        launch_ids: list[int] = list(sent_ids)
+        launch_skus: list[str] = list(catalog_skus)
         if ok:
             try:
-                published = await ebay_service.publish_to_channel(catalog_skus)
+                remaining = await self._revise_listed(
+                    sent_ids, catalog_skus, current, sku_owner, jobs
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded on the rows, not swallowed
+                # Nothing has been launched yet, and any revise call already made is on its
+                # step. Failed for review here, rather than left for the sweep's generic line
+                # half an hour later.
+                logger.exception("%s: eBay revise stage failed", self.name)
+                await self._fail_rows(
+                    sent_ids, jobs, "revise",
+                    "eBay revise step failed - check SellerCloud before resubmitting",
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise
+            if remaining is None:
+                return {"submission_count": 0, "rows": len(rows), "sent": True, "ok": False,
+                        "jobs": jobs, "blocked": blocked}
+            launch_ids, launch_skus = remaining
+            ok = bool(launch_ids)
+
+        # --- step 4: publish what is not ------------------------------------------------
+        if ok:
+            await self._heartbeat(launch_ids)
+            try:
+                published = await ebay_service.publish_to_channel(launch_skus)
             except Exception as exc:  # noqa: BLE001 - recorded on the rows, not swallowed
                 # This call sat outside the guard above, so a transport error here
                 # left the rows in PROCESSING at `specifics_imported` with nothing
@@ -680,12 +1057,14 @@ class EbayPoller(BasePoller):
                 # rather than requeued, the same as the import POST above.
                 logger.exception("%s: eBay publish call failed", self.name)
                 detail = getattr(getattr(exc, "response", None), "text", "") or str(exc)
-                await ListingSubmission.filter(id__in=sent_ids).update(
+                await ListingSubmission.filter(
+                    id__in=launch_ids, status=SubmissionStatus.PROCESSING
+                ).update(
                     status=SubmissionStatus.FAILED,
                     error_display="eBay publish call failed - check SellerCloud before resubmitting",
                 )
                 await self._stage(
-                    sent_ids, "failed", jobs, stage="publish",
+                    launch_ids, "failed", jobs, stage="publish",
                     reason=f"{type(exc).__name__}: {detail}"[:600],
                 )
                 raise
@@ -693,11 +1072,13 @@ class EbayPoller(BasePoller):
             if not published.get("ok"):
                 # 200 with Success=false. Treated as the failure it is.
                 ok = False
-                await ListingSubmission.filter(id__in=sent_ids).update(
+                await ListingSubmission.filter(
+                    id__in=launch_ids, status=SubmissionStatus.PROCESSING
+                ).update(
                     status=SubmissionStatus.FAILED,
                     error_display="eBay publish to channel refused",
                 )
-                await self._stage(sent_ids, "failed", jobs, stage="publish",
+                await self._stage(launch_ids, "failed", jobs, stage="publish",
                                   reason=str(published.get("message"))[:400])
                 return {"submission_count": 0, "rows": len(rows), "sent": True, "ok": False,
                         "jobs": jobs, "response": published.get("response"), "blocked": blocked}
@@ -713,8 +1094,10 @@ class EbayPoller(BasePoller):
             # already stamped the batch's own id before any SellerCloud call, and the
             # dashboard has been keying on it since. Overwriting it with a job id now would
             # move an import row that operators have already been watching.
+            # Only rows still PROCESSING get the marker; one the sweep failed keeps its failure.
+            launch_ids = await self._still_processing(launch_ids)
             await record_step(
-                sent_ids,
+                launch_ids,
                 "published",
                 meta={"ebay_jobs": dict(jobs),
                       "published_at": datetime.now(timezone.utc).isoformat()},
@@ -727,11 +1110,13 @@ class EbayPoller(BasePoller):
             # save carrying this instance's stale copy of that column would overwrite the
             # steps just recorded. Written after the step so the cycle can never observe
             # the marker without the history behind it.
-            await ListingSubmission.filter(id__in=sent_ids).update(
-                platform_status=PUBLISHED_STAGE
-            )
-        else:
-            await ListingSubmission.filter(id__in=sent_ids).update(
+            await ListingSubmission.filter(
+                id__in=launch_ids, status=SubmissionStatus.PROCESSING
+            ).update(platform_status=PUBLISHED_STAGE)
+        elif not specifics_ok:
+            await ListingSubmission.filter(
+                id__in=sent_ids, status=SubmissionStatus.PROCESSING
+            ).update(
                 status=SubmissionStatus.FAILED,
                 error_display="eBay specifics import rejected",
             )
@@ -743,9 +1128,14 @@ class EbayPoller(BasePoller):
             "submission_count": len(sent_ids),
             "rows": len(rows),
             "sent": True,
-            "ok": ok,
+            # The batch is ok when its imports were. `ok` alone reads false for a batch whose
+            # every child was revised, which leaves nothing to publish but failed at nothing;
+            # a refused or failed revise is recorded on its own submissions, not the batch.
+            "ok": specifics_ok,
             "job_id": jobs.get("publish") or job_id,
             "jobs": jobs,
+            "revise_tasks": jobs.get("revise_tasks"),
+            "launched_submissions": len(launch_ids) if specifics_ok else 0,
             "status_code": result.get("status_code"),
             "response": result.get("response"),
             "blocked": blocked,

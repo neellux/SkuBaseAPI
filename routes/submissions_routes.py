@@ -476,14 +476,18 @@ def _build_import_detail(
     details: list[ImportListingDetail] = []
     batch_number = None
     publish_job_id = None
+    revise_task_ids = None
     for sub in submissions:
         status_counts[_effective_status(sub)] += 1
         if batch_number is None:
             batch_number = (sub.platform_meta or {}).get("batch_number")
         # Every submission in an import carries the same ebay_jobs map, so the first one
         # that has it answers for the batch.
+        ebay_jobs = (sub.platform_meta or {}).get("ebay_jobs") or {}
         if publish_job_id is None:
-            publish_job_id = ((sub.platform_meta or {}).get("ebay_jobs") or {}).get("publish")
+            publish_job_id = ebay_jobs.get("publish")
+        if not revise_task_ids:
+            revise_task_ids = ebay_jobs.get("revise_tasks")
         listing = sub.listing
         title = None
         product_id = None
@@ -509,6 +513,7 @@ def _build_import_detail(
                 updated_skus=(sub.platform_meta or {}).get("updated_references") or [],
                 image_count=(image_counts or {}).get(product_id or "", 0),
                 item_ids=(sub.external_id or {}).get("item_ids") or None,
+                revised_skus=(sub.external_id or {}).get("revised") or None,
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )
@@ -519,6 +524,7 @@ def _build_import_detail(
         platform_id=platform,
         batch_number=batch_number,
         publish_job_id=str(publish_job_id) if publish_job_id else None,
+        revise_task_ids=[str(task) for task in revise_task_ids] if revise_task_ids else None,
         submissions=details,
         status_counts=dict(status_counts),
     )
@@ -764,6 +770,21 @@ async def _images_by_parent(parents: list[str]) -> dict[str, int]:
     return {r["product_id"]: (r["product_images_count"] or 0) for r in rows}
 
 
+def _image_item_ids(sub: ListingSubmission) -> dict[str, str]:
+    """The item ids an image upload is owed for: the children this attempt LAUNCHED.
+
+    A revised child is already live with its pictures, and revision profile 1145 does not
+    resend them, so it has no row in the upload. A submission settled before revise existed
+    carries no `launched` list, and every item id it has was launched.
+    """
+    external = sub.external_id or {}
+    item_ids = external.get("item_ids") or {}
+    if "launched" not in external:
+        return item_ids
+    launched = set(external.get("launched") or [])
+    return {sku: item_id for sku, item_id in item_ids.items() if sku in launched}
+
+
 def _revise_rows(
     submissions: list[ListingSubmission], image_counts: dict[str, int]
 ) -> list[tuple[str, str]]:
@@ -781,7 +802,7 @@ def _revise_rows(
         urls = PIC_SEPARATOR.join(
             f"{GCS_ROOT}/{parent}/{index}_fullsize.jpg" for index in range(1, count + 1)
         )
-        for _sku, item_id in sorted(((sub.external_id or {}).get("item_ids") or {}).items()):
+        for _sku, item_id in sorted(_image_item_ids(sub).items()):
             out.append((str(item_id), urls))
     return out
 
@@ -847,6 +868,14 @@ async def download_image_revise_template(
     )
     rows = _revise_rows(submissions, image_counts)
     if not rows:
+        externals = [s.external_id or {} for s in submissions]
+        if externals and all("launched" in e and not e["launched"] for e in externals):
+            # Nothing in the import was newly listed: revised children already carry their
+            # pictures, so no item numbers are coming and "try again shortly" would be false.
+            raise HTTPException(
+                status_code=404,
+                detail=f"Nothing to upload for import {import_id}: no size was newly listed",
+            )
         raise HTTPException(
             status_code=404,
             detail=(
@@ -897,8 +926,7 @@ async def mark_images_uploaded(
     failed_ids: list[int] = []
 
     for sub in waiting:
-        item_ids = (sub.external_id or {}).get("item_ids") or {}
-        if item_ids:
+        if _image_item_ids(sub):
             sub.status = SubmissionStatus.SUCCESS
             sub.completed_at = now
             sub.completed_by = user_id

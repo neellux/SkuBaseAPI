@@ -33,8 +33,12 @@ import asyncio
 import base64
 import logging
 import re
+import time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+import orjson
 
 from models.db_models import AppSettings, Listing
 from services.ebay_aspect_service import ebay_aspect_service
@@ -52,6 +56,9 @@ TEMPLATE_ENDPOINT = "/Catalog/Imports/EbaySpecifics/Template"
 CATALOG_EXPORT_ENDPOINT = "/Catalog/Exports/Custom"
 CATALOG_IMPORT_ENDPOINT = "/Catalog/Imports/Custom"
 LAUNCH_ENDPOINT = "/Catalog/Actions/LaunchOnChannel"
+# Revises a child that is already live on eBay instead of launching it again. Delta API, like
+# LaunchOnChannel, so it goes through sellercloud_internal_service.
+REVISE_ENDPOINT = "/Catalog/Actions/ReviseOnEbay"
 
 # The eBay catalog fields this owns, in file order. ProductID is the key and is not one of
 # them: it is absent from GET /Catalog/Imports/Custom/Templates/Fields for that reason, and
@@ -94,7 +101,16 @@ CATALOG_COLUMNS = (
 #
 # PackageWeightLbs/Oz rather than ShippingWeight, which is the same value in ounces but is
 # NOT among the 1,260 columns a custom export can ask for (only ShippingWeightUnits is).
-EXPORT_ONLY_COLUMNS = ("PackageWeightLbs", "PackageWeightOz")
+# The eBay item id of a child's live fixed-price listing, read so the batch can revise a child
+# that is already on eBay instead of launching it again. Export-only: diff_catalog_rows and
+# render_catalog_tsv work from CATALOG_COLUMNS, so it is never written back.
+#
+# Verified 2026-09-11 against the catalog grid's ebayItemID on seven children (export job
+# 4228763). NOT eBayItemID or EBayItemID: SellerCloud accepts both names without complaint and
+# exports the column blank (jobs 4228772, 4228773), which would read every child as unlisted
+# and launch the lot again.
+LISTING_ID_COLUMN = "CurrentFixedPriceListingID"
+EXPORT_ONLY_COLUMNS = ("PackageWeightLbs", "PackageWeightOz", LISTING_ID_COLUMN)
 CATALOG_KEY = "ProductID"
 DESCRIPTION_TEMPLATE = "Long Description"
 
@@ -103,6 +119,12 @@ DESCRIPTION_TEMPLATE = "Long Description"
 # published list. Categories like 260956 refuse the launch outright without it:
 # "Category id 260956 requires condition specified. Condition is not specified".
 ITEM_CONDITION = "1000"
+
+# The account's one eBay revision profile, sent on every ReviseOnEbay. A constant for the same
+# reason the policy ids below are: there is one, and a different value is not a variation, it
+# is the wrong profile. Confirmed by the user on 2026-09-11, including that it does not send
+# pictures -- the images an operator uploaded by hand survive a revise.
+REVISION_ID = "1145"
 
 # The account's payment and return policies. Constants rather than settings because there is
 # one of each: eBay resolves them by profile id, and a listing carrying a different one is
@@ -235,6 +257,17 @@ FORMAT_TAB = 0
 
 # Export jobs are queued; 5 SKUs measured at ~51s.
 POLL_INTERVAL = 5
+
+# ReviseOnEbay answers synchronously and took 20.2s for two children, against the internal
+# client's 30s default, so it gets its own timeout and a bounded list per call. Small until a
+# larger call has been timed (V5 in the plan): the batch packs whole submissions into a call,
+# so one refused or timed-out call only fails the submissions it carried.
+REVISE_CHUNK = 20
+REVISE_TIMEOUT_SECONDS = 120
+
+# How long a batch waits for its catalog and specifics imports before touching eBay. Well
+# under ebay_poller.recover_stale_processing's 30 minutes, which keys on updated_at.
+IMPORT_WAIT_SECONDS = 900
 
 # The template's own header and line ending, reproduced exactly.
 COLUMNS = ("ProductID", "SpecificName", "SpecificValue", "SpecificType", "Action")
@@ -1063,6 +1096,106 @@ class EbayService:
         if "id=" in message:
             job_id = message.split("id=")[1].split("'")[0].split("&")[0].strip()
         return {"ok": ok, "job_id": job_id, "message": message, "response": result}
+
+    @staticmethod
+    def split_by_listing_id(
+        current: Dict[str, Dict[str, str]], skus: List[str]
+    ) -> Tuple[Dict[str, str], List[str]]:
+        """({child: eBay item id} already live, [child] not listed), from the batch's export.
+
+        Read from the export the batch runs just before publishing, so the decision reflects
+        SellerCloud at that moment rather than whatever external_listing_ids last recorded:
+        that table misses anything listed outside SkuBase, and PRP-XJNS-0611/31 was live as
+        327331726364 on a listing created the day before.
+
+        A blank cell, "0", or a child the export did not return all mean "not listed". A
+        child SellerCloud has no id for cannot be revised, and launching it is exactly what
+        the batch did before this existed.
+        """
+        revise: Dict[str, str] = {}
+        launch: List[str] = []
+        for sku in skus:
+            item_id = ((current.get(sku) or {}).get(LISTING_ID_COLUMN) or "").strip()
+            if item_id and item_id != "0":
+                revise[sku] = item_id
+            else:
+                launch.append(sku)
+        return revise, launch
+
+    @staticmethod
+    def parse_revise_task_id(message: str) -> Optional[str]:
+        """The LMS task id in ReviseOnEbay's reply, e.g. "task-6-13327156060".
+
+        Recorded for the audit trail only. It is not a SellerCloud queued job, nothing is
+        known to look it up by, and it carries no per-child result.
+        """
+        match = re.search(r"LMS job#\s*([^\s,]+)", message or "")
+        return match.group(1).rstrip(".") if match else None
+
+    @staticmethod
+    async def revise_on_ebay(child_skus: List[str]) -> Dict[str, Any]:
+        """Push SellerCloud's current data for children that are already live on eBay.
+
+        Verified live on 2026-09-11 against PRP-XJNS-0611/31 and /32: SellerCloud answered
+        synchronously in 20.2s with Success and "Product revision sent to eBay with LMS job#
+        task-6-13327156060, Company 182." There is no queued job link, no output file and no
+        per-child result, so Success is the only signal a revise gives. HTTP 200 with
+        Success=false is a refusal, the same shape publish_to_channel handles.
+
+        Raises on transport errors and non-2xx, including a timeout, which the caller has to
+        treat as "may have been sent": the call is synchronous on SellerCloud's side too.
+        """
+        response = await sellercloud_internal_service._make_request(
+            "POST",
+            REVISE_ENDPOINT,
+            data={"ProductIDs": list(child_skus), "RevisionID": REVISION_ID},
+            timeout=httpx.Timeout(REVISE_TIMEOUT_SECONDS),
+        )
+        result = orjson.loads(response.content)
+        message = ((result.get("Notification") or {}).get("Message") or "")
+        return {
+            "ok": bool(result.get("Success")),
+            "task_id": EbayService.parse_revise_task_id(message),
+            "message": message,
+            "response": result,
+        }
+
+    @staticmethod
+    async def wait_for_jobs(
+        job_ids: List[str], timeout_seconds: int = IMPORT_WAIT_SECONDS
+    ) -> Dict[str, str]:
+        """{job id: "complete" | "reported_failed" | "timeout"} for queued SellerCloud jobs.
+
+        The batch waits on its catalog and specifics imports before revising or launching,
+        because a channel action that overtakes a queued import sends the OLD data: a launch
+        that beat its catalog import is how "Description template is not defined" happens,
+        and a revise would push stale values onto a live listing without anyone noticing.
+
+        A job SellerCloud reports as failed counts as finished. Custom imports are routinely
+        reported failed with 0 rows processed while every row was applied (docs section 17),
+        so treating that as fatal would fail batches whose data landed. The caller records
+        the outcome so the step history still says what SellerCloud claimed.
+        """
+        outcome: Dict[str, str] = {}
+        pending = {str(job_id) for job_id in job_ids if job_id}
+        # Wall clock, not slept seconds: each is_job_complete is an HTTP call that can itself
+        # take up to the client timeout, and counting only the sleeps let the bound run past
+        # the stale sweep's 30 minutes.
+        deadline = time.monotonic() + timeout_seconds
+        while pending:
+            for job_id in sorted(pending):
+                try:
+                    if await sellercloud_service.is_job_complete(job_id):
+                        outcome[job_id] = "complete"
+                except RuntimeError:
+                    outcome[job_id] = "reported_failed"
+            pending -= set(outcome)
+            if not pending or time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(POLL_INTERVAL)
+        for job_id in pending:
+            outcome[job_id] = "timeout"
+        return outcome
 
     @staticmethod
     async def fetch_template(file_format: int = FORMAT_TAB) -> str:

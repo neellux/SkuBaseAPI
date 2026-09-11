@@ -959,6 +959,12 @@ class ImportListingDetail(BaseModel):
         "the UI counts against `skus` to show how much of an import is actually listed "
         "before an operator downloads its image revise file",
     )
+    revised_skus: Optional[List[str]] = Field(
+        None,
+        description="eBay children this attempt REVISED rather than launched. They are live "
+        "with their pictures already, so the image revise file leaves them out and the "
+        "coverage count must too",
+    )
     updated_at: Optional[datetime] = None
     reviewed_at: Optional[datetime] = Field(
         None,
@@ -978,6 +984,11 @@ class ImportDetailResponse(BaseModel):
     # its priority in the queue, or to read the per-child errors eBay returned.
     publish_job_id: Optional[str] = Field(
         None, description="SellerCloud queued job id for this import's publish step"
+    )
+    # ReviseOnEbay returns an LMS task id rather than a queued job, and nothing is known to
+    # look one up by, so these are shown for the record rather than linked.
+    revise_task_ids: Optional[List[str]] = Field(
+        None, description="SellerCloud LMS task ids from this import's ReviseOnEbay calls"
     )
     submissions: List[ImportListingDetail] = Field(default_factory=list)
     status_counts: Dict[str, int] = Field(default_factory=dict)
