@@ -247,6 +247,15 @@ GOAT_DEFAULT_SETTINGS = {
 }
 
 
+# The scheduled daily flush (services/scheduled_flush.py), on every batch platform. None, not
+# 0: the GET returns null, the field renders blank, and a save writes null, because blank is
+# what "off" looks like.
+SCHEDULED_FLUSH_DEFAULTS = {
+    "scheduled_flush_days": None,
+    "scheduled_flush_min_size": None,
+}
+
+
 def _hydrate_platform_settings(platform_settings: dict) -> dict:
     merged = dict(platform_settings or {})
     for platform_id, defaults in (
@@ -256,7 +265,7 @@ def _hydrate_platform_settings(platform_settings: dict) -> dict:
         ("goat", GOAT_DEFAULT_SETTINGS),
     ):
         platform = dict(merged.get(platform_id) or {})
-        for key, default_value in defaults.items():
+        for key, default_value in {**defaults, **SCHEDULED_FLUSH_DEFAULTS}.items():
             platform.setdefault(key, default_value)
         merged[platform_id] = platform
     return merged

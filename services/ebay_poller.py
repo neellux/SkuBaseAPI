@@ -3,14 +3,17 @@
 Mirrors grailed_poller: claim the pending rows under a lock, flip them to PROCESSING,
 build one file for the whole batch, post it, then mark each row.
 
-Unlike Grailed and SPO this has NO scheduled cycle yet. It is driven only by
-POST /submissions/create_batch?platform=ebay, so an import happens when a person asks for
-one rather than on a timer. Clicking submit sends, matching what that button already means
-for SPO and Grailed; neither of those has a preview either.
+Unlike Grailed and SPO there is no size trigger: a pending count never sends eBay. An import
+happens when a person asks for one through POST /submissions/create_batch?platform=ebay or,
+when platform_settings.ebay.scheduled_flush_days is set, from the daily scheduled flush
+(services/scheduled_flush.py), which claims and runs exactly what Submit Pending would.
+Clicking submit sends, matching what that button already means for SPO and Grailed; neither
+of those has a preview either.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -35,6 +38,7 @@ from services.ebay_service import (
     weight_oz,
 )
 from services.external_listing_service import ExternalListingService
+from services.scheduled_flush import FlushStamp, run_scheduled_check, settle_stamp, stamp_flush
 from services.sellercloud_internal_service import sellercloud_internal_service
 from services.sellercloud_service import sellercloud_service
 from utils.submission_steps import last_step, record_step
@@ -64,17 +68,31 @@ class EbayPoller(BasePoller):
 
     def __init__(self) -> None:
         super().__init__("ebay_poller", name="ebay_poller")
+        # Each batch's flush clock stamp, held between begin_batch and run_batch because the
+        # submit route calls them separately (services/scheduled_flush.py).
+        self._flush_stamps: dict[int, FlushStamp | None] = {}
+        # A scheduled batch runs in the background, and the event loop only weakly references
+        # a task, so each one is held here until it finishes.
+        self._background_tasks: set[asyncio.Task] = set()
 
     async def _poll_cycle(self) -> None:
-        """Advance rows the submit path cannot.
+        """Advance rows the submit path cannot, and run the daily scheduled flush.
 
-        Submitting is driven by POST /submissions/create_batch, not by this cycle. What the
-        cycle owns is what happens AFTER SellerCloud accepts: publish jobs finish minutes to
-        hours later, eBay item ids appear gradually as it processes them, and neither event
-        notifies anything. Measured on the 2026-08-25 run, item ids went 222 -> 797 -> 1,074
-        over about an hour.
+        Submitting is driven by POST /submissions/create_batch and, once a day when
+        platform_settings.ebay.scheduled_flush_days is set, by run_scheduled_check. That starts
+        the same batch in the background, so this cycle is not held for the up to ~17 minutes
+        a batch can take. What the cycle otherwise owns is what happens AFTER SellerCloud
+        accepts: publish jobs finish minutes to hours later, eBay item ids appear gradually as
+        it processes them, and neither event notifies anything. Measured on the 2026-08-25
+        run, item ids went 222 -> 797 -> 1,074 over about an hour.
         """
         await self.recover_stale_processing()
+        await run_scheduled_check(
+            self.PLATFORM_ID,
+            count_ready=self._count_claimable,
+            flush=self._scheduled_flush,
+            background=True,
+        )
         await self.collect_item_ids()
 
     async def recover_stale_processing(self, stale_minutes: int = 30) -> dict[str, int]:
@@ -225,6 +243,8 @@ class EbayPoller(BasePoller):
             meta={"product_import_id": import_id},
             submissions=len(submission_ids),
         )
+        # The flush clock, settled when run_batch finishes (services/scheduled_flush.py).
+        self._flush_stamps[import_id] = await stamp_flush(self.PLATFORM_ID)
         logger.info("%s: batch %s claimed %d submission(s)",
                     self.name, import_id, len(submission_ids))
         return import_id, submission_ids
@@ -274,12 +294,53 @@ class EbayPoller(BasePoller):
         return claimed
 
     async def run_batch(self, import_id: int, submission_ids: list[int]) -> dict[str, Any]:
-        """The four SellerCloud round trips, for rows begin_batch already claimed."""
+        """The four SellerCloud round trips, for rows begin_batch already claimed.
+
+        Then settles the flush clock: put back if every row ended in pending again, which is
+        what happens when no row built, so nothing reached SellerCloud.
+        """
+        stamp = self._flush_stamps.pop(import_id, None)
         try:
             return await self._submit_batch(submission_ids)
         except Exception:
             logger.exception("%s: batch %s failed", self.name, import_id)
             raise
+        finally:
+            await settle_stamp(stamp, submission_ids)
+
+    async def _count_claimable(self) -> int:
+        """How many pending rows a batch would take right now: one per parent, none for a
+        parent already in flight.
+
+        The scheduled flush compares its minimum with this, not the raw pending count. Rows
+        held back behind a busy parent would otherwise pass the minimum, send a batch of
+        three and reset the clock for the rest.
+        """
+        pending_ids = await ListingSubmission.filter(
+            platform_id=self.PLATFORM_ID, status=SubmissionStatus.PENDING
+        ).values_list("id", flat=True)
+        if not pending_ids:
+            return 0
+        return len(await self._one_per_parent(list(pending_ids), connections.get("default")))
+
+    async def _scheduled_flush(self) -> int:
+        """Claim and start a batch exactly as Submit Pending does, in the background."""
+        import_id, submission_ids = await self.begin_batch()
+        if not submission_ids or import_id is None:
+            return 0
+        task = asyncio.create_task(self._run_scheduled_batch(import_id, submission_ids))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return len(submission_ids)
+
+    async def _run_scheduled_batch(self, import_id: int, submission_ids: list[int]) -> None:
+        try:
+            await self.run_batch(import_id, submission_ids)
+        except Exception:
+            # run_batch logged the traceback and _submit_batch recorded the failure on the
+            # rows. Caught so it does not also surface as a never-retrieved task exception.
+            logger.error("%s: scheduled batch %s failed, see the traceback above",
+                         self.name, import_id)
 
     async def manual_flush(self) -> dict[str, Any]:
         """Claim and run in one call. Used where a caller wants to block on the result."""

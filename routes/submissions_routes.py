@@ -26,6 +26,7 @@ from services import spo_service as spo_service_module
 from services.ebay_poller import ebay_poller
 from services.grailed_poller import grailed_poller
 from services.goat_poller import goat_poller
+from services.scheduled_flush import schedule_summary
 from services.spo_poller import spo_poller
 from services.spo_service import spo_service
 from services.template_service import TemplateService
@@ -296,7 +297,13 @@ async def get_dashboard(
         else:
             platform_settings = await _get_platform_settings_for(platform)
             platform_ids = [platform]
-            min_batch_size = int(platform_settings.get("min_batch_size", 200) or 200)
+            # eBay has no count trigger: nothing sends it on a pending count, so it reports 0
+            # and the dashboard stops describing one.
+            min_batch_size = (
+                0
+                if platform == "ebay"
+                else int(platform_settings.get("min_batch_size", 200) or 200)
+            )
 
         pending = processing = failed = success = 0
         all_imports: list[ImportSummary] = []
@@ -321,6 +328,24 @@ async def get_dashboard(
         end = start + page_size
         page_slice = all_imports[start:end]
 
+        # The scheduled daily flush, single-platform only. schedule_summary never raises, so a
+        # missing platform_flush_state table reads as "unavailable" rather than a 500.
+        schedule: dict[str, Any] = {}
+        if platform != "all":
+            app_settings = await AppSettings.first()
+            poller = {
+                "spo": spo_poller,
+                "grailed": grailed_poller,
+                "goat": goat_poller,
+                "ebay": ebay_poller,
+            }.get(platform)
+            schedule = await schedule_summary(
+                platform,
+                platform_settings,
+                enabled_platforms=(app_settings.platforms or []) if app_settings else [],
+                poller_enabled=bool(poller and poller.enabled),
+            )
+
         return SubmissionsDashboardResponse(
             platform_id=platform,
             pending_count=pending,
@@ -334,6 +359,7 @@ async def get_dashboard(
             page_size=page_size,
             platform_pending_counts=await _pending_counts_by_platform(),
             platform_awaiting_action_counts=await _awaiting_action_counts_by_platform(),
+            **schedule,
         )
     except HTTPException:
         raise

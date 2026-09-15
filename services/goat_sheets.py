@@ -25,8 +25,9 @@ CALL BUDGET, which is part of the design rather than an implementation detail:
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Final, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -61,9 +62,16 @@ _TRANSIENT_REASONS = frozenset(
 )
 
 
+# Batches are dated in Eastern time, the business's day. The UTC date is a day ahead for any
+# flush after 8pm EDT or 7pm EST, which is exactly when the scheduled flush runs, and the next
+# morning's batch then got a " (2)" tab. Readback and the Master Sheet use the tab_title
+# stored on each row, never a date computed again, so changing this renames nothing.
+EASTERN: Final = ZoneInfo("America/New_York")
+
+
 def tab_title_for(when: datetime | None = None) -> str:
-    """`9.4.2026` - M.D.YYYY, unpadded, matching the Master Sheet dashboard."""
-    d = when or datetime.now(timezone.utc)
+    """`9.4.2026` - M.D.YYYY, unpadded, matching the Master Sheet dashboard. Eastern date."""
+    d = when.astimezone(EASTERN) if when else datetime.now(EASTERN)
     return f"{d.month}.{d.day}.{d.year}"
 
 

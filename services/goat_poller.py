@@ -39,7 +39,8 @@ from services import email_service
 from services.base_poller import BasePoller
 from services.goat_service import GoatStage
 from services.external_listing_service import ExternalListingService
-from services.goat_sheets import goat_sheets, tab_title_for
+from services.goat_sheets import EASTERN, goat_sheets, tab_title_for
+from services.scheduled_flush import FlushStamp, run_scheduled_check, settle_stamp, stamp_flush
 from services.shopify_admin import ShopifyAdmin
 from services.shopify_client import (
     ShopifyPermanentError,
@@ -93,6 +94,9 @@ class GoatPoller(BasePoller):
         # Signature of the dashboard as last written, so an unchanged dashboard
         # costs zero calls.
         self._master_signature: str | None = None
+        # Each batch's flush clock stamp, held between begin_batch and run_batch because the
+        # submit route calls them separately (services/scheduled_flush.py).
+        self._flush_stamps: dict[int, FlushStamp | None] = {}
 
     # -- settings ----------------------------------------------------------
 
@@ -111,10 +115,25 @@ class GoatPoller(BasePoller):
 
     async def _poll_cycle(self) -> None:
         await self._recover_stale_processing()
+        await run_scheduled_check(
+            self.PLATFORM_ID, count_ready=self._count_pending, flush=self._scheduled_flush
+        )
         await self._batch_upload_pending(force=False)
         await self._check_readback()
         await self._sync_to_1nventory()
         await self._update_master()
+
+    async def _count_pending(self) -> int:
+        # The raw count, although one flush claims at most MAX_CLAIM: a minimum that high
+        # would be unusual, and the size trigger drains what is left.
+        return await ListingSubmission.filter(
+            platform_id=self.PLATFORM_ID, status=SubmissionStatus.PENDING
+        ).count()
+
+    async def _scheduled_flush(self) -> int:
+        # force=True, exactly as Submit Pending.
+        result = await self._batch_upload_pending(force=True)
+        return int(result.get("submission_count") or 0)
 
     # -- stale recovery ----------------------------------------------------
 
@@ -206,9 +225,25 @@ class GoatPoller(BasePoller):
         await record_step(
             ids, "sheet_writing", meta={"product_import_id": import_id}, batch_size=len(ids)
         )
+        # The flush clock, settled when run_batch finishes (services/scheduled_flush.py).
+        self._flush_stamps[import_id] = await stamp_flush(self.PLATFORM_ID)
         return import_id, ids
 
     async def run_batch(self, import_id: int, submission_ids: list[int]) -> dict[str, Any]:
+        """Run a claimed batch, then settle the flush clock.
+
+        The clock is put back when every row ends in pending again, which is what happens
+        when no row built or the tab could not be created: nothing reached the sheet.
+        """
+        stamp = self._flush_stamps.pop(import_id, None)
+        try:
+            return await self._build_and_write_batch(import_id, submission_ids)
+        finally:
+            await settle_stamp(stamp, submission_ids)
+
+    async def _build_and_write_batch(
+        self, import_id: int, submission_ids: list[int]
+    ) -> dict[str, Any]:
         """Build the rows, create the batch's tab, append. Never raises."""
         live = set(submission_ids)
         subs = await ListingSubmission.filter(id__in=submission_ids).prefetch_related("listing")
@@ -321,8 +356,9 @@ class GoatPoller(BasePoller):
         if not list_name:
             return
         # M/D/YYYY with slashes in the subject, matching how the sheet is
-        # referred to in conversation. The tab itself is named with dots.
-        now = datetime.now(timezone.utc)
+        # referred to in conversation. The tab itself is named with dots. Eastern date,
+        # the same day as the tab name (goat_sheets.tab_title_for).
+        now = datetime.now(EASTERN)
         subject = f"New PT Sheet: {now.month}/{now.day}/{now.year}"
         url = tab["sheet_url"]
         # Plain-text fallback spells the URL out, because the AppScript may render

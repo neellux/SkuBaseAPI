@@ -13,6 +13,7 @@ from models.db_models import (
     SubmissionStatus,
 )
 from services.base_poller import BasePoller
+from services.scheduled_flush import run_scheduled_check, settle_stamp, stamp_flush
 from services.spo_service import (
     SpoApiError,
     is_terminal_import_status,
@@ -49,8 +50,24 @@ class SpoPoller(BasePoller):
     async def _poll_cycle(self) -> None:
         await self._recover_stale_processing()
         await self._resume_products_complete()
+        await run_scheduled_check(
+            "spo", count_ready=self._count_pending, flush=self._scheduled_flush
+        )
         await self._batch_upload_pending(force=False)
         await self._check_processing()
+
+    @staticmethod
+    async def _count_pending() -> int:
+        return await ListingSubmission.filter(
+            platform_id="spo", status=SubmissionStatus.PENDING
+        ).count()
+
+    async def _scheduled_flush(self) -> int:
+        # force=True, exactly as Submit Pending: the schedule has its own minimum and does not
+        # also wait for min_batch_size. That includes a min_batch_size raised on purpose to
+        # stop auto-flushing, so leave scheduled_flush_days blank while SPO must not send.
+        result = await self._batch_upload_pending(force=True)
+        return int(result.get("submission_count") or 0)
 
     async def _recover_stale_processing(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.stale_timeout_minutes)
@@ -173,6 +190,12 @@ class SpoPoller(BasePoller):
                 )
             )
 
+        # The flush clock (services/scheduled_flush.py): stamped once the claim has committed,
+        # and put back in the finally below if every claimed row ends in pending again. A copy
+        # of the ids, because _run_batch removes each one from submission_ids as it settles it.
+        claimed_ids = list(submission_ids)
+        stamp = await stamp_flush("spo")
+
         logger.info(f"{self.name}: batch uploading {len(submission_ids)} SPO submissions")
 
         # Everything past the claim used to run unguarded. A template fetch, a
@@ -203,6 +226,8 @@ class SpoPoller(BasePoller):
                     reason=f"batch aborted before upload: {type(e).__name__}: {str(e)[:250]}",
                 )
             raise
+        finally:
+            await settle_stamp(stamp, claimed_ids)
 
     async def _run_batch(self, submission_ids: list[int]) -> dict[str, Any]:
         # Recorded outside the claim transaction: record_step uses its own

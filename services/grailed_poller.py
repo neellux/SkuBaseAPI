@@ -13,6 +13,7 @@ from models.db_models import (
 from services.base_poller import BasePoller
 from services.external_listing_service import ExternalListingService
 from services.grailed_service import grailed_service
+from services.scheduled_flush import run_scheduled_check, settle_stamp, stamp_flush
 from services.template_service import TemplateService
 from tortoise import Tortoise
 from tortoise.transactions import in_transaction
@@ -85,7 +86,21 @@ class GrailedPoller(BasePoller):
 
     async def _poll_cycle(self) -> None:
         await self._recover_stale_processing()
+        await run_scheduled_check(
+            "grailed", count_ready=self._count_pending, flush=self._scheduled_flush
+        )
         await self._batch_upload_pending(force=False)
+
+    @staticmethod
+    async def _count_pending() -> int:
+        return await ListingSubmission.filter(
+            platform_id="grailed", status=SubmissionStatus.PENDING
+        ).count()
+
+    async def _scheduled_flush(self) -> int:
+        # force=True, exactly as Submit Pending, still chunked at min_batch_size.
+        result = await self._batch_upload_pending(force=True)
+        return int(result.get("submission_count") or 0)
 
     async def _recover_stale_processing(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.stale_timeout_minutes)
@@ -181,6 +196,19 @@ class GrailedPoller(BasePoller):
                 )
             )
 
+        # The flush clock (services/scheduled_flush.py): stamped once the claim has committed,
+        # and put back in the finally if every claimed row ends in pending again, as it does
+        # when the template fetch fails or the AppScript is unreachable for every chunk.
+        stamp = await stamp_flush("grailed")
+        try:
+            return await self._flush_claimed(submission_ids, batch_size)
+        finally:
+            await settle_stamp(stamp, submission_ids)
+
+    async def _flush_claimed(
+        self, submission_ids: list[int], batch_size: int
+    ) -> dict[str, Any]:
+        """Send rows _batch_upload_pending has already claimed, in chunks of batch_size."""
         logger.info(
             f"{self.name}: batch submitting {len(submission_ids)} Grailed submissions "
             f"in chunks of {batch_size}"

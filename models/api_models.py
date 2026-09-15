@@ -903,7 +903,28 @@ class SubmissionsDashboardResponse(BaseModel):
     success_count: int = Field(..., description="ListingSubmissions completed successfully")
     min_batch_size: int = Field(
         ...,
-        description="Per-platform minimum pending count before auto-batch from platform_settings",
+        description="Per-platform minimum pending count before auto-batch from platform_settings. "
+        "0 for 'all' and for a platform with no count trigger (eBay)",
+    )
+    # The scheduled daily flush (services/scheduled_flush.py). Single-platform responses only;
+    # 'all' leaves every one of these null.
+    scheduled_flush_status: Optional[str] = Field(
+        None,
+        description="off, active, dry_run, platform_disabled, poller_disabled (the poller is "
+        "off in this server's config) or unavailable (the flush state could not be read)",
+    )
+    scheduled_flush_days: Optional[int] = Field(None, description="Parsed schedule, days")
+    scheduled_flush_min_size: Optional[int] = Field(
+        None, description="Parsed schedule, rows that must be ready at the check"
+    )
+    next_scheduled_flush_at: Optional[datetime] = Field(
+        None,
+        description="When the next check that could flush runs, Eastern and tz-aware. It "
+        "still needs scheduled_flush_min_size ready. Null unless status is active or dry_run",
+    )
+    last_scheduled_check_at: Optional[datetime] = None
+    last_scheduled_result: Optional[str] = Field(
+        None, description="What the last check did, e.g. 'skipped, 12 of 20 ready'"
     )
     imports: List[ImportSummary] = Field(default_factory=list)
     total_imports: int = Field(0, description="Total imports for this platform")

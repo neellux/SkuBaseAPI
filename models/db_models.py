@@ -515,6 +515,37 @@ class AppSettings(Model):
         return f"AppSettings({self.id})"
 
 
+class PlatformFlushState(Model):
+    """Per-platform flush clock and daily scheduled-check slot.
+
+    Kept out of app_settings.platform_settings on purpose: PUT /settings/platform_settings
+    replaces that whole JSON with whatever copy a page loaded, which would overwrite a clock
+    stored there. Created by API/migrations/add_platform_flush_state.sql; see
+    services/scheduled_flush.py.
+    """
+
+    platform = fields.CharField(max_length=32, pk=True)
+    last_flushed_at = fields.DatetimeField(
+        null=True,
+        description="Stamped by every flush trigger when a claim takes at least one row; put "
+        "back when every claimed row ends the flush in pending again",
+    )
+    last_scheduled_check_on = fields.DateField(
+        null=True, description="Eastern date whose scheduled check has run"
+    )
+    last_scheduled_check_at = fields.DatetimeField(null=True)
+    last_scheduled_result = fields.TextField(
+        null=True, description="Short text for the dashboard, e.g. 'skipped, 12 of 20 ready'"
+    )
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "platform_flush_state"
+
+    def __str__(self):
+        return f"PlatformFlushState({self.platform})"
+
+
 class InternalPlatformAction(StrEnum):
     """Actions the consignment pipeline can take against a parent product.
 
