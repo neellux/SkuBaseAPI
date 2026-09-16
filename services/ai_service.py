@@ -246,8 +246,13 @@ class AIService:
         product_name: str,
         product_type: str,
         use_raw_image_urls: bool = True,
+        require_ai: bool = False,
     ) -> str | None:
         if not CAPTION_MODEL or not CAPTION_API_KEY:
+            if require_ai:
+                from exceptions.batch_generation_exceptions import AIGenerationError
+
+                raise AIGenerationError("Caption model is not configured")
             logger.warning("AI description generation is not fully configured. Skipping.")
             return None
 
@@ -348,6 +353,12 @@ class AIService:
                 f"image_urls={url_sample} err={type(e).__name__}: {e}",
                 exc_info=True,
             )
+            if require_ai:
+                from exceptions.batch_generation_exceptions import AIGenerationError
+
+                raise AIGenerationError(
+                    f"Caption model {CAPTION_MODEL} failed: {type(e).__name__}: {str(e)[:400]}"
+                ) from e
             return None
 
     @staticmethod
@@ -357,8 +368,13 @@ class AIService:
         image_urls: List[str],
         mapped_options: Dict[str, List[Any]] = None,
         use_raw_image_urls: bool = True,
+        require_ai: bool = False,
     ) -> Dict[str, Any]:
         if not ASPECTS_MODEL or not ASPECTS_API_KEY:
+            if require_ai:
+                from exceptions.batch_generation_exceptions import AIGenerationError
+
+                raise AIGenerationError("Aspects model is not configured")
             logger.warning("AI aspects service is not configured. Skipping.")
             return {}
 
@@ -494,6 +510,12 @@ class AIService:
                 f"image_urls={url_sample} err={type(e).__name__}: {e}",
                 exc_info=True,
             )
+            if require_ai:
+                from exceptions.batch_generation_exceptions import AIGenerationError
+
+                raise AIGenerationError(
+                    f"Aspects model {ASPECTS_MODEL} failed: {type(e).__name__}: {str(e)[:400]}"
+                ) from e
             return {}
 
     @staticmethod
@@ -502,7 +524,15 @@ class AIService:
         fields_to_fill: List[FieldDefinition],
         mapped_options: Dict[str, List[Any]] = None,
         use_raw_image_urls: bool = True,
+        require_ai: bool = False,
     ) -> Dict[str, Any]:
+        """Aspects and description, together.
+
+        require_ai (background generation) turns every silent fallback into an
+        AIGenerationError: a failed or unconfigured model call raises instead of
+        returning {} or None, so the job is retried rather than a listing stored with no
+        AI content. Every other caller keeps the forgiving behaviour.
+        """
         if mapped_options is None:
             mapped_options = {}
 
@@ -537,6 +567,7 @@ class AIService:
                     image_urls,
                     mapped_options,
                     use_raw_image_urls,
+                    require_ai=require_ai,
                 )
             )
         else:
@@ -551,12 +582,19 @@ class AIService:
                     str(product_name),
                     str(product_type),
                     use_raw_image_urls,
+                    require_ai=require_ai,
                 )
             )
         else:
             tasks.append(asyncio.sleep(0, result=None))
 
-        results = await asyncio.gather(*tasks)
+        # With require_ai, let both calls finish before raising the first failure, so the
+        # other call is never left running unobserved.
+        results = await asyncio.gather(*tasks, return_exceptions=require_ai)
+        if require_ai:
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
 
         ai_aspects = results[0] if len(results) > 0 else {}
         ai_description = results[1] if len(results) > 1 else None

@@ -38,9 +38,20 @@ logger = logging.getLogger(__name__)
 # value refresh in batch_value_service. A second copy of this predicate anywhere is a bug
 # waiting to happen: what counts as pending work has to mean the same thing to the table,
 # the strip, the arrows and the job that re-prices it.
+#
+# pv expands each open batch's product_values once and joins it per listing. Reading
+# b.product_values -> l.product_id row by row decompresses the whole jsonb every time, and a
+# batch holding 2,000 products carries ~180 KB of it: thousands of decompressions per page.
 PENDING_ROWS = """
 FROM listings l
 JOIN batches b ON b.id = l.batch_id
+LEFT JOIN (
+  SELECT vb.id AS batch_id, pe.key AS product_id, pe.value AS v
+    FROM batches vb,
+         jsonb_each(CASE WHEN jsonb_typeof(vb.product_values) = 'object'
+                         THEN vb.product_values ELSE '{}'::jsonb END) pe
+   WHERE vb.status = ANY($1::text[])
+) pv ON pv.batch_id = l.batch_id AND pv.product_id = l.product_id
 WHERE NOT l.submitted
   AND b.status = ANY($1::text[])
 """
@@ -72,11 +83,11 @@ SELECT
   -- jsonb_typeof guard rather than a bare ::numeric cast. A product missing from
   -- product_values, or holding anything non-numeric, has to become NULL and sort
   -- last; a cast would raise and take the whole page down with it.
-  CASE WHEN jsonb_typeof(b.product_values -> l.product_id -> 'value') = 'number'
-       THEN (b.product_values -> l.product_id ->> 'value')::numeric END AS value,
-  (b.product_values -> l.product_id ->> 'qty')::int      AS qty,
-  (b.product_values -> l.product_id ->> 'children')::int AS children,
-  (b.product_values -> l.product_id ->> 'priced')::int   AS priced
+  CASE WHEN jsonb_typeof(pv.v -> 'value') = 'number'
+       THEN (pv.v ->> 'value')::numeric END AS value,
+  (pv.v ->> 'qty')::int      AS qty,
+  (pv.v ->> 'children')::int AS children,
+  (pv.v ->> 'priced')::int   AS priced
 {PENDING_ROWS}"""
 
 # The single source of truth for order. The page query and the rank window both read
@@ -387,14 +398,26 @@ FROM queue
 # two predicates that agree today.
 # ---------------------------------------------------------------------------
 
+# Parents still generating (an outstanding batch_generation_jobs row, no listing yet) are
+# pending work too. Without them a generating batch's value entries would be pruned as "no
+# longer on the batch" by merge_product_values and never come back.
 REFRESH_TARGETS = f"""
-SELECT l.batch_id,
-       b.value_computed_at,
-       array_agg(DISTINCT l.product_id) AS parents
-{PENDING_ROWS}
-  AND l.product_id IS NOT NULL
-GROUP BY l.batch_id, b.value_computed_at
-ORDER BY l.batch_id
+SELECT t.batch_id,
+       t.value_computed_at,
+       array_agg(DISTINCT t.parent) AS parents
+FROM (
+  SELECT l.batch_id, b.value_computed_at, l.product_id AS parent
+  {PENDING_ROWS}
+    AND l.product_id IS NOT NULL
+  UNION ALL
+  SELECT j.batch_id, b.value_computed_at, j.product_id AS parent
+  FROM batch_generation_jobs j
+  JOIN batches b ON b.id = j.batch_id
+  WHERE j.status <> 'done'
+    AND b.status = ANY($1::text[])
+) t
+GROUP BY t.batch_id, t.value_computed_at
+ORDER BY t.batch_id
 """
 
 
@@ -429,10 +452,20 @@ async def get_all_parents(batch_ids: List[int]) -> Dict[int, List[str]]:
     if not batch_ids:
         return {}
     conn = connections.get("default")
+    # A product still generating belongs to its batch too: its value entry must survive the
+    # refresh, or the batch's value shrinks for good while its listings are being made.
     rows = await conn.execute_query_dict(
-        "SELECT batch_id, array_agg(DISTINCT product_id) AS parents "
-        "FROM listings WHERE batch_id = ANY($1::int[]) AND product_id IS NOT NULL "
-        "GROUP BY batch_id",
+        """
+        SELECT batch_id, array_agg(DISTINCT product_id) AS parents
+        FROM (
+            SELECT batch_id, product_id FROM listings
+             WHERE batch_id = ANY($1::int[]) AND product_id IS NOT NULL
+            UNION ALL
+            SELECT batch_id, product_id FROM batch_generation_jobs
+             WHERE batch_id = ANY($1::int[]) AND status <> 'done'
+        ) t
+        GROUP BY batch_id
+        """,
         [list(batch_ids)],
     )
     return {row["batch_id"]: list(row["parents"] or []) for row in rows}

@@ -371,11 +371,21 @@ async def update_listing(
 
 
 @router.delete("")
-async def delete_listing(listing_id: str = Query(..., description="Listing ID")):
-    success = await ListingService.delete_listing(listing_id)
-    if not success:
+async def delete_listing(
+    listing_id: str = Query(..., description="Listing ID"),
+    delete_batch_if_empty: bool = Query(
+        False,
+        description="Also delete the listing's batch when nothing is left in it: no listings "
+        "and no products still generating. Decided server-side, inside the delete",
+    ),
+):
+    if delete_batch_if_empty:
+        deleted, batch_deleted = await ListingService.delete_listing_and_empty_batch(listing_id)
+    else:
+        deleted, batch_deleted = await ListingService.delete_listing(listing_id), False
+    if not deleted:
         raise HTTPException(status_code=404, detail="Listing not found")
-    return {"message": "Listing deleted successfully"}
+    return {"message": "Listing deleted successfully", "batch_deleted": batch_deleted}
 
 
 @router.get("/ai_search")
@@ -1742,13 +1752,23 @@ async def get_batches(
 
 
 @router.get("/batches/next_open", response_model=NextOpenBatchResponse)
-async def get_next_open_batch(batch_id: int = Query(..., description="Current batch ID")):
+async def get_next_open_batch(
+    batch_id: int = Query(..., description="Current batch ID"),
+    include_listings: bool = Query(
+        True,
+        description="Carry every listing, as before. The batch view built for background "
+        "generation passes false and reads products from /listings/batch/products",
+    ),
+):
     """Batch to move to when the current one is done. Null batch means none is left.
 
-    Returns the listings too, so the batch view can switch straight into it. Same
+    With include_listings (the default, for batch views still open from before background
+    generation) it returns the listings too, so the view can switch straight into it. Same
     user-data enrichment as /listings/batch/detail, since it is the same payload.
     """
-    batch, wrapped = await BatchService.get_next_open_batch(batch_id)
+    batch, wrapped = await BatchService.get_next_open_batch(
+        batch_id, include_listings=include_listings
+    )
     if not batch:
         return NextOpenBatchResponse(batch=None, wrapped=False)
 

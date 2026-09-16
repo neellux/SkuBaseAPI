@@ -1,12 +1,15 @@
+import hashlib
+import json
 import logging
 import asyncio
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from fastapi import HTTPException
-from tortoise import transactions
-from tortoise.expressions import Q, Subquery
+from tortoise import connections, transactions
+from tortoise.expressions import F, Q, Subquery
 from tortoise.functions import Count
-from models.db_models import Batch, Listing, AppSettings
+from models.db_models import Batch, BatchGenerationJob, Listing, AppSettings
 from exceptions.batch_exceptions import BatchCreationError
 from models.api_models import (
     CreateBatchRequest,
@@ -67,7 +70,120 @@ def split_flagged_priority(priority: Optional[List[str]]) -> tuple[List[str], bo
 # timeout PhotoManagementNew now allows with room to spare, while 23 (the
 # largest batch in the last 60 days) would not leave much. Batches are median 6,
 # so most run inline and only the unusually large ones wait for the poller.
+#
+# Legacy inline path only. Background generation always queues the search.
 INLINE_AI_SEARCH_MAX = 12
+
+# Background generation (docs/plans/2026-09-15-feat-catalog-browser-background-batch-generation-plan.md):
+# creating a batch writes one batch_generation_jobs row per product and returns at once, and
+# GenerationPoller generates the listings. False keeps the legacy inline path for explicit
+# product_id requests (the rollback lever); catalog creation refuses while it is off.
+BACKGROUND = bool(config.get("batch_generation", {}).get("background", False))
+
+# The one definition of a batch's products for the batch view: every listing on the batch
+# plus every product still generating. Order is stable while generation runs: products sort
+# by their job's claim order (value first), and listings with no job (legacy batches, or a
+# listing moved in by hand) come after, oldest first. A product finishing changes its state,
+# never its position.
+#
+# One round trip: the batch row and every product row come back together as jsonb.
+BATCH_PRODUCTS_SQL = """
+SELECT to_jsonb(b) - 'product_values' AS batch,
+       CASE WHEN $2::boolean THEN b.product_values END AS product_values,
+       (
+SELECT COALESCE(
+           jsonb_agg(
+               jsonb_build_object(
+                   'product_id', p.product_id,
+                   'listing_id', p.listing_id,
+                   'state', p.state,
+                   'submitted', p.submitted,
+                   'flagged', p.flagged,
+                   'flag_note', p.flag_note,
+                   'flagged_at', p.flagged_at,
+                   'job_id', p.job_id,
+                   'error_display', p.error_display
+               )
+               ORDER BY (p.sort_id IS NULL), p.sort_value DESC NULLS LAST, p.sort_id,
+                        p.created_at, p.listing_id
+           ),
+           '[]'::jsonb
+       )
+FROM (
+    SELECT l.product_id,
+           l.id AS listing_id,
+           CASE WHEN l.submitted THEN 'submitted' ELSE 'ready' END AS state,
+           l.submitted,
+           l.flagged,
+           l.flag_note,
+           l.flagged_at,
+           j.id AS job_id,
+           NULL::text AS error_display,
+           j.sort_value,
+           j.id AS sort_id,
+           l.created_at
+      FROM listings l
+      LEFT JOIN batch_generation_jobs j ON j.listing_id = l.id AND j.batch_id = l.batch_id
+     WHERE l.batch_id = $1
+    UNION ALL
+    SELECT j.product_id,
+           NULL::uuid,
+           CASE WHEN j.status = 'failed' THEN 'failed' ELSE 'loading' END,
+           false,
+           false,
+           NULL::text,
+           NULL::timestamptz,
+           j.id,
+           CASE WHEN j.status = 'failed' THEN j.error_display END,
+           j.sort_value,
+           j.id,
+           NULL::timestamptz
+      FROM batch_generation_jobs j
+     WHERE j.batch_id = $1 AND j.status <> 'done'
+) p
+       ) AS products
+  FROM batches b
+ WHERE b.id = $1
+"""
+
+# Post-commit work (the value snapshot) runs as tracked tasks, so a create returns without
+# waiting on SellerCloud. Held here so a task is not garbage collected mid-flight.
+_background_tasks: set = set()
+
+
+def schedule_background(coro, name: str) -> None:
+    task = asyncio.get_running_loop().create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error(f"Background task {name} failed", exc_info=t.exception())
+
+    task.add_done_callback(_done)
+
+
+@dataclass(frozen=True)
+class NewBatchSpec:
+    comment: str
+    assigned_to: Optional[str]
+    priority: str
+    created_by: str
+    photography_batch_id: Optional[int] = None
+
+
+def ordered_parents(requested: List[str], parents: Dict[str, str]) -> Dict[str, str]:
+    """Parent SKU -> the first requested SKU that resolved to it, in request order.
+
+    Two child SKUs of one parent used to create two listings for it. A batch holds one
+    product per parent, keyed the way listings.product_id is.
+    """
+    out: Dict[str, str] = {}
+    for sku in requested:
+        parent = parents.get(sku)
+        if parent and parent not in out:
+            out[parent] = sku
+    return out
 
 
 def _sorts_after(order_by: tuple[str, ...], row: Batch) -> Q:
@@ -91,6 +207,29 @@ def _sorts_after(order_by: tuple[str, ...], row: Batch) -> Q:
     return Q(*clauses, join_type=Q.OR)
 
 
+def _unresolved_error(e: SkuResolutionError, total: int) -> BatchCreationError:
+    logger.error(
+        "Batch creation rejected: %d of %d products are not registered in the "
+        "products database",
+        len(e.unresolved),
+        total,
+        extra={"unresolved_skus": e.unresolved},
+    )
+    return BatchCreationError(
+        f"{len(e.unresolved)} of {total} products not found: "
+        + ", ".join(e.unresolved[:5])
+        + (f" (+{len(e.unresolved) - 5} more)" if len(e.unresolved) > 5 else ""),
+        [
+            {
+                "product_id": sku,
+                "error_type": "ProductNotFound",
+                "error_message": f"Product {sku} not found",
+            }
+            for sku in e.unresolved
+        ],
+    )
+
+
 class BatchService:
 
     @staticmethod
@@ -109,6 +248,132 @@ class BatchService:
                 detail=f"Batch size ({len(request.product_ids)}) exceeds maximum allowed ({max_batches})",
             )
 
+        if BACKGROUND:
+            return await BatchService._create_batch_background(request, created_by)
+        return await BatchService._create_batch_inline(request, created_by)
+
+    # ------------------------------------------------------------------
+    # Background creation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _create_batch_background(
+        request: CreateBatchRequest, created_by: str
+    ) -> BatchResponse:
+        """Create the batch and one generation job per product, and return.
+
+        No SellerCloud or model call runs here, so the photography service's POST returns in
+        well under a second instead of minutes, and one bad product can no longer roll back
+        the whole batch after its AI spend: it becomes one failed job instead.
+        """
+        if request.photography_batch_id is not None:
+            existing = await BatchService._existing_photography_batch(request.photography_batch_id)
+            if existing:
+                return await BatchService._to_response(existing, include_listings=False)
+
+        # Unknown SKUs still reject the whole request, so photography retries it.
+        try:
+            resolved = await resolve_parents_strict(request.product_ids)
+        except SkuResolutionError as e:
+            raise _unresolved_error(e, len(request.product_ids)) from e
+
+        parents = ordered_parents(request.product_ids, resolved)
+        spec = NewBatchSpec(
+            comment=request.comment or "",
+            assigned_to=request.assigned_to,
+            priority=request.priority,
+            created_by=created_by,
+            photography_batch_id=request.photography_batch_id,
+        )
+
+        async with transactions.in_transaction("default") as conn:
+            if request.photography_batch_id is not None:
+                # Check-then-insert under a lock keyed on the photography batch: two retries
+                # of one photography request can no longer create two batches and pay twice.
+                await conn.execute_query(
+                    "SELECT pg_advisory_xact_lock(hashtext('photography_batch'), $1)",
+                    [int(request.photography_batch_id)],
+                )
+                existing = await BatchService._existing_photography_batch(
+                    request.photography_batch_id, using_db=conn
+                )
+                if existing:
+                    return await BatchService._to_response(existing, include_listings=False)
+
+            batch = await BatchService.insert_batch_with_jobs(conn, spec, parents)
+
+        await BatchService.after_create(batch, list(parents))
+        logger.info(
+            f"Batch {batch.id} created with {len(parents)} product(s) queued for generation"
+        )
+        # Re-read: the job insert's trigger set total_listings and the generation counters.
+        batch = await Batch.get(id=batch.id)
+        return await BatchService._to_response(batch, include_listings=False)
+
+    @staticmethod
+    async def _existing_photography_batch(photography_batch_id: int, using_db=None) -> Optional[Batch]:
+        existing = (
+            await Batch.filter(photography_batch_id=photography_batch_id)
+            .using_db(using_db)
+            .order_by("created_at")
+            .first()
+        )
+        if existing:
+            logger.info(
+                f"Idempotent create_batch: photography_batch_id={photography_batch_id} "
+                f"already mapped to batch_id={existing.id}; returning existing batch"
+            )
+        return existing
+
+    @staticmethod
+    async def insert_batch_with_jobs(conn, spec: NewBatchSpec, parents: Dict[str, str]) -> Batch:
+        """Insert a batch and its generation jobs. Requires the caller's open transaction and
+        has no side effects outside it; the caller runs after_create once it commits.
+
+        `parents` maps parent SKU to the SKU as requested, in request order.
+        """
+        from services import generation_queue
+
+        batch = await Batch.create(
+            using_db=conn,
+            comment=spec.comment,
+            assigned_to=spec.assigned_to,
+            priority=spec.priority,
+            created_by=spec.created_by,
+            # recount_batch sets the real number when the jobs land, in the same transaction.
+            total_listings=0,
+            photography_batch_id=spec.photography_batch_id,
+        )
+        await generation_queue.insert_jobs(
+            conn, batch.id, list(parents), list(parents.values()), spec.created_by
+        )
+        return batch
+
+    @staticmethod
+    async def after_create(batch: Batch, parent_skus: List[str]) -> None:
+        """Post-commit work for a new background batch. Never raises."""
+        try:
+            schedule_background(
+                BatchService._snapshot_value(batch, sorted(set(parent_skus))),
+                name=f"batch-{batch.id}-value-snapshot",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"Batch {batch.id}: could not schedule its value snapshot")
+        try:
+            # Deferred, like _enqueue_verification's poller import: the poller imports
+            # modules that import this one.
+            from services.generation_poller import generation_poller
+
+            generation_poller.kick()
+        except Exception:  # noqa: BLE001
+            logger.exception(f"Batch {batch.id}: could not kick the generation poller")
+
+    # ------------------------------------------------------------------
+    # Legacy inline creation ([batch_generation] background = false)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _create_batch_inline(request: CreateBatchRequest, created_by: str) -> BatchResponse:
         if request.photography_batch_id is not None:
             existing = (
                 await Batch.filter(photography_batch_id=request.photography_batch_id)
@@ -131,26 +396,7 @@ class BatchService:
         try:
             parents = await resolve_parents_strict(request.product_ids)
         except SkuResolutionError as e:
-            logger.error(
-                "Batch creation rejected: %d of %d products are not registered in the "
-                "products database",
-                len(e.unresolved),
-                len(request.product_ids),
-                extra={"unresolved_skus": e.unresolved},
-            )
-            raise BatchCreationError(
-                f"{len(e.unresolved)} of {len(request.product_ids)} products not found: "
-                + ", ".join(e.unresolved[:5])
-                + (f" (+{len(e.unresolved) - 5} more)" if len(e.unresolved) > 5 else ""),
-                [
-                    {
-                        "product_id": sku,
-                        "error_type": "ProductNotFound",
-                        "error_message": f"Product {sku} not found",
-                    }
-                    for sku in e.unresolved
-                ],
-            ) from e
+            raise _unresolved_error(e, len(request.product_ids)) from e
 
         # Small batches get their AI search inline, alongside the aspects call,
         # so the suggestions are already there when the operator opens the first
@@ -284,7 +530,9 @@ class BatchService:
                     raise BatchCreationError(error_msg, product_failures)
 
                 batch.total_listings = len(successful_listings)
-                await batch.save()
+                # update_fields: the trigger owns the other counters, and a bare save()
+                # would write this instance's stale generation counters back.
+                await batch.save(update_fields=["total_listings", "updated_at"])
 
                 logger.info(
                     f"Batch {batch.id} created successfully with {len(successful_listings)} listings"
@@ -293,6 +541,7 @@ class BatchService:
             await BatchService._snapshot_value(batch, sorted(set(parents.values())))
             await BatchService._enqueue_verification(successful_listings)
 
+            batch = await Batch.get(id=batch.id)
             return await BatchService._to_response(batch, include_listings=True)
 
         except BatchCreationError:
@@ -314,7 +563,8 @@ class BatchService:
         service posts to /api/create_batch with no pre-validation, so a SellerCloud outage
         must not roll back a batch that is otherwise complete - it leaves
         value_computed_at NULL, which is exactly what backfill_batch_values.py picks up on
-        its next run.
+        its next run. Background creation runs it as a tracked task, so the request does
+        not wait for it at all.
 
         Saves with update_fields because update_batch_counts() rewrites total_listings,
         submitted_listings and status on this row as each listing is inserted. A bare
@@ -330,9 +580,17 @@ class BatchService:
             )
             return
 
+        computed_at = datetime.now(timezone.utc)
+        from services.batch_value_service import value_source
+
+        if value_source() == "table":
+            # When the numbers were priced, not when the batch was made.
+            from services.product_value_service import latest_as_of
+
+            computed_at = await latest_as_of() or computed_at
         batch.total_value = total
         batch.product_values = breakdown
-        batch.value_computed_at = datetime.now(timezone.utc)
+        batch.value_computed_at = computed_at
         await batch.save(
             update_fields=["total_value", "product_values", "value_computed_at"]
         )
@@ -357,6 +615,9 @@ class BatchService:
         skips AI) is enqueued too. The queue's SQL decides what actually runs:
         an already-verified draft is skipped, an unverified or failed one is
         picked up, which makes every batch a free backfill for what it touches.
+
+        Legacy inline path only: background generation enqueues each listing inside the
+        transaction that inserts it (batch_generation_service.run_job).
         """
         if not listings:
             return
@@ -400,6 +661,94 @@ class BatchService:
         except Exception as e:
             logger.error(f"Error fetching batch {batch_id}: {e}")
             raise
+
+    @staticmethod
+    async def get_batch_products(
+        batch_id: int,
+        if_version: Optional[str] = None,
+        include_values: bool = False,
+    ) -> Optional[dict]:
+        """The batch header and one slim row per product: listings plus products still
+        generating. What the batch view polls while generation runs.
+
+        No listing data travels here; ListingView loads its own detail. `version` hashes
+        everything that can change what the view shows, so a poll that matches it gets
+        {"unchanged": true} back and re-renders nothing. product_values is left out unless
+        include_values, because at 2,000 products it is ~150 KB per poll.
+        """
+        def as_json(value):
+            # asyncpg hands jsonb back as text.
+            return json.loads(value) if isinstance(value, str) else value
+
+        # One round trip: the batch row and every product row arrive together as jsonb.
+        rows = await connections.get("default").execute_query_dict(
+            BATCH_PRODUCTS_SQL, [batch_id, include_values]
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        batch_row = as_json(row["batch"]) or {}
+        products = [
+            {
+                "product_id": p["product_id"],
+                "listing_id": p["listing_id"],
+                "state": p["state"],
+                "submitted": bool(p["submitted"]),
+                "flagged": bool(p["flagged"]),
+                "flag_note": p["flag_note"],
+                "flagged_at": p["flagged_at"],
+                "job_id": p["job_id"],
+                "error_display": p["error_display"],
+            }
+            for p in as_json(row["products"]) or []
+        ]
+
+        from services.generation_poller import generation_poller
+
+        # Every listing on the batch is in the rows already, so no separate count query.
+        flagged = sum(1 for product in products if product["flagged"])
+        total = int(batch_row.get("total_listings") or 0)
+        submitted = int(batch_row.get("submitted_listings") or 0)
+        header = {
+            "id": batch_row["id"],
+            "comment": batch_row.get("comment"),
+            "assigned_to": batch_row.get("assigned_to"),
+            "priority": batch_row["priority"],
+            "status": batch_row["status"],
+            "created_by": batch_row.get("created_by"),
+            "total_listings": total,
+            "submitted_listings": submitted,
+            "generation_outstanding": int(batch_row.get("generation_outstanding") or 0),
+            "generation_failed": int(batch_row.get("generation_failed") or 0),
+            "photography_batch_id": batch_row.get("photography_batch_id"),
+            "progress_percentage": (submitted / total) * 100 if total else 0.0,
+            "total_value": batch_row.get("total_value") or 0,
+            "value_computed_at": batch_row.get("value_computed_at"),
+            "flagged_listings": flagged,
+            "created_at": batch_row.get("created_at"),
+            "updated_at": batch_row.get("updated_at"),
+        }
+        generation = generation_poller.status()
+        version = hashlib.sha1(
+            json.dumps(
+                {"batch": header, "products": products, "generation": generation},
+                sort_keys=True,
+                default=str,
+            ).encode()
+        ).hexdigest()[:16]
+
+        if if_version and if_version == version:
+            return {"unchanged": True, "version": version}
+
+        if include_values:
+            header["product_values"] = as_json(row["product_values"]) or {}
+        return {
+            "unchanged": False,
+            "version": version,
+            "batch": header,
+            "products": products,
+            "generation": generation,
+        }
 
     @staticmethod
     async def get_all_batches(
@@ -456,16 +805,28 @@ class BatchService:
                 # the exact-match path rather than the case-insensitive fallback. A miss
                 # is normal here (partial input, a typo), so fall back to the substring
                 # match and keep search forgiving.
+                #
+                # A product still generating has no listing yet, so its outstanding job
+                # matches too.
                 resolved = await resolve_parents([raw_search])
                 if raw_search in resolved:
                     matching_batch_ids = Listing.filter(
                         product_id__iexact=resolved[raw_search]
                     ).values("batch_id")
+                    generating_batch_ids = BatchGenerationJob.filter(
+                        product_id__iexact=resolved[raw_search], status__not="done"
+                    ).values("batch_id")
                 else:
                     matching_batch_ids = Listing.filter(
                         product_id__icontains=raw_search.upper()
                     ).values("batch_id")
-                query = query.filter(id__in=Subquery(matching_batch_ids))
+                    generating_batch_ids = BatchGenerationJob.filter(
+                        product_id__icontains=raw_search.upper(), status__not="done"
+                    ).values("batch_id")
+                query = query.filter(
+                    Q(id__in=Subquery(matching_batch_ids))
+                    | Q(id__in=Subquery(generating_batch_ids))
+                )
 
             total = await query.count()
 
@@ -493,7 +854,9 @@ class BatchService:
             raise
 
     @staticmethod
-    async def get_next_open_batch(batch_id: int) -> tuple[Optional[BatchResponse], bool]:
+    async def get_next_open_batch(
+        batch_id: int, include_listings: bool = True
+    ) -> tuple[Optional[BatchResponse], bool]:
         """Next open batch after `batch_id`, in the same order the batch list uses.
 
         That order is BATCH_SORTS[DEFAULT_BATCH_SORT] - currently total_value DESC,
@@ -506,6 +869,11 @@ class BatchService:
         created_at/id tail is what stops the walk from sticking or looping inside
         a tie.
 
+        Only batches with something ready to work: at least one generated, unsubmitted
+        listing. A batch still generating can lead the value order while nothing in it is
+        workable, and one whose products all failed or were removed has nothing to open.
+        Both stay visible in the batch list.
+
         The batch view opens in a new tab (BatchList hands the id to window.open)
         and carries no sort state, so it cannot mirror a per-user sort choice -
         it follows the default.
@@ -515,17 +883,20 @@ class BatchService:
         open batch. Returns (batch, wrapped); a null batch means none is
         left, while an unknown batch_id raises 404.
 
-        Carries the listings, i.e. the same payload as GET /listings/batch/detail,
-        so the batch view can render the next batch the moment the arrow is used
-        instead of showing a spinner while it fetches what the caller already
-        asked for.
+        include_listings carries the listings, i.e. the same payload as GET
+        /listings/batch/detail. The batch view built for background generation asks for the
+        header only and reads its products from /listings/batch/products.
         """
         current = await Batch.get_or_none(id=batch_id)
         if not current:
             raise HTTPException(status_code=404, detail="Batch not found")
 
         try:
-            open_batches = Batch.filter(status__in=OPEN_BATCH_STATUSES).exclude(id=batch_id)
+            open_batches = (
+                Batch.filter(status__in=OPEN_BATCH_STATUSES)
+                .filter(total_listings__gt=F("submitted_listings") + F("generation_outstanding"))
+                .exclude(id=batch_id)
+            )
             order_by = BATCH_SORTS[DEFAULT_BATCH_SORT]
 
             next_batch = (
@@ -543,7 +914,7 @@ class BatchService:
                 return None, False
 
             return (
-                await BatchService._to_response(next_batch, include_listings=True),
+                await BatchService._to_response(next_batch, include_listings=include_listings),
                 wrapped,
             )
 
@@ -580,12 +951,24 @@ class BatchService:
 
     @staticmethod
     async def delete_batch(batch_id: int) -> bool:
-        try:
-            batch = await Batch.get_or_none(id=batch_id)
-            if not batch:
-                return False
+        """Delete a batch and its generation jobs in one transaction.
 
-            await batch.delete()
+        Jobs go first, under the claim lock, so the lock order is job then batch: the same
+        order a completing attempt takes (its job row, then the batch through the listing
+        insert). A running attempt loses its lease and rolls back instead of inserting a
+        listing into a batch that no longer exists.
+        """
+        from services import generation_queue
+
+        try:
+            async with transactions.in_transaction("default") as conn:
+                batch = await Batch.get_or_none(id=batch_id, using_db=conn)
+                if not batch:
+                    return False
+
+                await generation_queue.delete_jobs_for_batch(conn, batch_id)
+                await batch.delete(using_db=conn)
+
             logger.info(f"Deleted batch {batch_id}")
             return True
 
@@ -635,6 +1018,9 @@ class BatchService:
             created_by=batch.created_by,
             total_listings=batch.total_listings,
             submitted_listings=batch.submitted_listings,
+            generation_outstanding=batch.generation_outstanding,
+            generation_failed=batch.generation_failed,
+            photography_batch_id=batch.photography_batch_id,
             progress_percentage=batch.progress_percentage,
             total_value=batch.total_value,
             value_computed_at=batch.value_computed_at,
@@ -673,6 +1059,8 @@ class BatchService:
             status=batch.status,
             total_listings=batch.total_listings,
             submitted_listings=batch.submitted_listings,
+            generation_outstanding=batch.generation_outstanding,
+            generation_failed=batch.generation_failed,
             flagged_listings=flagged_listings,
             progress_percentage=batch.progress_percentage,
             total_value=batch.total_value,

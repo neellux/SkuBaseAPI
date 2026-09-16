@@ -241,6 +241,41 @@ async def _fetch_grid_rows(
     return out, unfetched, chunks, quarantined
 
 
+def value_source() -> str:
+    """Where batch values read prices: "grid" (the SellerCloud Kind 13 grid) or "table"
+    (parent_product_values, written by the 04:30 sync). Read per call, so a test or a config
+    change sees the current setting."""
+    return str(config.get("batch_value", {}).get("source", "grid")).strip().lower()
+
+
+async def _compute_from_table(
+    parent_sets: Dict[Any, List[str]], parents: List[str]
+) -> Valuation:
+    """compute_values_for_sets against parent_product_values instead of the grid.
+
+    A parent with no row, a stale row, or a partially exported one lands in `dropped` and
+    keeps its previous batch entry, exactly like a parent in a quarantined grid chunk. The
+    merge, freeze and suspicious-zero rules downstream are unchanged.
+    """
+    from services.product_value_service import read_parent_values
+
+    entries, dropped_parents = await read_parent_values(parents)
+    dropped_set = set(dropped_parents)
+    values: Dict[Any, Tuple[Decimal, Dict[str, Dict[str, Any]]]] = {}
+    dropped: Dict[Any, List[str]] = {}
+    for key, skus in parent_sets.items():
+        scoped = {p: entries[p] for p in skus if p and p in entries}
+        total = sum((_to_decimal(entry.get("value")) for entry in scoped.values()), Decimal(0))
+        values[key] = (
+            total.quantize(_CENTS, rounding=ROUND_HALF_UP),
+            {sku: scoped[sku] for sku in sorted(scoped)},
+        )
+        skipped = sorted({p for p in skus if p and p in dropped_set})
+        if skipped:
+            dropped[key] = skipped
+    return Valuation(values=values, dropped=dropped, requested=len(parents), returned=len(entries))
+
+
 async def compute_values_for_sets(
     parent_sets: Dict[Any, List[str]],
     chunk_size: int = GRID_CHUNK,
@@ -259,6 +294,9 @@ async def compute_values_for_sets(
     parents = sorted({p for skus in parent_sets.values() for p in skus if p})
     if not parents:
         return Valuation(values={key: (Decimal(0), {}) for key in parent_sets})
+
+    if value_source() == "table":
+        return await _compute_from_table(parent_sets, parents)
 
     children_by_parent = await _active_children_by_parent(parents)
     all_children = [sku for skus in children_by_parent.values() for sku in skus]
@@ -318,6 +356,16 @@ async def compute_product_values(
     would look exactly like a batch of worthless stock.
     """
     valuation = await compute_values_for_sets({None: list(parent_skus)})
+    if value_source() == "table":
+        # From the table, a batch is valued from whichever parents have trustworthy values;
+        # the rest simply have no entry yet (a product created today is unvalued until the
+        # next export). Only a table with nothing usable for this batch is a failure.
+        if valuation.dropped.get(None) and not valuation.values[None][1]:
+            raise GridReadFailure(
+                f"parent_product_values has no trustworthy value for any of "
+                f"{len(valuation.dropped[None])} product(s)"
+            )
+        return valuation.values[None]
     if valuation.dropped.get(None):
         raise GridReadFailure(
             f"{len(valuation.dropped[None])} product(s) had no trustworthy grid data: "
@@ -556,6 +604,11 @@ class BatchValueRefreshPoller:
         valuation = await compute_values_for_sets(parent_sets)
 
         now = datetime.now(timezone.utc)
+        if value_source() == "table":
+            # When the numbers were priced, not when this refresh ran.
+            from services.product_value_service import latest_as_of
+
+            now = await latest_as_of() or now
         # values(), not model instances: nothing here should be in a position to call
         # save() on a batch row the update_batch_counts() trigger owns.
         current = {
@@ -630,18 +683,37 @@ class BatchValueRefreshPoller:
                 if dry_run:
                     continue
                 # Guarded on status too: a batch that completed while this cycle was
-                # talking to SellerCloud should keep the value it finished with.
-                written = await Batch.filter(
-                    id=batch_id, status__in=OPEN_BATCH_STATUSES
-                ).update(
-                    total_value=total, product_values=merged, value_computed_at=now
+                # talking to SellerCloud should keep the value it finished with. And on
+                # product_values still being what this cycle read: a Remove
+                # (generation_queue.remove_job) that dropped an entry meanwhile must not be
+                # undone by writing the merged copy back over it. That batch is simply left
+                # for tomorrow.
+                import json
+
+                written = await connections.get("default").execute_query_dict(
+                    """
+                    UPDATE batches
+                       SET total_value = $2, product_values = $3::jsonb, value_computed_at = $4
+                     WHERE id = $1
+                       AND status = ANY($5::text[])
+                       AND product_values = $6::jsonb
+                    RETURNING id
+                    """,
+                    [
+                        batch_id,
+                        total,
+                        json.dumps(merged, default=float),
+                        now,
+                        list(OPEN_BATCH_STATUSES),
+                        json.dumps(existing, default=float),
+                    ],
                 )
                 if written:
                     updated += 1
                 else:
                     skipped += 1
                     logger.debug(
-                        f"{self.name}: batch {batch_id} closed mid-cycle, left alone"
+                        f"{self.name}: batch {batch_id} closed or changed mid-cycle, left alone"
                     )
             except Exception:  # noqa: BLE001
                 failed += 1

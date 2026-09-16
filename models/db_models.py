@@ -167,6 +167,19 @@ class Batch(Model):
         description="When the value was last computed; null means never computed",
     )
 
+    # Maintained only by recount_batch() from batch_generation_jobs (see
+    # migrations/add_batch_generation_jobs.sql), alongside total_listings, which now counts
+    # these outstanding products too. Read them; never write them, and never save a Batch
+    # without update_fields, or a stale in-memory copy lands over the trigger's numbers.
+    generation_outstanding = fields.IntField(
+        default=0,
+        description="Products queued, generating, or failed to generate; counted in total_listings",
+    )
+    generation_failed = fields.IntField(
+        default=0,
+        description="Products whose generation failed and needs Retry or Remove",
+    )
+
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 
@@ -186,6 +199,43 @@ class Batch(Model):
     @property
     def is_completed(self) -> bool:
         return self.total_listings > 0 and self.submitted_listings == self.total_listings
+
+
+class BatchGenerationJob(Model):
+    """One product of a batch waiting to be generated in the background.
+
+    Written only by raw SQL in services/generation_queue.py: claims and completions need row
+    locks and a lease check that Tortoise cannot express, and every write feeds the
+    recount_batch() statement triggers. This model exists for read-side queries, such as the
+    batch list's product search. Never create or save rows through it.
+    """
+
+    id = fields.BigIntField(pk=True)
+    batch = fields.ForeignKeyField(
+        "models.Batch", related_name="generation_jobs", on_delete=fields.CASCADE
+    )
+    product_id = fields.CharField(max_length=200, description="Parent SKU")
+    info_product_id = fields.CharField(max_length=255, null=True)
+    sort_value = fields.DecimalField(max_digits=20, decimal_places=2, null=True)
+    status = fields.CharField(max_length=20, default="pending")
+    attempts = fields.IntField(default=0)
+    interruptions = fields.IntField(default=0)
+    lease_token = fields.UUIDField(null=True)
+    next_attempt_at = fields.DatetimeField()
+    error = fields.TextField(null=True)
+    error_display = fields.TextField(null=True)
+    listing = fields.ForeignKeyField(
+        "models.Listing", related_name=False, null=True, on_delete=fields.SET_NULL
+    )
+    outcome = fields.CharField(max_length=20, null=True)
+    created_by = fields.CharField(max_length=100)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    started_at = fields.DatetimeField(null=True)
+    completed_at = fields.DatetimeField(null=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+    class Meta:
+        table = "batch_generation_jobs"
 
 
 class Listing(Model):

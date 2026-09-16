@@ -10,6 +10,8 @@ from middleware.CORSMiddleware import CORSMiddleware
 from middleware.ExceptionHandlerMiddleware import ExceptionHandlerMiddleware
 from routes.api_routes import router as api_router
 from routes.image_routes import router as image_router
+from routes.batch_generation_routes import router as batch_generation_router
+from routes.catalog_routes import router as catalog_router
 from routes.listing_routes import router as listing_router
 from routes.product_routes import router as product_router
 from routes.settings_routes import router as settings_router
@@ -35,6 +37,8 @@ from services.daily_image_import_poller import daily_image_import_poller
 from services.sellercloud_sync_poller import sellercloud_sync_poller
 from services.gallery_image_sync_poller import gallery_image_sync_poller
 from services.ai_search_poller import ai_search_poller
+from services.generation_poller import generation_poller
+from services.catalog_sync_poller import catalog_sync_poller
 from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.batch_value_service import batch_value_refresh_poller
 from services.ebay_poller import ebay_poller
@@ -96,7 +100,10 @@ app.add_middleware(
 
 
 app.include_router(template_router)
+# Registered before listing_router, which shares the /listings prefix.
+app.include_router(batch_generation_router)
 app.include_router(listing_router)
+app.include_router(catalog_router)
 app.include_router(settings_router)
 app.include_router(submissions_router)
 # Authenticated app only, never api_app: /api is excluded from AuthMiddleware.
@@ -158,6 +165,15 @@ async def startup_event():
     await sellercloud_sync_poller.start()
     await gallery_image_sync_poller.start()
     await ai_search_poller.start()
+    from services.batch_service import BACKGROUND as BATCH_GENERATION_BACKGROUND
+
+    logger.info(
+        f"Batch generation: background={BATCH_GENERATION_BACKGROUND}, "
+        f"generation poller enabled={generation_poller.enabled}, "
+        f"max_running_total={generation_poller.max_running_total}"
+    )
+    await generation_poller.start()
+    await catalog_sync_poller.start()
     await alias_bulk_import_poller.start()
     await photo_upload_poller.start()
     await secondary_inventory_transfer_poller.start()
@@ -182,6 +198,8 @@ async def shutdown_event():
     await secondary_inventory_transfer_poller.stop()
     await photo_upload_poller.stop()
     await alias_bulk_import_poller.stop()
+    await catalog_sync_poller.stop()
+    await generation_poller.stop()
     await ai_search_poller.stop()
     await gallery_image_sync_poller.stop()
     await sellercloud_sync_poller.stop()

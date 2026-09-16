@@ -15,6 +15,11 @@ from models.api_models import (
     UpdateListingRequest,
 )
 from models.db_models import AppSettings, Listing, Template
+from exceptions.batch_generation_exceptions import (
+    NOT_IN_SELLERCLOUD,
+    AIGenerationError,
+    PermanentGenerationError,
+)
 from services.ebay_aspect_service import ebay_aspect_service
 from services.ebay_service import EbayService
 from services.ai_service import AIService
@@ -25,6 +30,7 @@ from services.template_render import render_template, resolve_field_template
 from services.template_service import TemplateService
 import orjson
 from tortoise import connections
+from tortoise.transactions import in_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +50,24 @@ class AiAspectField:
     options: Optional[List[Any]] = None
     multiselect: bool = False
     ai_tagging: bool = True
+
+
+@dataclass(frozen=True)
+class ListingFields:
+    """A built, not yet inserted, listing: build_listing_fields' output and persist_listing's
+    input. `verification` is the inline AI search result, when one ran."""
+
+    product_id: str
+    company_code: Optional[int]
+    info_product_id: Optional[str]
+    assigned_to: Optional[str]
+    data: Dict[str, Any]
+    ai_response: Optional[Dict[str, Any]]
+    ai_description: Optional[str]
+    original_description: Optional[str]
+    original_title: Optional[str]
+    upload_status: str
+    verification: Optional[Dict[str, Any]] = None
 
 
 class ListingService:
@@ -416,21 +440,25 @@ class ListingService:
             return None
 
     @staticmethod
-    async def create_listing(
+    async def build_listing_fields(
         request: CreateListingRequest,
-        created_by: str,
         sellercloud_template: Optional[TemplateResponse] = None,
         mapped_options: Optional[Dict[str, List[Any]]] = None,
         ai_search_inline: bool = False,
-    ) -> ListingResponse:
-        """Create one listing, prefilled from SellerCloud and filled in by AI.
+        *,
+        require_ai: bool = False,
+    ) -> "ListingFields":
+        """Everything create_listing does before the insert: prefill, AI, title, company.
 
-        ai_search_inline runs the AI web/tag search alongside the aspects call
-        rather than queueing it for the poller, so the suggestions are already on
-        the listing when the operator opens it. It roughly triples how long this
-        takes (~5s to ~18s), which is why the caller decides: single-listing
-        creation always does it, and a batch only when it is small enough to
-        finish inside the caller's timeout. See BatchService.INLINE_AI_SEARCH_MAX.
+        Writes nothing to the database, so background generation can run it outside any
+        transaction and insert with persist_listing inside a short one.
+
+        require_ai=True is for background generation, which must retry rather than store a
+        listing with no AI content: a failed or unconfigured model call raises
+        AIGenerationError instead of leaving ai_response empty, a missing default template
+        raises too, and a product SellerCloud does not know fails permanently instead of
+        becoming a blank listing. Every other caller keeps require_ai=False and gets the
+        behaviour create_listing always had.
         """
         try:
             ai_response_data = None
@@ -444,6 +472,8 @@ class ListingService:
                 sellercloud_template = await TemplateService.get_template_by_id("default")
 
             if not sellercloud_template:
+                if require_ai:
+                    raise AIGenerationError("default template not found")
                 logger.warning(
                     "default template not found, creating listing with provided data only"
                 )
@@ -454,6 +484,13 @@ class ListingService:
                 )
 
                 if not product_data:
+                    if require_ai:
+                        # The forgiving path makes a blank listing here. A background job
+                        # fails instead, the verdict the batch confirm step already gives.
+                        raise PermanentGenerationError(
+                            NOT_IN_SELLERCLOUD,
+                            detail=f"SellerCloud returned no product for {request.product_id}",
+                        )
                     logger.warning(
                         f"Product {request.product_id} not found in SellerCloud, using provided data only"
                     )
@@ -569,7 +606,10 @@ class ListingService:
                         # pair costs max(3.4s, ~18s) instead of their sum.
                         ai_content, verification = await asyncio.gather(
                             AIService.generate_ai_content(
-                                product_data, fields_for_ai, mapped_options
+                                product_data,
+                                fields_for_ai,
+                                mapped_options,
+                                require_ai=require_ai,
                             ),
                             ListingService._run_ai_search_inline(
                                 request, prefilled_data, ai_search_inline
@@ -664,36 +704,99 @@ class ListingService:
                 )
                 company_code = None
 
-            listing = await Listing.create(
+            return ListingFields(
                 product_id=request.product_id,
                 company_code=company_code,
                 info_product_id=request.info_product_id,
                 assigned_to=request.assigned_to,
                 data=prefilled_data,
-                # The creation-time baseline: what prefill and AI handed the
-                # operator, before any edit. Write-once, so nothing else in the
-                # codebase may assign it. A separate dict so the two can never
-                # alias. Not on ListingResponse: read it from the database.
-                original_data=dict(prefilled_data),
                 ai_response=ai_response_data,
                 ai_description=ai_description,
                 original_description=original_description,
                 original_title=original_title,
                 upload_status=upload_status,
-                created_by=created_by,
+                verification=verification,
             )
 
-            if verification:
-                # A targeted UPDATE rather than a column on the model: everywhere
-                # else this value is written by the poller minutes later, and a
-                # bare listing.save() from a stale instance must never be able to
-                # put an old copy back. Inside the same transaction, so a
-                # rolled-back batch takes its verifications with it.
-                await connections.get("default").execute_query(
-                    "UPDATE listings SET ai_search = $2::jsonb WHERE id = $1",
-                    [str(listing.id), orjson.dumps(verification).decode()],
-                )
+        except Exception as e:
+            logger.error(f"Error building listing for {request.product_id}: {e}")
+            raise
 
+    @staticmethod
+    async def persist_listing(
+        fields: "ListingFields",
+        *,
+        created_by: str,
+        batch_id: Optional[int] = None,
+        assigned_to: Optional[str] = None,
+        using_db=None,
+    ) -> Listing:
+        """Insert a listing built by build_listing_fields.
+
+        No external calls, so background generation runs it inside a short transaction
+        (using_db) together with completing its job. batch_id is set on the insert itself,
+        so the listing is counted into its batch by the same statement that creates it.
+        """
+        listing = await Listing.create(
+            using_db=using_db,
+            product_id=fields.product_id,
+            company_code=fields.company_code,
+            info_product_id=fields.info_product_id,
+            assigned_to=assigned_to if assigned_to is not None else fields.assigned_to,
+            data=fields.data,
+            # The creation-time baseline: what prefill and AI handed the
+            # operator, before any edit. Write-once, so nothing else in the
+            # codebase may assign it. A separate dict so the two can never
+            # alias. Not on ListingResponse: read it from the database.
+            original_data=dict(fields.data),
+            ai_response=fields.ai_response,
+            ai_description=fields.ai_description,
+            original_description=fields.original_description,
+            original_title=fields.original_title,
+            upload_status=fields.upload_status,
+            created_by=created_by,
+            batch_id=batch_id,
+        )
+
+        if fields.verification:
+            # A targeted UPDATE rather than a column on the model: everywhere
+            # else this value is written by the poller minutes later, and a
+            # bare listing.save() from a stale instance must never be able to
+            # put an old copy back. On the caller's connection, so a rolled-back
+            # transaction takes its verification with it.
+            conn = using_db or connections.get("default")
+            await conn.execute_query(
+                "UPDATE listings SET ai_search = $2::jsonb WHERE id = $1",
+                [str(listing.id), orjson.dumps(fields.verification).decode()],
+            )
+
+        return listing
+
+    @staticmethod
+    async def create_listing(
+        request: CreateListingRequest,
+        created_by: str,
+        sellercloud_template: Optional[TemplateResponse] = None,
+        mapped_options: Optional[Dict[str, List[Any]]] = None,
+        ai_search_inline: bool = False,
+    ) -> ListingResponse:
+        """Create one listing, prefilled from SellerCloud and filled in by AI.
+
+        ai_search_inline runs the AI web/tag search alongside the aspects call
+        rather than queueing it for the poller, so the suggestions are already on
+        the listing when the operator opens it. It roughly triples how long this
+        takes (~5s to ~18s), which is why the caller decides: single-listing
+        creation always does it, and a batch only when it is small enough to
+        finish inside the caller's timeout. See BatchService.INLINE_AI_SEARCH_MAX.
+        """
+        try:
+            fields = await ListingService.build_listing_fields(
+                request,
+                sellercloud_template=sellercloud_template,
+                mapped_options=mapped_options,
+                ai_search_inline=ai_search_inline,
+            )
+            listing = await ListingService.persist_listing(fields, created_by=created_by)
             return await ListingService._to_response(listing)
 
         except Exception as e:
@@ -796,6 +899,44 @@ class ListingService:
         except Exception as e:
             logger.error(f"Error deleting listing {listing_id}: {e}")
             raise
+
+    @staticmethod
+    async def delete_listing_and_empty_batch(listing_id: str) -> tuple[bool, bool]:
+        """Delete a listing, and its batch too when nothing is left in it.
+
+        Returns (listing deleted, batch deleted). "Nothing left" means no listings and no
+        products still generating, decided inside the delete's transaction from the
+        database, never from a count the browser last saw: deleting the only generated
+        listing of a batch with 299 products still generating must leave the batch alone.
+        """
+        from services import generation_queue
+
+        async with in_transaction("default") as conn:
+            listing = await Listing.get_or_none(id=listing_id, using_db=conn)
+            if not listing:
+                return False, False
+            batch_id = listing.batch_id
+            await listing.delete(using_db=conn)
+            logger.info(f"Deleted listing {listing_id}")
+            if batch_id is None:
+                return True, False
+
+            rows = await conn.execute_query_dict(
+                """
+                SELECT (SELECT count(*) FROM listings WHERE batch_id = $1) AS listings,
+                       (SELECT count(*) FROM batch_generation_jobs
+                         WHERE batch_id = $1 AND status <> 'done') AS outstanding
+                """,
+                [batch_id],
+            )
+            if rows[0]["listings"] or rows[0]["outstanding"]:
+                return True, False
+
+            await generation_queue.delete_jobs_for_batch(conn, batch_id)
+            await conn.execute_query("DELETE FROM batches WHERE id = $1", [batch_id])
+
+        logger.info(f"Deleted batch {batch_id}: its last listing was deleted")
+        return True, True
 
     @staticmethod
     async def get_draft_listing_by_product_id(product_id: str) -> Optional[Listing]:

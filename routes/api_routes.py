@@ -4,7 +4,7 @@ import secrets
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
 from tortoise import Tortoise
-from config import API_KEY
+from config import API_KEY, config
 from models.api_models import BatchResponse, CreateBatchRequest
 from services.batch_service import BatchService
 from services.product_service import ProductService
@@ -25,7 +25,24 @@ async def require_api_key(x_api_key: str = Header(None, alias="X-API-KEY")):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
-@router.post("/create_batch", response_model=BatchResponse, include_in_schema=False)
+async def require_api_key_for_create_batch(x_api_key: str = Header(None, alias="X-API-KEY")):
+    """require_api_key, once [api] require_key_for_create_batch is on.
+
+    Behind a flag so PhotoManagementNew can start sending X-API-KEY first and SkuBase can
+    start requiring it after, in either deploy order. It must be on before background
+    generation is: a create that returns in milliseconds, with no key, is a cheap way to
+    start unbounded AI spend.
+    """
+    if config.get("api", {}).get("require_key_for_create_batch", False):
+        await require_api_key(x_api_key)
+
+
+@router.post(
+    "/create_batch",
+    response_model=BatchResponse,
+    include_in_schema=False,
+    dependencies=[Depends(require_api_key_for_create_batch)],
+)
 async def create_batch_public(request_data: CreateBatchRequest):
     created_by = "system"
 
@@ -53,7 +70,8 @@ async def create_batch_public(request_data: CreateBatchRequest):
         raise
     except Exception as e:
         logger.error(f"Unexpected error creating batch: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to create batch: {str(e)}")
+        # Static: this route sits outside AuthMiddleware, so internals stay in the log.
+        raise HTTPException(status_code=500, detail="Failed to create batch")
 
 
 async def _attach_class_names(rows):

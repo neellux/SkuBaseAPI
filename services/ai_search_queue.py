@@ -52,7 +52,9 @@ async def enqueue(
     return rows[0]["id"]
 
 
-async def enqueue_for_listings(pairs: List[tuple], reason: str = "batch_create") -> int:
+async def enqueue_for_listings(
+    pairs: List[tuple], reason: str = "batch_create", conn=None
+) -> int:
     """Queue newly created listings in one statement.
 
     The WHERE clause settles the existing-draft relink path without a branch in
@@ -61,12 +63,15 @@ async def enqueue_for_listings(pairs: List[tuple], reason: str = "batch_create")
     $0.021 and ~25s to almost certainly say the same thing), and a draft that was
     never verified or whose last run failed is picked up -- which makes every
     batch a free backfill for the listings it touches.
+
+    `conn` runs the insert inside the caller's transaction. Background generation
+    passes it so a listing never becomes visible without its AI search job.
     """
     if not pairs:
         return 0
     listing_ids = [str(p[0]) for p in pairs]
     product_ids = [str(p[1]) for p in pairs]
-    rows = await _conn().execute_query_dict(
+    rows = await (conn or _conn()).execute_query_dict(
         """
         INSERT INTO listing_ai_search_jobs (listing_id, product_id, reason)
         SELECT t.lid, t.pid, $3

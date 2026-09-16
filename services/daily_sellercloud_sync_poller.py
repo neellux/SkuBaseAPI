@@ -75,6 +75,9 @@ class DailySellercloudSyncPoller:
 
         # Execution gate + safety caps
         self.execute: bool = bool(cfg.get("execute", False))
+        # false = values only: the custom export and write_parent_values, with no alias
+        # export and no reconcile. TEST runs this way.
+        self.reconcile_enabled: bool = bool(cfg.get("reconcile_enabled", True))
         self.max_actions_per_cycle: int = int(cfg.get("max_actions_per_cycle", 500))
         self.max_deletes_per_cycle: int = int(cfg.get("max_deletes_per_cycle", 50))
         self.max_pct_of_total_aliases_changed: float = float(
@@ -167,13 +170,28 @@ class DailySellercloudSyncPoller:
 
             all_skus = sorted(db_state.keys())
 
-            # 2. SC alias state (batched ExportStandardInfo)
+            # 2. One ExportCustomInfo job: primary UPCs for reconcile, and qty and SitePrice
+            #    for the daily parent values. First, so an alias export failure or a deadline
+            #    trip later in the cycle cannot skip the value refresh.
+            export = await self._fetch_sc_custom_export(all_skus, deadline)
+            sc_primaries = export.upcs
+            logger.info(
+                f"{self.name}: custom export returned {export.returned} SKUs, "
+                f"{len(sc_primaries)} with a primary UPC"
+            )
+            await self._write_values(export, len(all_skus))
+
+            if not self.reconcile_enabled:
+                logger.info(f"{self.name}: reconcile_enabled=false; values only this cycle")
+                return {
+                    "cycle_id": cycle_id,
+                    "values_only": True,
+                    "elapsed_seconds": round(time.perf_counter() - cycle_started, 2),
+                }
+
+            # 3. SC alias state (batched ExportStandardInfo)
             sc_aliases = await self._fetch_sc_aliases(all_skus, deadline)
             logger.info(f"{self.name}: SC aliases pulled for {len(sc_aliases)} SKUs")
-
-            # 3. SC primary UPC state (one ExportCustomInfo job)
-            sc_primaries = await self._fetch_sc_primaries(all_skus, deadline)
-            logger.info(f"{self.name}: SC primary UPCs pulled for {len(sc_primaries)} SKUs")
 
             sc_state = build_sc_state(sc_aliases, sc_primaries)
 
@@ -319,17 +337,23 @@ class DailySellercloudSyncPoller:
             if sku and alias:
                 into.setdefault(sku, set()).add(alias)
 
-    async def _fetch_sc_primaries(
-        self, skus: list[str], deadline: float
-    ) -> dict[str, str]:
-        """Run ExportCustomInfo with all SKUs in one queued job, parse UPC column."""
+    async def _fetch_sc_custom_export(self, skus: list[str], deadline: float):
+        """Run ExportCustomInfo with all SKUs in one queued job.
+
+        One export serves two consumers: the UPC column feeds reconcile, and
+        AggregatePhysicalQty and SitePrice feed the daily parent values
+        (product_value_service), so valuing the whole catalog costs no second export.
+        Parsed by header name, off the event loop.
+        """
+        from services.product_value_service import EXPORT_FIELD_NAMES
+
         await sellercloud_internal_service._ensure_authenticated()
         client = await sellercloud_internal_service._get_client()
         base_url = sellercloud_internal_service.base_url
 
         payload = {
-            "FieldNames": ["ProductID", "UPC"],
-            "DisplayNames": ["", ""],
+            "FieldNames": list(EXPORT_FIELD_NAMES),
+            "DisplayNames": [""] * len(EXPORT_FIELD_NAMES),
             "FileFormat": "0",
             "SortBy": "",
             "ProductIds": skus,
@@ -355,29 +379,28 @@ class DailySellercloudSyncPoller:
         file_id = await self._resolve_job_output_file(client, base_url, job_id)
         pretty = f"{job_id}.txt"
         tsv_bytes = await self._download_file(file_id, pretty)
-        return self._parse_upc_tsv(tsv_bytes)
 
-    def _parse_upc_tsv(self, tsv_bytes: bytes) -> dict[str, str]:
-        # Note: SellerCloud's saved column preference may add ProductName as
-        # column 2. Detect column count and pick the last column as UPC.
-        text = tsv_bytes.decode("utf-8", "replace")
-        lines = text.splitlines()
-        if not lines:
-            return {}
-        header = lines[0].split("\t")
+        from services.product_value_service import parse_custom_export_tsv
+
+        # ~160k rows, so parsed off the event loop. By header name only, with no positional
+        # fallback: SellerCloud inserts ProductName unasked, and with the value columns
+        # appended the old last-column fallback would read prices as UPCs.
+        return await asyncio.to_thread(parse_custom_export_tsv, tsv_bytes)
+
+    async def _write_values(self, export, requested: int) -> None:
+        """Store the daily parent values from this cycle's export.
+
+        Never raises into reconcile, and runs before it, so a reconcile or alias failure
+        later in the cycle cannot skip or undo the value write.
+        """
+        from services.product_value_service import ExportRejected, write_parent_values
+
         try:
-            upc_idx = header.index("UPC")
-        except ValueError:
-            upc_idx = len(header) - 1
-        out: dict[str, str] = {}
-        for line in lines[1:]:
-            parts = line.split("\t")
-            if len(parts) <= upc_idx:
-                continue
-            sku, upc = parts[0].strip(), parts[upc_idx].strip()
-            if sku and upc:
-                out[sku] = upc
-        return out
+            await write_parent_values(export, requested, datetime.now(timezone.utc))
+        except ExportRejected:
+            pass  # logged at ERROR by write_parent_values; the previous values stay
+        except Exception:  # noqa: BLE001
+            logger.exception(f"{self.name}: writing parent values failed; the previous values stay")
 
     async def _poll_job(
         self, client: httpx.AsyncClient, base_url: str, job_id: str, deadline: float

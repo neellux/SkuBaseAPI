@@ -207,20 +207,27 @@ def load_sc_aliases(path: str | Path) -> dict[str, set[str]]:
 
 
 def load_sc_upcs(path: str | Path) -> dict[str, str]:
-    """Read ExportCustomInfo TSV (header: ProductID\\tProductName\\tUPC).
+    """Read an ExportCustomInfo TSV and return {sku: primary_upc}, skipping empty UPCs.
 
-    Returns {sku: primary_upc}. Skips rows with empty UPC.
+    Columns are found by header name. SellerCloud inserts ProductName unasked, and the daily
+    export now carries AggregatePhysicalQty and SitePrice as well, so a positional read would
+    pick the wrong column.
     """
     by_sku: dict[str, str] = {}
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
         reader = csv.reader(f, delimiter="\t")
-        header = next(reader, None)
-        if header is None:
+        header = [name.strip() for name in next(reader, [])]
+        if not header:
             return {}
+        if "ProductID" not in header or "UPC" not in header:
+            raise ValueError(
+                f"ExportCustomInfo TSV needs ProductID and UPC columns; header was {header}"
+            )
+        sku_i, upc_i = header.index("ProductID"), header.index("UPC")
         for row in reader:
-            if len(row) < 3:
+            if len(row) <= max(sku_i, upc_i):
                 continue
-            sku, _name, upc = row[0].strip(), row[1], row[2].strip()
+            sku, upc = row[sku_i].strip(), row[upc_i].strip()
             if sku and upc:
                 by_sku[sku] = upc
     return by_sku

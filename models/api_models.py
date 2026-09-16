@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, validator, model_validator
-from typing import List, Optional, Union, Literal, Dict, Any
+from pydantic import BaseModel, Field, StringConstraints, validator, model_validator
+from typing import Annotated, List, Optional, Union, Literal, Dict, Any
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
@@ -494,8 +494,21 @@ class BatchResponse(BaseModel):
     status: Literal["new", "in_progress", "completed"] = Field(..., description="Batch status")
     created_by: str = Field(..., description="Creator user ID")
     created_by_name: Optional[str] = Field(None, description="Name of creator user")
-    total_listings: int = Field(..., description="Total number of listings in batch")
+    total_listings: int = Field(
+        ...,
+        description="Products in the batch: listings plus products still generating",
+    )
     submitted_listings: int = Field(..., description="Number of submitted listings")
+    # Required, never defaulted: a call site that forgot them must fail loudly rather than
+    # report 0, which would make a generating batch look handed off.
+    generation_outstanding: int = Field(
+        ...,
+        description="Products queued, generating or failed to generate. Counted in "
+        "total_listings, so the batch cannot complete while this is above 0",
+    )
+    generation_failed: int = Field(
+        ..., description="Products whose generation failed and needs Retry or Remove"
+    )
     photography_batch_id: Optional[int] = Field(None, description="Reference to photography batch")
     progress_percentage: float = Field(..., description="Completion percentage")
     total_value: Decimal = Field(
@@ -530,8 +543,18 @@ class BatchListResponse(BaseModel):
     assigned_to_name: Optional[str] = Field(None, description="Name of assigned user")
     priority: str = Field(..., description="Batch priority")
     status: Literal["new", "in_progress", "completed"] = Field(..., description="Batch status")
-    total_listings: int = Field(..., description="Total number of listings in batch")
+    total_listings: int = Field(
+        ...,
+        description="Products in the batch: listings plus products still generating",
+    )
     submitted_listings: int = Field(..., description="Number of submitted listings")
+    generation_outstanding: int = Field(
+        ...,
+        description="Products queued, generating or failed to generate; counted in total_listings",
+    )
+    generation_failed: int = Field(
+        ..., description="Products whose generation failed and needs Retry or Remove"
+    )
     photography_batch_id: Optional[int] = Field(None, description="Reference to photography batch")
     progress_percentage: float = Field(..., description="Completion percentage")
     total_value: Decimal = Field(
@@ -657,6 +680,190 @@ class QueueSummaryResponse(BaseModel):
         description="Products valued at exactly 0. Never summed with unvalued: the two "
         "have different causes and different fixes",
     )
+
+
+class BatchProductRow(BaseModel):
+    """One product of a batch for the batch view: a listing, or a product still generating."""
+
+    product_id: str = Field(..., description="Parent SKU; the row's identity in the batch view")
+    listing_id: Optional[str] = Field(None, description="Null until the listing is generated")
+    state: Literal["ready", "submitted", "loading", "failed"] = Field(
+        ..., description="ready/submitted: a listing exists; loading: queued or generating"
+    )
+    submitted: bool = Field(False, description="Whether the listing is submitted")
+    flagged: bool = Field(False, description="Whether the listing is flagged")
+    flag_note: Optional[str] = Field(None, description="Why the listing is flagged")
+    flagged_at: Optional[datetime] = Field(None, description="When the flag was last set")
+    job_id: Optional[int] = Field(None, description="The generation job, for Retry and Remove")
+    error_display: Optional[str] = Field(
+        None, description="Why generation failed; one of a fixed set of messages"
+    )
+
+
+class GenerationStatusResponse(BaseModel):
+    enabled: bool = Field(..., description="False while generation is switched off")
+    paused_until: Optional[datetime] = Field(
+        None, description="Claims are paused until then (rate limit or provider outage)"
+    )
+    pause_reason: Optional[str] = Field(None, description="Why generation is paused")
+
+
+class BatchHeaderResponse(BaseModel):
+    """BatchListResponse without product_values, which is only sent when asked for."""
+
+    id: int
+    comment: Optional[str] = None
+    assigned_to: Optional[str] = None
+    assigned_to_name: Optional[str] = None
+    priority: str
+    status: Literal["new", "in_progress", "completed"]
+    created_by: Optional[str] = None
+    created_by_name: Optional[str] = None
+    total_listings: int
+    submitted_listings: int
+    generation_outstanding: int
+    generation_failed: int
+    photography_batch_id: Optional[int] = None
+    progress_percentage: float
+    total_value: Decimal = Decimal(0)
+    value_computed_at: Optional[datetime] = None
+    product_values: Optional[Dict[str, Any]] = None
+    flagged_listings: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class BatchProductsResponse(BaseModel):
+    unchanged: bool = Field(
+        False, description="True when if_version matched; nothing else is sent"
+    )
+    version: str = Field(..., description="Pass back as if_version on the next poll")
+    batch: Optional[BatchHeaderResponse] = None
+    products: Optional[List[BatchProductRow]] = None
+    generation: Optional[GenerationStatusResponse] = None
+
+
+class GenerationRetryResponse(BaseModel):
+    requeued: int = Field(..., description="Failed products put back in the queue")
+
+
+class GenerationRemoveResponse(BaseModel):
+    removed: bool
+    batch_id: Optional[int] = None
+    product_id: Optional[str] = None
+
+
+class CatalogFilters(BaseModel):
+    """The catalog browser's filters. Every value is bound as a SQL parameter or looked up in
+    a fixed dictionary by catalog_service, never interpolated into SQL."""
+
+    search: Optional[str] = Field(None, max_length=100, description="SKU, child SKU, MPN or title")
+    coverage_platform: List[Annotated[str, StringConstraints(min_length=1, max_length=50)]] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Platforms to filter coverage on; every one must be in a chosen state",
+    )
+    coverage_state: List[Literal["listed", "in_progress", "failed", "none", "excluded"]] = Field(
+        default_factory=list, max_length=5
+    )
+    value_min: Optional[float] = Field(None, ge=0, allow_inf_nan=False)
+    value_max: Optional[float] = Field(None, ge=0, allow_inf_nan=False)
+    in_stock: bool = False
+    unvalued: bool = False
+    listing_state: Optional[Literal["never_listed", "in_open_batch", "not_in_open_batch"]] = None
+    listing_status: Optional[Literal["images_pending", "platforms_pending", "listed"]] = Field(
+        None,
+        description=(
+            "images_pending: submitted everywhere it had to be, waiting on photography. "
+            "platforms_pending: some eligible platform is not listed. "
+            "listed: every eligible platform is listed"
+        ),
+    )
+    has_images: Optional[bool] = Field(None, description="Photography has images for the parent")
+    sort: Literal["value_desc", "newest", "sku"] = "value_desc"
+
+
+class IdsSelection(BaseModel):
+    mode: Literal["ids"]
+    product_ids: List[Annotated[str, StringConstraints(min_length=1, max_length=200)]] = Field(
+        ..., min_length=1, max_length=50000
+    )
+
+
+class FilterSelection(BaseModel):
+    mode: Literal["filter"]
+    filters: CatalogFilters
+
+
+class CatalogBatchCreateRequest(BaseModel):
+    selection: Annotated[Union[IdsSelection, FilterSelection], Field(discriminator="mode")]
+    expected_count: Optional[int] = Field(
+        None, ge=0, description="The eligible count the operator saw; drift is reported back"
+    )
+    comment: Optional[str] = Field(None, max_length=2000)
+    assigned_to: Optional[str] = None
+    priority: Literal["low", "medium", "high"] = "medium"
+
+
+class CatalogValue(BaseModel):
+    value: Decimal
+    qty: int
+    children: int
+    priced: int
+    exported: int
+    as_of: datetime
+
+
+class CatalogRow(BaseModel):
+    sku: str
+    title: str
+    mpn: Optional[str] = None
+    brand: Optional[str] = None
+    product_type: Optional[str] = None
+    company_code: Optional[int] = None
+    value: Optional[CatalogValue] = Field(None, description="Null when the product is unvalued")
+    coverage: Dict[str, Literal["listed", "in_progress", "failed", "none", "excluded"]] = Field(
+        default_factory=dict,
+        description="Per enabled platform. Listed means has been listed; excluded wins over the rest",
+    )
+    exclusions: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Why each excluded platform is excluded: brand, product type and/or company",
+    )
+    open_batch_id: Optional[int] = None
+    open_kind: Optional[Literal["listing", "generating"]] = None
+    has_listing: bool = False
+    has_images: bool = Field(False, description="Photography has a productimages row for it")
+    images_taken_at: Optional[datetime] = Field(
+        None, description="When its newest productimages row was created"
+    )
+    blocked_reason: Optional[Literal["in_open_batch", "no_images"]] = None
+
+
+class CatalogSkipped(BaseModel):
+    in_open_batch: int = 0
+    no_images: int = 0
+    not_in_catalog: int = 0
+
+
+class CatalogSummaryResponse(BaseModel):
+    count: int
+    eligible_count: int
+    skipped: CatalogSkipped
+    total_value: Decimal = Field(..., description="Sum of values, each negative value counting as 0")
+    negative_value: int = Field(0, description="Products valued below 0 (negative stock in SellerCloud)")
+    unvalued: int
+    values_as_of: Optional[datetime] = None
+    catalog_synced_at: Optional[datetime] = None
+    platforms: List[str]
+    can_create: bool = Field(..., description="False while background generation is off")
+
+
+class CatalogBatchCreateResponse(BaseModel):
+    batch: BatchResponse
+    eligible: int
+    skipped: CatalogSkipped
+    newly_skipped: int = 0
 
 
 class BatchFilterOptionsResponse(BaseModel):
