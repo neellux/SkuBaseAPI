@@ -39,6 +39,9 @@ from services.gallery_image_sync_poller import gallery_image_sync_poller
 from services.ai_search_poller import ai_search_poller
 from services.generation_poller import generation_poller
 from services.catalog_sync_poller import catalog_sync_poller
+# Module, not an object: the cache is module-level state with start/stop, like
+# WarehouseManagement's product_cache.
+from services import catalog_product_cache
 from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.batch_value_service import batch_value_refresh_poller
 from services.ebay_poller import ebay_poller
@@ -173,6 +176,14 @@ async def startup_event():
         f"max_running_total={generation_poller.max_running_total}"
     )
     await generation_poller.start()
+    # The catalog reads its product fields from here, not from a mirror table. A failure to
+    # load must not stop the API: every other page works without it, and the catalog answers
+    # 503 until the first load lands.
+    logger.info("Starting catalog_product_cache...")
+    try:
+        await catalog_product_cache.start()
+    except Exception:
+        logger.exception("catalog_product_cache failed to start (continuing)")
     await catalog_sync_poller.start()
     await alias_bulk_import_poller.start()
     await photo_upload_poller.start()
@@ -199,6 +210,7 @@ async def shutdown_event():
     await photo_upload_poller.stop()
     await alias_bulk_import_poller.stop()
     await catalog_sync_poller.stop()
+    await catalog_product_cache.stop()
     await generation_poller.stop()
     await ai_search_poller.stop()
     await gallery_image_sync_poller.stop()
