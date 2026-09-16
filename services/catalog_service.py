@@ -253,7 +253,11 @@ def require_snapshot() -> Snapshot:
 
 
 def match_skus(
-    snap: Snapshot, exact: Optional[str], like: Optional[str], sort: str
+    snap: Snapshot,
+    exact: Optional[str],
+    like: Optional[str],
+    sort: str,
+    companies: Optional[Set[int]] = None,
 ) -> List[str]:
     """The SKUs a search matches, in the order the sort wants them bound.
 
@@ -265,13 +269,34 @@ def match_skus(
     and scanning 42k strings in Python has no such cliff.
     """
     order = snap.order_newest if sort == "newest" else snap.order_sku
+    by_sku = snap.by_sku
+
     if exact:
-        return [exact] if exact in snap.by_sku else []
-    if like:
+        skus = [exact] if exact in by_sku else []
+    elif like:
         term = like.upper()
-        by_sku = snap.by_sku
-        return [sku for sku in order if term in by_sku[sku].haystack]
-    return list(order)
+        skus = [sku for sku in order if term in by_sku[sku].haystack]
+    else:
+        skus = list(order)
+
+    # A product belongs to exactly one company, so several picked companies mean "any of
+    # these". Contrast coverage_platform, where several mean "all of these".
+    if companies:
+        skus = [sku for sku in skus if by_sku[sku].company_code in companies]
+    return skus
+
+
+def catalog_companies(snap: Snapshot) -> List[Dict[str, Any]]:
+    """The companies the catalog holds products for, lowest code first.
+
+    Derived from the cache so the filter's options need no UI change when a company is
+    added, and labelled through ebay_service's existing map rather than a second copy of
+    it. Deferred import: ebay_service is heavy and nothing else here needs it.
+    """
+    from services.ebay_service import company_label
+
+    codes = sorted({p.company_code for p in snap.by_sku.values() if p.company_code is not None})
+    return [{"code": code, "label": company_label(code)} for code in codes]
 
 
 @dataclass(frozen=True)
@@ -746,7 +771,7 @@ async def get_page(filters: CatalogFilters, page: int, page_size: int) -> List[D
     exact, like = await resolve_search(filters.search)
     enabled = await enabled_platforms()
     index = rule_index(await exclusion_rules())
-    skus = match_skus(snap, exact, like, filters.sort)
+    skus = match_skus(snap, exact, like, filters.sort, set(filters.company))
     if not skus:
         return []
 
@@ -821,7 +846,7 @@ async def get_summary(filters: CatalogFilters) -> Dict[str, Any]:
     snap = require_snapshot()
     exact, like = await resolve_search(filters.search)
     index = rule_index(await exclusion_rules())
-    skus = match_skus(snap, exact, like, filters.sort)
+    skus = match_skus(snap, exact, like, filters.sort, set(filters.company))
 
     key = f"{snap.version}:{index.version}:{filters.model_dump_json()}"
     now = time.monotonic()
@@ -842,6 +867,7 @@ async def get_summary(filters: CatalogFilters) -> Dict[str, Any]:
             "values_as_of": None,
             "catalog_synced_at": snap.loaded_at,
             "platforms": await enabled_platforms(),
+            "companies": catalog_companies(snap),
             "can_create": BACKGROUND,
         }
         _summary_cache[key] = (now, summary)
@@ -888,6 +914,7 @@ WHERE {where}
         # What the product side is as of: the cache's last load, not a mirror's last sync.
         "catalog_synced_at": snap.loaded_at,
         "platforms": await enabled_platforms(),
+        "companies": catalog_companies(snap),
         "can_create": BACKGROUND,
     }
     _summary_cache[key] = (now, summary)
@@ -921,7 +948,7 @@ async def _resolve_selection(
         filters = CatalogFilters()
     else:
         filters = selection.filters
-        skus = match_skus(snap, search_exact, search_like, "value_desc")
+        skus = match_skus(snap, search_exact, search_like, "value_desc", set(filters.company))
     if not skus:
         return [], skipped
 

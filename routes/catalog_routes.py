@@ -51,6 +51,10 @@ async def catalog_filters(
         None, description="images_pending, platforms_pending or listed"
     ),
     has_images: Optional[bool] = Query(None, description="Photography has images for the parent"),
+    company: Optional[List[int]] = Query(
+        None,
+        description="SellerCloud company codes (repeat the key for several); a product matches any of them",
+    ),
     sort: str = Query("value_desc", description="value_desc, newest or sku"),
 ) -> CatalogFilters:
     try:
@@ -65,6 +69,7 @@ async def catalog_filters(
             listing_state=listing_state,
             listing_status=listing_status,
             has_images=has_images,
+            company=company or [],
             sort=sort,
         )
     except ValidationError:

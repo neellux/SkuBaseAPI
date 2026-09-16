@@ -753,6 +753,13 @@ class GenerationRemoveResponse(BaseModel):
     product_id: Optional[str] = None
 
 
+class CatalogCompany(BaseModel):
+    """One SellerCloud company the catalog holds products for, with its display name."""
+
+    code: int
+    label: str
+
+
 class CatalogFilters(BaseModel):
     """The catalog browser's filters. Every value is bound as a SQL parameter or looked up in
     a fixed dictionary by catalog_service, never interpolated into SQL."""
@@ -780,6 +787,13 @@ class CatalogFilters(BaseModel):
         ),
     )
     has_images: Optional[bool] = Field(None, description="Photography has images for the parent")
+    # A product belongs to exactly ONE company, so several picked companies mean "any of
+    # these", unlike coverage_platform where several mean "all of these".
+    company: List[int] = Field(
+        default_factory=list,
+        max_length=20,
+        description="SellerCloud company codes; a product matches if it is in any of them",
+    )
     sort: Literal["value_desc", "newest", "sku"] = "value_desc"
 
 
@@ -855,6 +869,9 @@ class CatalogSummaryResponse(BaseModel):
     unvalued: int
     values_as_of: Optional[datetime] = None
     catalog_synced_at: Optional[datetime] = None
+    # The companies present in the catalog, for the filter's options. Derived from the
+    # product cache rather than hard-coded, so a new company needs no UI change.
+    companies: List[CatalogCompany] = Field(default_factory=list)
     platforms: List[str]
     can_create: bool = Field(..., description="False while background generation is off")
 
