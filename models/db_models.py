@@ -311,8 +311,9 @@ class Listing(Model):
     # keeps the four together, so a flag always has its note, who and when, and a clear
     # listing has none of them. See migrations/add_listing_flag.sql.
     #
-    # Written only by ListingService.set_flag and clear_flag, with update_fields. Any bare
-    # listing.save() elsewhere would write a stale flag back over a fresh one.
+    # Updated only by ListingService.set_flag and clear_flag, with update_fields. Any bare
+    # listing.save() elsewhere would write a stale flag back over a fresh one. The copy path's
+    # INSERT (batch_generation_service) carries a source's four values over as one set.
     flagged = fields.BooleanField(
         default=False, description="Whether the listing is flagged to skip in the value queue"
     )
@@ -334,6 +335,18 @@ class Listing(Model):
         null=True,
         on_delete=fields.SET_NULL,
         description="Batch this listing belongs to",
+    )
+
+    # Set only when background generation copied an earlier listing instead of generating
+    # one (batch_generation_service._copy_submitted), and nulled if that source is deleted.
+    # That copy is a raw INSERT ... SELECT with an explicit column list: a column added to
+    # this model must be added to COPY_INSERT_SQL as well, or copies leave it at its default.
+    copied_from = fields.ForeignKeyField(
+        "models.Listing",
+        related_name=False,
+        null=True,
+        on_delete=fields.SET_NULL,
+        description="Listing this one was copied from",
     )
 
     created_at = fields.DatetimeField(auto_now_add=True)

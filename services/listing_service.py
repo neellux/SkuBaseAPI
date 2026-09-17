@@ -52,6 +52,31 @@ class AiAspectField:
     ai_tagging: bool = True
 
 
+def ai_fields_from_rows(
+    rows: List[Dict[str, Any]],
+) -> tuple[List[AiAspectField], Dict[str, List[Any]]]:
+    """The AI fields and value lists for rows of get_ai_aspects_for_category.
+
+    Shared by generation and by the copy path, so both hand the model identical fields. A
+    value list is offered only when the aspect has one; longer lists already came back as
+    None, and the model is asked for free text instead.
+    """
+    fields, options = [], {}
+    for row in rows:
+        values = row["values"] or None
+        fields.append(
+            AiAspectField(
+                name=row["aspect_name"],
+                type=row["field_type"],
+                options=values,
+                multiselect=row["cardinality"] == "MULTI",
+            )
+        )
+        if values:
+            options[row["aspect_name"]] = values
+    return fields, options
+
+
 @dataclass(frozen=True)
 class ListingFields:
     """A built, not yet inserted, listing: build_listing_fields' output and persist_listing's
@@ -134,20 +159,7 @@ class ListingService:
             logger.warning(f"Could not load eBay AI aspects for {product_type!r}: {e}")
             return [], {}
 
-        fields, options = [], {}
-        for row in rows:
-            values = row["values"] or None
-            fields.append(
-                AiAspectField(
-                    name=row["aspect_name"],
-                    type=row["field_type"],
-                    options=values,
-                    multiselect=row["cardinality"] == "MULTI",
-                )
-            )
-            if values:
-                options[row["aspect_name"]] = values
-        return fields, options
+        return ai_fields_from_rows(rows)
 
     @staticmethod
     async def _generate_product_name(data: Dict[str, Any]) -> str:
@@ -746,8 +758,10 @@ class ListingService:
             data=fields.data,
             # The creation-time baseline: what prefill and AI handed the
             # operator, before any edit. Write-once, so nothing else in the
-            # codebase may assign it. A separate dict so the two can never
-            # alias. Not on ListingResponse: read it from the database.
+            # codebase may assign it; the only other insert, the copy path in
+            # batch_generation_service, carries its source's baseline instead.
+            # A separate dict so the two can never alias. Not on
+            # ListingResponse: read it from the database.
             original_data=dict(fields.data),
             ai_response=fields.ai_response,
             ai_description=fields.ai_description,
@@ -1472,8 +1486,9 @@ class ListingService:
             logger.error(f"Error processing product data for template: {e}")
             return user_data
 
-    # The flag's writes. Nothing else writes these columns, and these write nothing else:
-    # see update_listing for why every listing save names its fields.
+    # The flag's writes. Nothing else updates these columns, and these write nothing else:
+    # see update_listing for why every listing save names its fields. The copy path's INSERT
+    # (batch_generation_service) carries a source's four values over as one set.
     FLAG_UPDATE_FIELDS = ["flagged", "flag_note", "flagged_by", "flagged_at", "updated_at"]
     FLAG_NOTE_MAX_LENGTH = 500
 
@@ -1573,6 +1588,8 @@ class ListingService:
             original_description=listing.original_description,
             original_title=listing.original_title,
             title_auto_update=listing.title_auto_update,
+            # A UUID on the model; pydantic will not coerce it into Optional[str].
+            copied_from_id=str(listing.copied_from_id) if listing.copied_from_id else None,
             submitted=listing.submitted,
             submitted_at=listing.submitted_at,
             submitted_by=listing.submitted_by,

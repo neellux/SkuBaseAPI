@@ -340,6 +340,13 @@ class ListingResponse(BaseModel):
             "the next time the listing is opened."
         ),
     )
+    copied_from_id: Optional[str] = Field(
+        None,
+        description=(
+            "The listing this one was copied from, when background generation copied an "
+            "earlier listing instead of generating it"
+        ),
+    )
     # Read by the listing form from /listings/detail and from the flag endpoints only.
     # BatchView caches batch payloads for a whole queue walk, so a flag read from those
     # would go stale.

@@ -710,35 +710,6 @@ async def get_mapping_status(
     }
 
 
-async def _ebay_in_flight_elsewhere(conn: Any, product_id: Optional[str], listing_id: Any) -> bool:
-    """Whether ANOTHER listing for this parent has an eBay attempt still in flight.
-
-    The latest attempt per listing, the same rule this route applies to a listing's own rows,
-    so an old attempt superseded by a later one does not block anything.
-    """
-    if not product_id:
-        return False
-    rows = await conn.execute_query_dict(
-        """
-        SELECT 1
-        FROM listings l
-        JOIN LATERAL (
-            SELECT s.status
-            FROM listing_submissions s
-            WHERE s.listing_id = l.id AND s.platform_id = 'ebay'
-            ORDER BY s.attempt_number DESC
-            LIMIT 1
-        ) latest ON true
-        WHERE l.product_id = $1
-          AND l.id <> $2::uuid
-          AND latest.status IN ('queued', 'pending', 'processing', 'awaiting_action')
-        LIMIT 1
-        """,
-        [product_id, str(listing_id)],
-    )
-    return bool(rows)
-
-
 @router.post("/submit")
 async def submit_listing(
     request: Request,
@@ -1086,6 +1057,13 @@ async def submit_listing(
     submission_records = {}
     try:
         async with in_transaction("default") as conn:
+            # One submit per product at a time. The in-flight check below reads OTHER
+            # listings' rows, so two sibling submits running together would each miss the
+            # other's uncommitted row and both post. Taken first, and no trigger takes it.
+            await conn.execute_query(
+                "SELECT pg_advisory_xact_lock(hashtext('listing_submit'), hashtext($1))",
+                [listing_model.product_id or str(listing_id)],
+            )
             await Listing.select_for_update().using_db(conn).get(id=listing_id)
 
             for platform_id in platforms:
@@ -1115,17 +1093,23 @@ async def submit_listing(
                     logger.info(f"Skipping {platform_id}: already in {latest.status}")
                     continue
 
-                # PARENT level for eBay, on top of this listing's own rows. Two listings for
-                # one parent each pass the check above on their own rows, and the second
-                # batch's export can run before the first batch's publish job has issued item
-                # ids, so both would launch the same children. Four of the Combine file's
-                # ready parents had a second listing on 2026-09-10.
-                if platform_id == "ebay" and await _ebay_in_flight_elsewhere(
-                    conn, listing_model.product_id, listing_model.id
+                # PARENT level, on top of this listing's own rows, for every platform. Two
+                # listings for one parent each pass the check above on their own rows. On
+                # eBay the second batch's export can run before the first batch's publish job
+                # has issued item ids, so both would launch the same children (four of the
+                # Combine file's ready parents had a second listing on 2026-09-10). Background
+                # generation now copies a listing that went out into a new batch, which makes
+                # two listings per parent routine, so the rule covers every platform: nothing
+                # is posted while another listing's attempt there is still in flight. Only
+                # in-flight blocks. A success does not: where the platform keeps presence rows
+                # the external-id gate below already covers it, and blocking on a success
+                # without presence would leave this listing unable to ever complete.
+                if await ExternalListingService.in_flight_elsewhere(
+                    conn, platform_id, listing_model.product_id, listing_model.id
                 ):
                     logger.info(
-                        f"Skipping ebay: another listing for {listing_model.product_id} "
-                        f"is already in flight"
+                        f"Skipping {platform_id}: another listing for "
+                        f"{listing_model.product_id} is already in flight"
                     )
                     continue
 

@@ -169,6 +169,50 @@ class ExternalListingService:
             return set()
         return {r["platform_id"] for r in rows}
 
+    # A latest attempt in one of these is still on its way to the platform.
+    SIBLING_IN_FLIGHT_STATUSES = ("queued", "pending", "processing", "awaiting_action")
+
+    @staticmethod
+    async def in_flight_elsewhere(
+        conn: Any, platform_id: str, product_id: str | None, listing_id: Any
+    ) -> bool:
+        """Whether ANOTHER listing for this parent has an attempt on this platform in flight.
+
+        The latest attempt per listing, the same rule the submit route applies to a
+        listing's own rows, so an old attempt superseded by a later one blocks nothing.
+        Runs on the submit transaction's connection, under its per-product lock.
+
+        In-flight only, never success. Where a platform keeps presence rows, the
+        external-id gate already covers a success; blocking on a success without presence
+        would leave the blocked listing with no row and no presence, unable to complete.
+        """
+        if not product_id:
+            return False
+        rows = await conn.execute_query_dict(
+            """
+            SELECT 1
+            FROM listings l
+            JOIN LATERAL (
+                SELECT s.status
+                FROM listing_submissions s
+                WHERE s.listing_id = l.id AND s.platform_id = $3
+                ORDER BY s.attempt_number DESC
+                LIMIT 1
+            ) latest ON true
+            WHERE l.product_id = $1
+              AND l.id <> $2::uuid
+              AND latest.status = ANY($4::text[])
+            LIMIT 1
+            """,
+            [
+                product_id,
+                str(listing_id),
+                platform_id,
+                list(ExternalListingService.SIBLING_IN_FLIGHT_STATUSES),
+            ],
+        )
+        return bool(rows)
+
     @staticmethod
     async def coverage_for_parent(parent_sku: str | None) -> dict[str, dict[str, Any]]:
         """Per-platform coverage detail for the Listing view.

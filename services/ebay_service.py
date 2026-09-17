@@ -296,6 +296,39 @@ def render_tsv(rows: List[Tuple[str, str, str, str, str]]) -> str:
 class EbayService:
     PLATFORM_ID = "ebay"
 
+    # A value that eBay would receive as nothing. The submit path and the copy path's
+    # "is this aspect filled" test both use it, so the two can never disagree.
+    EMPTY_VALUES = (None, "", [])
+
+    @staticmethod
+    def aspect_value_from_listing(aspect: Dict[str, Any], data: Dict[str, Any]) -> Any:
+        """The value a listing sends for one aspect that no mapping table answers.
+
+        `aspect` is one entry of get_category_aspects(...)["aspects"]. The chain is
+
+            listings.data[key]  ??  this category's default  ??  the aspect-wide default
+
+        where key is the aspect's own name, except for a `mapped_field` aspect, which reads
+        THE FIELD IT IS MAPPED TO. Color is mapped to brand_color and Style to style_name,
+        and neither key exists under the aspect's name, so reading data["Color"] found
+        nothing and the aspect was silently dropped from the file. eBay then refused the
+        listing with "The item specific Color is missing".
+
+        resolve_mapping returns None for these deliberately: brand_color needs no mapping
+        TABLE. That is not the same as needing no value, which is the distinction this
+        missed.
+        """
+        settings = aspect.get("settings") or {}
+        source_key = aspect["aspect_name"]
+        if settings.get("source") == "mapped_field" and settings.get("mapped_field"):
+            source_key = settings["mapped_field"]
+        value = data.get(source_key)
+        if value in EbayService.EMPTY_VALUES:
+            value = aspect.get("category_default")
+        if value in EbayService.EMPTY_VALUES:
+            value = settings.get("default_value")
+        return value
+
     @staticmethod
     async def resolve_specifics(
         listing: Listing,
@@ -350,23 +383,7 @@ class EbayService:
             if resolved_by:
                 value = await EbayService._value_from_mapping(resolved_by, data)
             else:
-                # A `mapped_field` aspect reads THE FIELD IT IS MAPPED TO, not its own
-                # name. Color is mapped to brand_color and Style to style_name, and neither
-                # key exists under the aspect's name -- so reading data["Color"] found
-                # nothing and the aspect was silently dropped from the file. eBay then
-                # refused the listing with "The item specific Color is missing".
-                #
-                # resolve_mapping returns None for these deliberately: brand_color needs no
-                # mapping TABLE. That is not the same as needing no value, which is the
-                # distinction this missed.
-                source_key = name
-                if settings.get("source") == "mapped_field" and settings.get("mapped_field"):
-                    source_key = settings["mapped_field"]
-                value = data.get(source_key)
-                if value in (None, "", []):
-                    value = aspect.get("category_default")
-                if value in (None, "", []):
-                    value = settings.get("default_value")
+                value = EbayService.aspect_value_from_listing(aspect, data)
 
             if isinstance(value, list):
                 # eBay MULTI aspects. SellerCloud takes one value per row, so a multi-value
