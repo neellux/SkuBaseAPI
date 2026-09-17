@@ -145,6 +145,21 @@ def coverage_state_sql(platform: str, sku: str = "c.sku") -> str:
     return _COVERAGE_TEMPLATE.format(platform=platform, sku=sku)
 
 
+async def coverage_for_product(sku: Optional[str], platforms: Sequence[str]) -> Dict[str, str]:
+    """One parent's tile states, so the listing view shows what the catalog shows.
+
+    Exclusions are not applied: the listing view works them out for the listing itself.
+    """
+    if not sku or not platforms:
+        return {}
+    rows = await connections.get("default").execute_query_dict(
+        f"SELECT p.platform_id, {coverage_state_sql('p.platform_id', '$1::text')} AS state "
+        "FROM unnest($2::text[]) AS p(platform_id)",
+        [sku, list(platforms)],
+    )
+    return {r["platform_id"]: r["state"] for r in rows}
+
+
 CATALOG_FROM = """
 FROM cat c
 LEFT JOIN parent_product_values v ON v.parent_sku = c.sku

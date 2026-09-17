@@ -51,7 +51,7 @@ from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
 from services.product_info_service import ProductInfoService
-from services import product_queue_service
+from services import catalog_service, product_queue_service
 from services.product_resolver import SkuResolutionError, resolve_parent
 from services.oneinventory_service import oneinventory_service
 from services.sellercloud_service import sellercloud_service
@@ -643,6 +643,22 @@ async def get_submission_status(
         if pid not in excluded_platforms
     }
 
+    # The catalog's tile state per platform, from the catalog's own SQL, so both pages
+    # agree. The UI marks a platform the catalog calls listed, without a successful
+    # attempt on this listing, as "Listed (manual)". Best effort, like the presence
+    # read above: a failure drops the marks, not the poll.
+    enabled = [
+        pid for pid in (settings.platforms if settings and settings.platforms else [])
+        if pid not in excluded_platforms
+    ]
+    try:
+        catalog_coverage = await catalog_service.coverage_for_product(
+            listing_model.product_id, enabled
+        )
+    except Exception:
+        logger.exception("catalog coverage failed for %s", listing_model.product_id)
+        catalog_coverage = {}
+
     return {
         "platforms": platform_statuses,
         "all_complete": all_complete,
@@ -650,6 +666,7 @@ async def get_submission_status(
         # the coverage gap. Deliberately not computed here: child_products lives
         # in lux_products_2 and this endpoint is polled every 1.5s.
         "external_listings": external_listings,
+        "catalog_coverage": catalog_coverage,
     }
 
 
