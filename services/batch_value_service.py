@@ -13,12 +13,16 @@ unfinished listing is worth what it is worth now.
 A product is worth the sum, over its ACTIVE variants, of physical quantity on hand times
 the price the website sells it at:
 
-    value(parent) = sum over active children of (AggregatePhysicalQty x SitePrice)
+    value(parent) = sum over active children of (AggregateQty x SitePrice)
 
 Two field choices worth stating, both verified against production on 2026-08-14:
 
-  * AggregatePhysicalQty, not AggregateQty. AggregateQty read 0 on rows where
-    AggregatePhysicalQty was 2, so it is not the on-hand number.
+  * AggregateQty, the SELLABLE quantity, since 2026-09-16. The earlier note here said
+    "AggregatePhysicalQty, not AggregateQty, because AggregateQty read 0 on rows where
+    AggregatePhysicalQty was 2, so it is not the on-hand number." That observation is
+    correct and is exactly why the field changed: on-hand is not what the value should
+    count. Stock that exists but cannot be sold is worth nothing to sell. 424-MBTM-0028/L
+    shows the shape, physical 2 and sellable 1.
   * SitePrice, not ListPrice. SitePrice is what the storefront charges - oneinventory
     _service prices Shopify variants off it - and submit rewrites ListPrice, so ListPrice
     can differ from what was there when the batch was made. SitePrice and WebsitePrice
@@ -127,7 +131,7 @@ def aggregate_values(
             row = by_sku.get(child.lower())
             if not row:
                 continue
-            child_qty = _to_int(row.get("AggregatePhysicalQty"))
+            child_qty = _to_int(row.get("AggregateQty"))
             price = _to_decimal(row.get("SitePrice"))
             if price > 0:
                 priced += 1

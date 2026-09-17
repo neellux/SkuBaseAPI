@@ -341,7 +341,7 @@ class DailySellercloudSyncPoller:
         """Run ExportCustomInfo with all SKUs in one queued job.
 
         One export serves two consumers: the UPC column feeds reconcile, and
-        AggregatePhysicalQty and SitePrice feed the daily parent values
+        AggregateQty and SitePrice feed the daily parent values
         (product_value_service), so valuing the whole catalog costs no second export.
         Parsed by header name, off the event loop.
         """

@@ -5,7 +5,7 @@ The data is split across two databases that cannot be joined:
 
 - Product fields (title, mpn, brand, product type, company, created date) come from
   catalog_product_cache, which holds the active parents in memory, loaded from the products
-  DB. They used to be mirrored into skubase as catalog_products; that table is gone.
+  DB. They used to be mirrored into skubase as catalog_products; that mirror is no longer read. It still EXISTS on prod: `migrations/drop_catalog_products_mirror.sql` drops it, and is deliberately held until this code is confirmed deployed, because dropping it while the mirror build is live takes the catalog down.
 - Value, platform coverage, listing state, open work and images come from skubase, so one
   query still filters, sorts and pages across all of them.
 
@@ -212,10 +212,29 @@ listing_state AS (
     -- counts differ from "every enabled platform eligible, nothing listed", which the WHERE
     -- supplies by COALESCE for everyone else.
     --
-    -- Derived from the small side deliberately. Scanning the bound SKU array here instead
-    -- cost 250 ms against the old mirror join's 140 ms, because a materialized array has no
-    -- statistics and no index for the planner to work with, while this side is the ~4k
-    -- products with listings rather than all ~42k.
+    -- Derived from this side rather than the bound SKU array: scanning the array here cost
+    -- 250 ms against the old mirror join's 140 ms, because a materialized array has no
+    -- statistics and no index for the planner to work with.
+    --
+    -- This side is NO LONGER the small one, and the comment used to claim it was. The
+    -- 2026-09-16 presence backfills took external_listing_ids from 220 distinct parents
+    -- under source='submission' to 47,305, more than the whole ~42k catalog, while only
+    -- 4,161 products have an actual listing row. So listing_state now computes for every
+    -- product, not the few thousand with listings.
+    --
+    -- Measured 2026-09-16: 217-291 ms of EXPLAIN time, ~405 ms warm wall. Three things
+    -- were ruled OUT by measurement, so do not re-propose them:
+    --   * the index. An index-only scan reads all 131,742 rows in 14 ms.
+    --   * stale statistics. Every table here is within 1.00x of reltuples and was
+    --     autoanalyzed the same day.
+    --   * work_mem. These HashAggregates DO spill at the prod 4MB (Batches: 5, disk
+    --     usage, 1,347 temp blocks), but raising it to 64MB removes every spill and buys
+    --     only 3%: 415 ms -> 405 ms. The spill is a symptom, not the cost.
+    -- The cost is cumulative hash aggregation proportional to row count: 67 ms to build
+    -- 92,986 pairs, 168 ms to dedup the 100,745-row Append to 93,454, 227 ms to fold that
+    -- into 47,305. The only real lever is not computing 93,454 pairs for a per-sku count.
+    -- Note too that the UNION below re-deduplicates what its first branch already made
+    -- DISTINCT.
     SELECT s.sku,
            cardinality({platforms}) - COALESCE(x.n, 0) AS eligible,
            COALESCE(l.n, 0) AS listed
@@ -753,6 +772,11 @@ def _shape_row(
         "open_batch_id": row["open_batch_id"],
         "open_kind": row["open_kind"],
         "has_listing": bool(row["has_listing"]),
+        # The newest listing, so the row can link to it. A listing in flight is reported
+        # separately from `submitted`: a queued submission satisfies completion, so a
+        # product can be flagged submitted while four platforms are still queued.
+        "listing_id": row.get("listing_id"),
+        "listing_in_progress": bool(row.get("listing_in_progress")),
         "has_images": bool(row["has_images"]),
         "images_taken_at": row["images_taken_at"],
         "blocked_reason": row["blocked_reason"],
@@ -807,8 +831,24 @@ async def get_page(filters: CatalogFilters, page: int, page_size: int) -> List[D
     ORDER BY {order}
     LIMIT {limit} OFFSET {offset}
 )
-SELECT page.*, cx.coverage
+SELECT page.*, cx.coverage, ln.listing_id, ln.listing_in_progress
   FROM page
+  LEFT JOIN LATERAL (
+      -- The product's newest listing, and whether anything is still in flight on it.
+      -- Newest matters: a product with several listings (189 of them, up to 4) can have a
+      -- quiet old listing and a live new one, and keying on the wrong one reports the
+      -- product as finished. The statuses match what the tiles call "in progress".
+      SELECT l.id::text AS listing_id,
+             EXISTS (
+                 SELECT 1 FROM listing_submissions s
+                  WHERE s.listing_id = l.id
+                    AND s.status IN ('queued', 'pending', 'processing', 'awaiting_action')
+             ) AS listing_in_progress
+        FROM listings l
+       WHERE l.product_id = page.sku
+       ORDER BY l.created_at DESC
+       LIMIT 1
+  ) ln ON true
   LEFT JOIN LATERAL (
       SELECT COALESCE(jsonb_object_agg(
                  p.platform_id, {coverage_state_sql('p.platform_id', 'page.sku')}

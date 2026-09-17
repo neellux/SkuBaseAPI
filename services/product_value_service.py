@@ -2,7 +2,7 @@
 
 Written once a day from the ExportCustomInfo job daily_sellercloud_sync_poller already runs
 over every active child SKU, so valuing the whole catalog costs no extra SellerCloud export.
-Phase B0 of the plan verified the columns on 2026-09-15: FieldNames AggregatePhysicalQty and
+Phase B0 verified the columns on 2026-09-15: FieldNames AggregatePhysicalQty and
 SitePrice matched the Kind 13 grid on 50 of 50 SKUs (PhysicalQty exported blank, which is
 what an unknown name looks like). SellerCloud also inserts ProductName after ProductID
 without being asked, so columns are only ever read by header name.
@@ -10,7 +10,7 @@ without being asked, so columns are only ever read by header name.
 Read by the batch value snapshot and the nightly batch refresh when
 [batch_value] source = "table", and by the catalog browser.
 
-value(parent) = sum over active children of (AggregatePhysicalQty x SitePrice), through the
+value(parent) = sum over active children of (AggregateQty x SitePrice), through the
 same aggregate_values batch_value_service has always used.
 
 Imports no batch or listing service.
@@ -30,7 +30,19 @@ from tortoise.transactions import in_transaction
 
 logger = logging.getLogger(__name__)
 
-QTY_FIELD = "AggregatePhysicalQty"
+# Sellable quantity, not on-hand. Changed from AggregatePhysicalQty on 2026-09-16 at the
+# user's instruction: physical counts stock that exists but cannot be sold, and the value
+# should reflect what can actually be sold. On a 200-row grid sample physical was non-zero on
+# 73 rows against AggregateQty's 42, so values fall accordingly.
+#
+# Verified on both APIs before the switch, because this constant feeds two of them:
+#   Kind 13 grid          AggregateQty present on real rows.
+#   ExportCustomInfo      job 4241979 returned the column, blank on 0 of 40 rows, and it
+#                         matched the grid on 40 of 40. An unknown field name there does NOT
+#                         error, it exports blank, which is the trap B0 hit with PhysicalQty.
+# AggregateQty, AggregatedQty and InventoryAvailableQty were all non-zero on the same 42 of
+# 200 rows, so they are the same number under three names.
+QTY_FIELD = "AggregateQty"
 PRICE_FIELD = "SitePrice"
 EXPORT_FIELD_NAMES = ["ProductID", "UPC", QTY_FIELD, PRICE_FIELD]
 

@@ -846,7 +846,14 @@ class CatalogRow(BaseModel):
     )
     open_batch_id: Optional[int] = None
     open_kind: Optional[Literal["listing", "generating"]] = None
-    has_listing: bool = False
+    has_listing: bool
+    # The product's newest listing, so the catalog can link to it at /view/<id>. A string,
+    # not a UUID: asyncpg returns UUID objects and pydantic will not coerce them.
+    listing_id: Optional[str] = None
+    # True when that listing has a submission queued, pending, processing or
+    # awaiting_action. Separate from `submitted`, which a queued submission already
+    # satisfies, so a product can be submitted and still mid-flight.
+    listing_in_progress: bool = False
     has_images: bool = Field(False, description="Photography has a productimages row for it")
     images_taken_at: Optional[datetime] = Field(
         None, description="When its newest productimages row was created"
