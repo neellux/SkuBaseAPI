@@ -28,6 +28,7 @@ from services.product_service import format_mpn
 from services.sellercloud_service import sellercloud_service
 from services.template_render import render_template, resolve_field_template
 from services.template_service import TemplateService
+from utils.text_case import to_title_case
 import orjson
 from tortoise import connections
 from tortoise.transactions import in_transaction
@@ -358,6 +359,35 @@ class ListingService:
             return False
         data["manufacturer_sku"] = formatted
         logger.info(f"Normalized MPN {mpn!r} -> {formatted!r}")
+        return True
+
+    @staticmethod
+    def normalize_brand_color(data: Dict[str, Any]) -> bool:
+        """Title-case brand_color in place. Returns True if changed.
+
+        brand_color is prefilled from SellerCloud's COLOR custom column, which holds the
+        brand's own name for the colour and is very often written there in caps ("MID
+        INDIGO", "BLACK"). Nothing used to change that: the only thing that ever title-cased
+        it was an operator pressing the toggle on the field, by hand, one listing at a time.
+        It was a real share of the work, 63 of the 189 brand_color corrections made on
+        listings that then shipped were nothing but a case fix.
+
+        Uses the UI's own rule (utils.text_case.to_title_case), so this and the button can
+        never disagree about the same value, and an operator who presses the button on a new
+        listing sees nothing happen because it is already in that form.
+
+        Idempotent, like normalize_mpn, so it is safe wherever it runs more than once. The
+        return value is there for the same reason: a caller that only wants to write on a
+        real change can check it.
+        """
+        color = data.get("brand_color")
+        if not isinstance(color, str) or not color.strip():
+            return False
+        cased = to_title_case(color)
+        if cased == color:
+            return False
+        data["brand_color"] = cased
+        logger.info(f"Title-cased brand color {color!r} -> {cased!r}")
         return True
 
     @staticmethod
@@ -694,6 +724,12 @@ class ListingService:
             # is snapshotted after this, so the creation baseline records the
             # normalized value that would actually be submitted.
             ListingService.normalize_mpn(prefilled_data)
+
+            # Alongside the MPN, and for the same reason: the value that reaches the
+            # operator should already be in the form they would have put it in. Runs on
+            # whatever brand_color ended up in prefilled_data, whether that came from
+            # SellerCloud's BRAND_COLOR column or was copied off standard_color above.
+            ListingService.normalize_brand_color(prefilled_data)
 
             upload_status = "pending"
             if await ListingService._check_photos_uploaded(request.product_id):

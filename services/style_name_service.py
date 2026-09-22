@@ -288,7 +288,13 @@ async def suggest(
             reason="The style name pass returned nothing usable.",
         ), cost
 
-    agrees = suggested.lower() == listing_value.lower()
+    # EXACT, not case-insensitive. For most fields a case difference is a formatting
+    # opinion, which is why the card compares brand_color loosely: it has its own Title
+    # Case toggle. For style_name the casing IS the suggestion. 211 of the 374 operator
+    # edits this was built from were nothing but ALLCAPS -> Title Case, so treating
+    # "TAPE ARROW HOODIE" and "Tape Arrow Hoodie" as agreement marked the single most
+    # common and most useful suggestion "confirmed" and hid it from the card entirely.
+    agrees = suggested == listing_value
     return _verdict(
         suggested=suggested,
         listing_value=listing_value,
