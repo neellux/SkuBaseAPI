@@ -30,7 +30,7 @@ import random
 import re
 import time
 from html import unescape
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, quote_plus, urlparse
 
 import httpx
@@ -42,6 +42,7 @@ from exceptions.ai_search_exceptions import (
 )
 from google import genai
 from google.genai import types
+from services import style_name_service
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +103,34 @@ FIELD_TO_LISTING_KEY = {
     "description": "description",
 }
 
+# style_name is NOT in the mapping above on purpose: the search model is never asked for
+# it. It is a house naming convention rather than a fact a page or a tag states, and the
+# prompt's "never infer, normalise or repair a value" rule makes this model the wrong one
+# to ask. style_name_service derives it in a separate text-only pass, the same way
+# _material_from_sources derives composition. See that module for the measurements.
+DERIVED_FIELDS = ("style_name",)
+
+# What the fingerprint covers, which is every field a verdict speaks about: an edit to any
+# of them should be able to mark the stored verdict stale.
+#
+# Versioned because the set grew. A fingerprint is only comparable to one computed over the
+# same fields, so widening this without recording it would have flipped every stored verdict
+# to "checked against an older value" at once, which is both false and the fastest way to
+# teach operators to ignore the badge. Verdicts written before style_name existed carry no
+# `fingerprint_fields` and are re-checked against LEGACY_FINGERPRINT_FIELDS.
+LEGACY_FINGERPRINT_FIELDS = tuple(sorted(FIELD_TO_LISTING_KEY.values()))
+FINGERPRINT_FIELDS = tuple(sorted(LEGACY_FINGERPRINT_FIELDS + DERIVED_FIELDS))
+
 # What the UI surfaces. Widening this is a one-line change with no migration and
 # no re-run, because every field above is asked for and stored regardless.
-SURFACED_FIELDS = ("manufacturer_sku", "brand_color", "material", "title", "description")
+SURFACED_FIELDS = (
+    "manufacturer_sku",
+    "brand_color",
+    "style_name",
+    "material",
+    "title",
+    "description",
+)
 
 # description's verified_value is advisory prose ("all features supported", or
 # the contradicted features), never a replacement value, so Apply must be
@@ -1176,15 +1202,23 @@ async def check_urls(urls: List[str]) -> Dict[str, Tuple[str, str, str]]:
     return results
 
 
-def input_fingerprint(fields: Dict[str, Any], image_urls: List[str]) -> str:
+def input_fingerprint(
+    fields: Dict[str, Any],
+    image_urls: List[str],
+    field_names: Optional[Sequence[str]] = None,
+) -> str:
     """Pins a verdict to the input it was formed against.
 
     Lets the UI say "checked against an older value" instead of quietly showing a
     verdict about an MPN the operator has since fixed.
+
+    `field_names` defaults to the current set. Pass the set a stored verdict recorded to
+    re-check that verdict on its own terms: a hash over a different field list is not
+    comparable, so mixing them reports staleness that never happened.
     """
     payload = json.dumps(
         {
-            "fields": {k: fields.get(k) for k in sorted(FIELD_TO_LISTING_KEY.values())},
+            "fields": {k: fields.get(k) for k in sorted(field_names or FINGERPRINT_FIELDS)},
             "images": sorted(image_urls),
         },
         sort_keys=True,
@@ -1271,8 +1305,8 @@ async def run_for_fields(
         tag_options=tag_options,
         own_markers=markers,
     )
-    auth, response = await asyncio.to_thread(
-        _generate, AI_SEARCH_AUTH, prompt, images, RESPONSE_SCHEMA, SYSTEM_PROMPT
+    (auth, response), style_verdict, style_cost = await _search_and_style(
+        prompt=prompt, images=images, fields=fields
     )
 
     text = response_text(response)
@@ -1292,6 +1326,7 @@ async def run_for_fields(
     return await _shape_result(
         raw, fields, response, auth, tag_text, [u for u, _ in images], reason,
         requested_by, source_key, tag_options,
+        style_verdict=style_verdict, style_cost=style_cost,
     )
 
 
@@ -1372,6 +1407,38 @@ async def extract_source_materials(sources: List[Dict[str, Any]], auth: str) -> 
     return _usage_and_cost(response, used_auth, grounded=False)
 
 
+async def _search_and_style(
+    *, prompt: Any, images: List[Any], fields: Dict[str, Any]
+) -> Tuple[Any, Dict[str, Any], float]:
+    """The grounded search and the house style-name pass, run TOGETHER.
+
+    The style pass used to wait for the search so it could read the web product title the
+    search found. Measured: it is worth nothing. Dropping the web title scored 82/159
+    against the same 82/159, fixing 7 rows and breaking 7, against a noise floor of 3 fixed
+    / 5 broke on two runs of an identical prompt. The prompt already fences the web title
+    off ("never let it replace a supplier name that already reads correctly"), so it was
+    being paid for and then ignored.
+
+    Once it needs nothing from the search, the style pass has no reason to be behind it.
+    The search takes 5-47s and the style pass 2-5s, so gathering them makes the style name
+    free rather than a tax on every job.
+
+    `return_exceptions` is not set on purpose: suggest() swallows its own failures and
+    returns an empty verdict, so only the search can raise here, and it must still fail the
+    job exactly as it did before the two were paired.
+
+    Returns ((auth, response), style_verdict, style_cost).
+    """
+    search, (style_verdict, style_cost) = await asyncio.gather(
+        asyncio.to_thread(
+            _generate, AI_SEARCH_AUTH, prompt, images, RESPONSE_SCHEMA, SYSTEM_PROMPT
+        ),
+        # No web_title: see above. Passing one would put this back behind the search.
+        style_name_service.suggest(fields),
+    )
+    return search, style_verdict, style_cost
+
+
 def _material_from_sources(sources: List[Dict[str, Any]], listing_value: Any) -> Dict[str, Any]:
     """The composition verdict, built from what the pages published.
 
@@ -1421,7 +1488,7 @@ def _material_from_sources(sources: List[Dict[str, Any]], listing_value: Any) ->
 
 async def _shape_result(
     raw, fields, response, auth, tag_text, image_urls, reason, requested_by,
-    source_key, tag_options=None,
+    source_key, tag_options=None, *, style_verdict=None, style_cost=0.0,
 ) -> Dict[str, Any]:
     """Translate the model's vocabulary into this app's, and attach the extras."""
     from services.product_service import format_mpn
@@ -1523,6 +1590,13 @@ async def _shape_result(
         material_usage = await extract_source_materials(sources, auth)
         verdicts["material"] = _material_from_sources(sources, fields.get("material"))
 
+    # The house style name, already computed: it ran alongside the search rather than after
+    # it, because it needs nothing the search produces. Derived, not searched for, since
+    # the search model is under orders never to normalise a value and this field is nothing
+    # but normalisation. See _search_and_style.
+    if style_verdict is not None:
+        verdicts["style_name"] = style_verdict
+
     if (
         label.get("mpn_normalized")
         and verdicts.get("manufacturer_sku", {}).get("normalized_value")
@@ -1544,11 +1618,14 @@ async def _shape_result(
         "auth": auth,
         "reason": reason,
         "requested_by": requested_by,
-        "cost_usd": round(usage["cost_usd"] + material_usage["cost_usd"], 5),
+        "cost_usd": round(usage["cost_usd"] + material_usage["cost_usd"] + style_cost, 5),
         "error": None,
         "input": {
             "source": source_key,
             "fingerprint": input_fingerprint(fields, image_urls),
+            # Recorded so a later widening of the set cannot make this verdict look stale
+            # against a hash computed over different fields. See FINGERPRINT_FIELDS.
+            "fingerprint_fields": list(FINGERPRINT_FIELDS),
             "image_urls": image_urls,
             "tag_text_available": tag_text is not None,
             "search_options": [

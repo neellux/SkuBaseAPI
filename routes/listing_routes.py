@@ -406,6 +406,7 @@ async def get_listing_ai_search(
     """
     from services import ai_search_queue
     from services.ai_search_service import (
+        LEGACY_FINGERPRINT_FIELDS,
         SURFACED_FIELDS,
         input_fingerprint,
         is_configured,
@@ -447,8 +448,13 @@ async def get_listing_ai_search(
     # has to be able to say so rather than quietly comparing against a stale value.
     stale = False
     if stored and stored.get("input", {}).get("fingerprint"):
+        # Re-hash over the fields THIS verdict was hashed with. A verdict stored before
+        # style_name joined the set carries no fingerprint_fields, and comparing it against
+        # the wider set would report every one of them stale the moment this shipped.
         stale = stored["input"]["fingerprint"] != input_fingerprint(
-            listing.data or {}, stored["input"].get("image_urls") or []
+            listing.data or {},
+            stored["input"].get("image_urls") or [],
+            stored["input"].get("fingerprint_fields") or LEGACY_FINGERPRINT_FIELDS,
         )
 
     fields = {
