@@ -491,6 +491,14 @@ class AIService:
                     messages=messages,
                     api_key=ASPECTS_API_KEY,
                     reasoning_effort=ASPECTS_REASONING_EFFORT,
+                    # litellm validates reasoning_effort against its own per-model map,
+                    # which lags new releases: on litellm 1.77.5 gpt-6-sol is absent, so the
+                    # param is rejected as "openai does not support parameters" even though
+                    # OpenAI accepts it and honours it (effort=high returns reasoning tokens,
+                    # effort=low returns none). Naming it here passes it through instead of
+                    # failing the call. Without this, every aspects and style call 400s the
+                    # moment the model is pointed at anything newer than the pinned litellm.
+                    allowed_openai_params=["reasoning_effort"],
                 )
 
                 ai_response_content = response.choices[0].message.content

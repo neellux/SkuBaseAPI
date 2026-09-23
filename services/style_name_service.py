@@ -67,6 +67,10 @@ MODEL = _AI.get("style_name_model") or _AI.get("aspects_model")
 API_KEY = _AI.get("style_name_api_key") or _AI.get("aspects_api_key")
 REASONING_EFFORT = _AI.get("style_name_reasoning_effort") or _AI.get("aspects_reasoning_effort") or "high"
 
+# Six covers the median of five stored sources with room to spare, and caps a pathological
+# row. Ordered as the search ranked them, so the best match is never the one dropped.
+MAX_SOURCE_TITLES = 6
+
 # Longest value seen in the corpus is well under this. A model that runs away with a
 # sentence is refused rather than surfaced.
 MAX_LENGTH = 120
@@ -101,11 +105,16 @@ def item_block(
     colour: str = "",
     supplier_title: str = "",
     web_title: str = "",
+    source_titles: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """One product rendered for the prompt.
 
     Examples and the live item use this same function, so a live item never looks different
     from what the model was shown. The garment tag is not a field here: see the module note.
+
+    The shipped examples carry no source titles while live items do. That asymmetry is
+    deliberate and is what was measured: the 19/30 run used exactly this shape. Adding
+    sources to the 48 examples would change the prompt the score was taken on.
     """
     lines = [
         f"Supplier name: {_norm(style_name) or '(empty)'}",
@@ -118,6 +127,20 @@ def item_block(
         lines.append(f"Supplier title: {_norm(supplier_title)}")
     if _norm(web_title):
         lines.append(f"Web product title: {_norm(web_title)}")
+    rows = [
+        (_norm(t.get("domain") or t.get("source_name")), _norm(t.get("title")),
+         t.get("image_match"))
+        for t in (source_titles or [])
+    ]
+    rows = [r for r in rows if r[1]][:MAX_SOURCE_TITLES]
+    if rows:
+        lines.append("Web product titles:")
+        for domain, title, match in rows:
+            # The colourway warning is carried through rather than filtered: a page for
+            # another colour of the same style still names the style correctly, and the
+            # prompt says so. Hiding it would lose a usable name.
+            mark = "" if match == "same_product" else f"  [{match}]"
+            lines.append(f"  {domain or 'source'}: {title}{mark}")
     return "\n".join(lines)
 
 
@@ -214,6 +237,7 @@ async def suggest(
     fields: Dict[str, Any],
     *,
     web_title: Optional[str] = None,
+    source_titles: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], float]:
     """The style_name verdict for one listing, and what the call cost.
 
@@ -234,6 +258,7 @@ async def suggest(
         colour=fields.get("brand_color") or fields.get("standard_color"),
         supplier_title=fields.get("title"),
         web_title=web_title,
+        source_titles=source_titles,
     )
     # No temperature: the gpt-5.x reasoning models accept only the default and 400 on
     # anything else, so this call is not reproducible run to run even at a fixed effort.
@@ -247,6 +272,9 @@ async def suggest(
                 model=MODEL,
                 api_key=API_KEY,
                 reasoning_effort=REASONING_EFFORT,
+                # See ai_service: litellm's per-model param map lags new releases, and
+                # without naming it here a newer model rejects reasoning_effort outright.
+                allowed_openai_params=["reasoning_effort"],
                 timeout=TIMEOUT_SECONDS,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},

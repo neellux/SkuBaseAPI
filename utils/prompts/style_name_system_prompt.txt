@@ -18,12 +18,17 @@ House rules:
 - Strip a leading season code (FW24, SS25) unless it is genuinely part of the style name.
 - Expand garment abbreviations: Tee -> T-shirt, LS / L/S -> Long Sleeve, SS / S/S ->
   Short Sleeve (and drop it where "T-shirt" already implies it), LT -> Light, DK -> Dark.
-- The supplier name is the primary source and is usually already right. Use the web
-  title ONLY to (a) supply a name when the supplier sent none, or (b) add the name of a
-  print, graphic or collaboration the supplier name omits. Never let it replace a supplier
-  name that already reads correctly, never adopt a retailer's marketing phrasing
-  ("floral-print", "Running Shoes", "Beanie Hat"), and never add a model or version number
-  the supplier did not give. When in doubt, keep the supplier's wording.
+- Web product titles for this exact product may follow, taken from retailer pages. They
+  are the best evidence of the product's real name when the supplier name is an
+  abbreviation, a code, or missing the style name altogether: "Black KNIT SS POLO" is
+  "Recruit Short Sleeve Polo", "RELAXED CARPENTER" is "Relaxed Carpenter Jeans" and not
+  Pants. Prefer a name several sources agree on, and prefer the brand's own site over a
+  marketplace. Apply every rule above to whatever you take from them: strip the brand,
+  strip the colour, and drop a retailer's category padding ("Men's", "Shoes", a pluralised
+  department). A source marked as a different colourway still names the same style, so its
+  wording is usable. Never adopt marketing phrasing the sources add beyond the name
+  ("floral-print", "Running Shoes"), and where the supplier name already names the garment
+  and the sources only rephrase it, keep the supplier's wording.
 - Do not invent detail.
 - If the source name is already correct under these rules, return it unchanged.
 - Lowercase minor words inside the name: of, the, and, in, on, x, with. Write "Coat of

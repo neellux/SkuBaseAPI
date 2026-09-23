@@ -1305,9 +1305,7 @@ async def run_for_fields(
         tag_options=tag_options,
         own_markers=markers,
     )
-    (auth, response), style_verdict, style_cost = await _search_and_style(
-        prompt=prompt, images=images, fields=fields
-    )
+    auth, response = await _run_search(prompt=prompt, images=images)
 
     text = response_text(response)
     if not text:
@@ -1326,7 +1324,6 @@ async def run_for_fields(
     return await _shape_result(
         raw, fields, response, auth, tag_text, [u for u, _ in images], reason,
         requested_by, source_key, tag_options,
-        style_verdict=style_verdict, style_cost=style_cost,
     )
 
 
@@ -1407,36 +1404,28 @@ async def extract_source_materials(sources: List[Dict[str, Any]], auth: str) -> 
     return _usage_and_cost(response, used_auth, grounded=False)
 
 
-async def _search_and_style(
-    *, prompt: Any, images: List[Any], fields: Dict[str, Any]
-) -> Tuple[Any, Dict[str, Any], float]:
-    """The grounded search and the house style-name pass, run TOGETHER.
+async def _run_search(*, prompt: Any, images: List[Any]) -> Any:
+    """The grounded search. Returns (auth, response).
 
-    The style pass used to wait for the search so it could read the web product title the
-    search found. Measured: it is worth nothing. Dropping the web title scored 82/159
-    against the same 82/159, fixing 7 rows and breaking 7, against a noise floor of 3 fixed
-    / 5 broke on two runs of an identical prompt. The prompt already fences the web title
-    off ("never let it replace a supplier name that already reads correctly"), so it was
-    being paid for and then ignored.
+    THIS USED TO RUN CONCURRENTLY WITH THE STYLE-NAME PASS, and no longer can. The style
+    pass reads the per-source product titles, and those do not exist until the search comes
+    back, so it is behind the search again by necessity rather than by oversight.
 
-    Once it needs nothing from the search, the style pass has no reason to be behind it.
-    The search takes 5-47s and the style pass 2-5s, so gathering them makes the style name
-    free rather than a tax on every job.
+    What that buys, measured on 30 held-out listings the operator renamed: the style pass
+    scored 15/30 blind and 19/30 with the source titles on gpt-5.6-luna, 17/30 and 18/30 on
+    gpt-6-sol, and broke nothing in either run. The wins are the cases operators spend the
+    most time on, where the supplier name is an abbreviation and a retailer published the
+    real one ("Black KNIT SS POLO" -> "Recruit Short Sleeve Polo", "RELAXED CARPENTER" ->
+    "Relaxed Carpenter Jeans" rather than Pants).
 
-    `return_exceptions` is not set on purpose: suggest() swallows its own failures and
-    returns an empty verdict, so only the search can raise here, and it must still fail the
-    job exactly as it did before the two were paired.
-
-    Returns ((auth, response), style_verdict, style_cost).
+    What it costs: about 2.5s added to a job that already takes 5-47s, because the two calls
+    are now sequential. An earlier ablation said the web was worth nothing and justified the
+    parallelism; that ablation removed the single aggregated `fields.title.verified_value`,
+    not these per-source titles, and did not test this.
     """
-    search, (style_verdict, style_cost) = await asyncio.gather(
-        asyncio.to_thread(
-            _generate, AI_SEARCH_AUTH, prompt, images, RESPONSE_SCHEMA, SYSTEM_PROMPT
-        ),
-        # No web_title: see above. Passing one would put this back behind the search.
-        style_name_service.suggest(fields),
+    return await asyncio.to_thread(
+        _generate, AI_SEARCH_AUTH, prompt, images, RESPONSE_SCHEMA, SYSTEM_PROMPT
     )
-    return search, style_verdict, style_cost
 
 
 def _material_from_sources(sources: List[Dict[str, Any]], listing_value: Any) -> Dict[str, Any]:
@@ -1488,7 +1477,7 @@ def _material_from_sources(sources: List[Dict[str, Any]], listing_value: Any) ->
 
 async def _shape_result(
     raw, fields, response, auth, tag_text, image_urls, reason, requested_by,
-    source_key, tag_options=None, *, style_verdict=None, style_cost=0.0,
+    source_key, tag_options=None,
 ) -> Dict[str, Any]:
     """Translate the model's vocabulary into this app's, and attach the extras."""
     from services.product_service import format_mpn
@@ -1590,12 +1579,15 @@ async def _shape_result(
         material_usage = await extract_source_materials(sources, auth)
         verdicts["material"] = _material_from_sources(sources, fields.get("material"))
 
-    # The house style name, already computed: it ran alongside the search rather than after
-    # it, because it needs nothing the search produces. Derived, not searched for, since
-    # the search model is under orders never to normalise a value and this field is nothing
-    # but normalisation. See _search_and_style.
-    if style_verdict is not None:
-        verdicts["style_name"] = style_verdict
+    # The house style name. Derived, not answered by the search model: that model is under
+    # orders never to normalise a value, and this field is nothing but normalisation. It
+    # runs here, after the sources are shaped, because the per-source product titles are
+    # its best evidence - a retailer routinely publishes the real name behind a supplier's
+    # abbreviation. Failure inside suggest() returns an empty verdict rather than raising:
+    # a style name is the least important thing this job produces.
+    verdicts["style_name"], style_cost = await style_name_service.suggest(
+        fields, source_titles=sources
+    )
 
     if (
         label.get("mpn_normalized")
