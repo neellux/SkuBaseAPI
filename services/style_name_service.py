@@ -106,6 +106,7 @@ def item_block(
     supplier_title: str = "",
     web_title: str = "",
     source_titles: Optional[List[Dict[str, Any]]] = None,
+    original_title: str = "",
 ) -> str:
     """One product rendered for the prompt.
 
@@ -123,8 +124,16 @@ def item_block(
     ]
     if _norm(colour):
         lines.append(f"Colour (strip this from the name): {_norm(colour)}")
+    # Two different things, both shown, neither overriding the other. "Supplier title" is
+    # the listing's own title, which the template generates FROM style_name - circular, but
+    # it is what the 48 examples carry, so the label and its position stay put. The raw
+    # ProductName is added BELOW it as one more candidate: on a listing whose supplier sent
+    # no style_name it is the only local evidence there is, and on one that did it is a
+    # second opinion rather than a correction.
     if _norm(supplier_title):
         lines.append(f"Supplier title: {_norm(supplier_title)}")
+    if _norm(original_title) and _norm(original_title) != _norm(supplier_title):
+        lines.append(f"Supplier product name: {_norm(original_title)}")
     if _norm(web_title):
         lines.append(f"Web product title: {_norm(web_title)}")
     rows = [
@@ -238,6 +247,7 @@ async def suggest(
     *,
     web_title: Optional[str] = None,
     source_titles: Optional[List[Dict[str, Any]]] = None,
+    original_title: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], float]:
     """The style_name verdict for one listing, and what the call cost.
 
@@ -259,6 +269,7 @@ async def suggest(
         supplier_title=fields.get("title"),
         web_title=web_title,
         source_titles=source_titles,
+        original_title=original_title,
     )
     # No temperature: the gpt-5.x reasoning models accept only the default and 400 on
     # anything else, so this call is not reproducible run to run even at a fixed effort.

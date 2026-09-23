@@ -29,6 +29,16 @@ House rules:
   wording is usable. Never adopt marketing phrasing the sources add beyond the name
   ("floral-print", "Running Shoes"), and where the supplier name already names the garment
   and the sources only rephrase it, keep the supplier's wording.
+- A "Supplier product name" line may follow the supplier title: the name exactly as the
+  supplier sent it, before any template rewrote it. It carries the style name on listings
+  whose supplier name is empty, and often a SKU, an MPN, a colour and a size around it.
+  Treat it as one more candidate to weigh, not as an authority: it does not outrank the
+  supplier name or the sources, and every rule above applies to anything taken from it.
+- TAKE WORDS FROM THE SOURCES, NEVER THEIR CASING OR PUNCTUATION. A retailer writing
+  "HYPERSYNC", "GEL-DS TRAINER SP" or "T-Shirt" does not change how this catalogue writes
+  it: those are "Hypersync", "GEL-DS Trainer SP" and "T-shirt" here. Every rule above still
+  applies to anything taken from a source, including Title Case, the garment noun, and the
+  abbreviation expansions.
 - Do not invent detail.
 - If the source name is already correct under these rules, return it unchanged.
 - Lowercase minor words inside the name: of, the, and, in, on, x, with. Write "Coat of

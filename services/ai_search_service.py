@@ -1252,6 +1252,12 @@ async def run_for_listing(
         reason=reason,
         requested_by=requested_by,
         source_key=source_key,
+        # The SellerCloud ProductName exactly as it arrived, before the title template
+        # rewrote it. `fields["title"]` is NOT a substitute: that one is generated FROM
+        # style_name, so feeding it back is circular and tells the model nothing. This is
+        # the only local evidence on a listing whose supplier sent no style_name at all,
+        # which is most of the RESALE-* range.
+        original_title=listing.original_title,
     )
 
 
@@ -1259,6 +1265,7 @@ async def run_for_fields(
     fields: Dict[str, Any],
     *,
     product_id: str,
+    original_title: Optional[str] = None,
     parent_product_id: Optional[str] = None,
     reason: str = "manual",
     requested_by: Optional[str] = None,
@@ -1323,7 +1330,7 @@ async def run_for_fields(
 
     return await _shape_result(
         raw, fields, response, auth, tag_text, [u for u, _ in images], reason,
-        requested_by, source_key, tag_options,
+        requested_by, source_key, tag_options, original_title=original_title,
     )
 
 
@@ -1477,7 +1484,7 @@ def _material_from_sources(sources: List[Dict[str, Any]], listing_value: Any) ->
 
 async def _shape_result(
     raw, fields, response, auth, tag_text, image_urls, reason, requested_by,
-    source_key, tag_options=None,
+    source_key, tag_options=None, *, original_title: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Translate the model's vocabulary into this app's, and attach the extras."""
     from services.product_service import format_mpn
@@ -1586,7 +1593,7 @@ async def _shape_result(
     # abbreviation. Failure inside suggest() returns an empty verdict rather than raising:
     # a style name is the least important thing this job produces.
     verdicts["style_name"], style_cost = await style_name_service.suggest(
-        fields, source_titles=sources
+        fields, source_titles=sources, original_title=original_title
     )
 
     if (
@@ -1626,6 +1633,9 @@ async def _shape_result(
             ],
         },
         "label": label,
+        # Stored so the suggestion card can show the operator the line the name was read
+        # out of, the same way the tag block shows what the washtag said.
+        "supplier_title": (original_title or "").strip(),
         "fields": verdicts,
         "sources": sources,
         "notes": str(raw.get("notes") or "")[:MAX_NOTES],

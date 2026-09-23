@@ -474,6 +474,12 @@ async def get_listing_ai_search(
         # Hoisted: the tag is frequently the only evidence there is, and the UI
         # must be able to render it with zero sources.
         "label": (stored or {}).get("label") or {},
+        # The supplier's raw ProductName. Falls back to the listing's own column for a
+        # verdict stored before the search started recording it, so an older listing still
+        # gets the row rather than silently losing it.
+        "supplier_title": (
+            (stored or {}).get("supplier_title") or listing.original_title or ""
+        ).strip(),
         "sources": (stored or {}).get("sources") or [],
         "notes": (stored or {}).get("notes") or "",
         "conflict_count": sum(1 for v in fields.values() if v.get("status") == "conflict"),
