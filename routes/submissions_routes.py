@@ -503,6 +503,8 @@ def _build_import_detail(
     batch_number = None
     publish_job_id = None
     revise_task_ids = None
+    sheet_url = None
+    sheet_title = None
     for sub in submissions:
         status_counts[_effective_status(sub)] += 1
         if batch_number is None:
@@ -514,6 +516,13 @@ def _build_import_detail(
             publish_job_id = ebay_jobs.get("publish")
         if not revise_task_ids:
             revise_task_ids = ebay_jobs.get("revise_tasks")
+        # GOAT's tab_created step writes these onto every row of the batch before the sheet
+        # is written, so the first row carrying them answers for the whole import - and an
+        # import whose tab was never created simply has none, which is the honest answer.
+        if sheet_url is None:
+            sheet_url = (sub.platform_meta or {}).get("sheet_url")
+        if sheet_title is None:
+            sheet_title = (sub.platform_meta or {}).get("tab_title")
         listing = sub.listing
         title = None
         product_id = None
@@ -551,6 +560,8 @@ def _build_import_detail(
         batch_number=batch_number,
         publish_job_id=str(publish_job_id) if publish_job_id else None,
         revise_task_ids=[str(task) for task in revise_task_ids] if revise_task_ids else None,
+        sheet_url=sheet_url,
+        sheet_title=sheet_title,
         submissions=details,
         status_counts=dict(status_counts),
     )

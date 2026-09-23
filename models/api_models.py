@@ -1249,6 +1249,15 @@ class ImportDetailResponse(BaseModel):
     revise_task_ids: Optional[List[str]] = Field(
         None, description="SellerCloud LMS task ids from this import's ReviseOnEbay calls"
     )
+    # GOAT writes each batch into its own tab of the shared PT spreadsheet and records the
+    # deep link on every row of the import. Read generically rather than under a goat check:
+    # any platform whose import lives in a sheet gets the link by writing the same two keys.
+    sheet_url: Optional[str] = Field(
+        None, description="Deep link to the spreadsheet tab holding this import's rows"
+    )
+    sheet_title: Optional[str] = Field(
+        None, description="Title of that tab, e.g. the GOAT batch date '9.22.2026'"
+    )
     submissions: List[ImportListingDetail] = Field(default_factory=list)
     status_counts: Dict[str, int] = Field(default_factory=dict)
 
