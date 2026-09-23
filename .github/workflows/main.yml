@@ -102,6 +102,10 @@ jobs:
               echo "$SERVICE_ACCOUNT_2" | base64 --decode > service-account-2.json
             fi
 
+            if [ -n "$SERVICE_ACCOUNT_3" ]; then
+              echo "$SERVICE_ACCOUNT_3" | base64 --decode > service-account-3.json
+            fi
+
       - name: Copy files to server
         uses: appleboy/scp-action@v1.0.0
         with:
