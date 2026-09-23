@@ -64,6 +64,7 @@ jobs:
           SELLERCLOUD_INTERNAL_API_ENDPOINT: ${{ vars.SELLERCLOUD_INTERNAL_API_ENDPOINT }}
           SERVICE_ACCOUNT: ${{ secrets.SERVICE_ACCOUNT }}
           SERVICE_ACCOUNT_2: ${{ secrets.SERVICE_ACCOUNT_2 }}
+          SERVICE_ACCOUNT_3: ${{ secrets.SERVICE_ACCOUNT_3 }}
         with:
           host: ${{ vars.PROD_SERVER_IP }}
           username: ${{ secrets.PROD_SERVER_USER }}
