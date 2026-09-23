@@ -681,6 +681,16 @@ class QueueSummaryResponse(BaseModel):
             "batches, which is a known imprecision in the sum, not in the count"
         ),
     )
+    listed_today_count: int = Field(
+        0, description="Listings submitted today, in America/New_York"
+    )
+    listed_today_value: Decimal = Field(
+        Decimal(0),
+        description=(
+            "What today's submitted listings were worth, read from the value snapshot "
+            "frozen on submission. Not part of total_value, which counts pending work only"
+        ),
+    )
     unvalued: int = Field(0, description="Products with no entry in product_values")
     zero_valued: int = Field(
         0,

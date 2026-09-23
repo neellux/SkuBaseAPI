@@ -42,6 +42,12 @@ logger = logging.getLogger(__name__)
 # pv expands each open batch's product_values once and joins it per listing. Reading
 # b.product_values -> l.product_id row by row decompresses the whole jsonb every time, and a
 # batch holding 2,000 products carries ~180 KB of it: thousands of decompressions per page.
+# "Today" for the operator, not UTC. Every daily poller in this app schedules on
+# America/New_York (batch_value_service, daily_image_import_poller, goat_sheets), so a
+# figure labelled "listed today" has to roll over when their day does. At 02:00 ET the UTC
+# date is already tomorrow, and a UTC cut would show the morning's work under the wrong day.
+QUEUE_TIMEZONE = "America/New_York"
+
 PENDING_ROWS = """
 FROM listings l
 JOIN batches b ON b.id = l.batch_id
@@ -369,15 +375,49 @@ async def get_queue_summary(
         search_like=like,
     )
 
+    # The same filters again, for the listed-today half. Appended to the same params list
+    # after the queue's, so the placeholder numbering stays sequential across both halves.
+    # Every figure in the header strip therefore obeys the same filters: a number in that
+    # bar that ignored the filters beside it would be read as the unfiltered total.
+    where_listed = build_filters(
+        params,
+        assigned_to=assigned_to,
+        priority=priority,
+        date_from=date_from,
+        date_to=date_to,
+        search_exact=exact,
+        search_like=like,
+    )
+
+    # listed_today deliberately does NOT restrict batch status. A batch completes the moment
+    # its last listing goes out, so restricting to open batches would drop most of the very
+    # work being counted - and on a quiet day, all of it.
+    #
+    # The value read is the frozen one: batches.product_values stops being refreshed for a
+    # product on the day its listing is submitted (see Batch.total_value), so this is what
+    # the product was worth when it went out rather than what it would fetch tonight.
     sql = f"""
 WITH queue AS (
 {QUEUE_SELECT}
   {where}
+),
+listed_today AS (
+  SELECT CASE WHEN jsonb_typeof(b.product_values -> l.product_id -> 'value') = 'number'
+              THEN (b.product_values -> l.product_id ->> 'value')::numeric END AS value
+    FROM listings l
+    JOIN batches b ON b.id = l.batch_id
+   WHERE l.submitted
+     AND l.submitted_at IS NOT NULL
+     AND (l.submitted_at AT TIME ZONE '{QUEUE_TIMEZONE}')::date
+         = (now() AT TIME ZONE '{QUEUE_TIMEZONE}')::date
+  {where_listed}
 )
 SELECT count(*)                              AS count,
        COALESCE(sum(value), 0)               AS total_value,
        count(*) FILTER (WHERE value IS NULL) AS unvalued,
-       count(*) FILTER (WHERE value = 0)     AS zero_valued
+       count(*) FILTER (WHERE value = 0)     AS zero_valued,
+       (SELECT count(*) FROM listed_today)                   AS listed_today_count,
+       (SELECT COALESCE(sum(value), 0) FROM listed_today)     AS listed_today_value
 FROM queue
 """
     conn = connections.get("default")
@@ -387,6 +427,8 @@ FROM queue
         "total_value": 0,
         "unvalued": 0,
         "zero_valued": 0,
+        "listed_today_count": 0,
+        "listed_today_value": 0,
     }
 
 
