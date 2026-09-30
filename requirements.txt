@@ -14,7 +14,7 @@ pytest-asyncio==0.26.0
 orjson==3.10.18
 pandas==2.3.0
 openpyxl==3.1.5
-litellm==1.42.1
+litellm==1.77.5
 Pillow
 google-genai
 gcloud-aio-storage
