@@ -790,6 +790,13 @@ class CatalogFilters(BaseModel):
     coverage_state: List[Literal["listed", "in_progress", "failed", "none", "excluded"]] = Field(
         default_factory=list, max_length=5
     )
+    coverage_any_platform: bool = Field(
+        False,
+        description=(
+            "Filter coverage on every enabled platform, combined with OR: a product matches "
+            "when at least one is in a chosen state. coverage_platform is ignored"
+        ),
+    )
     value_min: Optional[float] = Field(None, ge=0, allow_inf_nan=False)
     value_max: Optional[float] = Field(None, ge=0, allow_inf_nan=False)
     in_stock: bool = False
@@ -804,6 +811,13 @@ class CatalogFilters(BaseModel):
         ),
     )
     has_images: Optional[bool] = Field(None, description="Photography has images for the parent")
+    images_edited: Optional[bool] = Field(
+        None,
+        description=(
+            "The editor has delivered for the parent's current shoot. "
+            "false also matches a parent with no images"
+        ),
+    )
     # A product belongs to exactly ONE company, so several picked companies mean "any of
     # these", unlike coverage_platform where several mean "all of these".
     company: List[int] = Field(

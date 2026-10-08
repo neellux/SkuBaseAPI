@@ -40,6 +40,10 @@ async def catalog_filters(
     coverage_state: Optional[List[str]] = Query(
         None, description="listed, in_progress, failed, none or excluded (repeat the key for several)"
     ),
+    coverage_any_platform: bool = Query(
+        False,
+        description="Every enabled platform, and one of them in a chosen state is enough",
+    ),
     value_min: Optional[float] = Query(None, ge=0),
     value_max: Optional[float] = Query(None, ge=0),
     in_stock: bool = Query(False, description="Only products with on-hand quantity"),
@@ -51,6 +55,9 @@ async def catalog_filters(
         None, description="images_pending, platforms_pending or listed"
     ),
     has_images: Optional[bool] = Query(None, description="Photography has images for the parent"),
+    images_edited: Optional[bool] = Query(
+        None, description="The editor has delivered for the parent's current shoot"
+    ),
     company: Optional[List[int]] = Query(
         None,
         description="SellerCloud company codes (repeat the key for several); a product matches any of them",
@@ -62,6 +69,7 @@ async def catalog_filters(
             search=(search or "").strip() or None,
             coverage_platform=coverage_platform or [],
             coverage_state=coverage_state or [],
+            coverage_any_platform=coverage_any_platform,
             value_min=value_min,
             value_max=value_max,
             in_stock=in_stock,
@@ -69,6 +77,7 @@ async def catalog_filters(
             listing_state=listing_state,
             listing_status=listing_status,
             has_images=has_images,
+            images_edited=images_edited,
             company=company or [],
             sort=sort,
         )
