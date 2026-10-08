@@ -1145,6 +1145,13 @@ class ImportSummary(BaseModel):
 
 class SubmissionsDashboardResponse(BaseModel):
     platform_id: str = Field(..., description="Platform identifier")
+    # Whether this platform has an export parser, so the dashboard knows to offer its
+    # Import control. It rides on the dashboard rather than on the import endpoints
+    # because those are new: a brand-new route 403s until it is registered with the auth
+    # service, which would hide the button exactly when someone is trying to find it.
+    import_supported: bool = Field(
+        False, description="This platform has an export parser (platform_export_parsers)"
+    )
     pending_count: int = Field(..., description="ListingSubmissions awaiting upload")
     processing_count: int = Field(..., description="ListingSubmissions in flight")
     failed_count: int = Field(..., description="ListingSubmissions in terminal failure")

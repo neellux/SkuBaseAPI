@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import openpyxl
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from models.api_models import (
@@ -22,6 +22,10 @@ from models.db_models import (
     ListingSubmission,
     SubmissionStatus,
 )
+from routes.batch_generation_routes import require_skubase_client
+from services import platform_export_parsers
+from services import platform_import_job_service
+from services import platform_reconcile_service
 from services import spo_service as spo_service_module
 from services.ebay_poller import ebay_poller
 from services.grailed_poller import grailed_poller
@@ -348,6 +352,7 @@ async def get_dashboard(
 
         return SubmissionsDashboardResponse(
             platform_id=platform,
+            import_supported=platform_export_parsers.has_parser(platform),
             pending_count=pending,
             processing_count=processing,
             failed_count=failed,
@@ -992,3 +997,347 @@ async def mark_images_uploaded(
         import_id, platform, len(completed_ids), len(failed_ids), user_id,
     )
     return _build_import_detail(platform, import_id, submissions)
+
+
+# --- Per-platform export import and reconcile --------------------------------------
+#
+# Plan: docs/plans/2026-10-05-1011-feat-platform-export-import-reconcile-plan.md (U4).
+# Five endpoints, query parameters only, manage_batches throughout. The operator uploads
+# the platform's own product export; SkuBase works out what the file says that its own
+# records do not, shows it for approval, and only then writes.
+#
+# Nothing here writes catalog data. A preview stages one job row holding the file's SKU
+# set (KTD1) and derives the plan fresh; approval hands it to PlatformReconcilePoller.
+
+
+def _import_user(request: Request) -> str:
+    return request.state.user["id"]
+
+
+async def _import_platform_or_404(platform: str) -> None:
+    """Refuse a platform with no parser, which is also what hides the UI control (R1)."""
+    await _get_platform_settings_for(platform)
+    if not platform_export_parsers.has_parser(platform):
+        raise HTTPException(
+            status_code=404, detail=f"No import parser for {platform}"
+        )
+
+
+def _job_view(job: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The job as the dashboard reads it. Deliberately omits skus: it is up to 3,399
+    strings and the dialog never shows them."""
+    if not job:
+        return None
+    return {
+        "id": job["id"],
+        "platform": job["platform_id"],
+        "status": job["status"],
+        "file_name": job.get("file_name"),
+        "counts": job.get("preview_counts"),
+        "progress": {
+            "total_parents": job.get("total_parents") or 0,
+            "processed_parents": job.get("processed_parents") or 0,
+            "listed": job.get("listed_count") or 0,
+            "delisted": job.get("delisted_count") or 0,
+            "repaired": job.get("repaired_count") or 0,
+            "refused": job.get("refused_count") or 0,
+        },
+        "results": job.get("results") or [],
+        "skipped": job.get("skipped") or [],
+        "error": job.get("error_message"),
+        "created_by": job.get("created_by"),
+        "created_at": job.get("created_at"),
+        "completed_at": job.get("completed_at"),
+    }
+
+
+def _cannot_act_on(plan: Any) -> dict[str, Any]:
+    """R11/AE7: everything the plan cannot act on, grouped by reason, with examples.
+
+    The preview and the result both need this, and the first draft of the plan had
+    nowhere to put it.
+    """
+    refusals: dict[str, list[str]] = {}
+    for parent in plan.refusals:
+        refusals.setdefault(parent.reason or "Refused", []).append(parent.parent_sku)
+    skips: dict[str, list[str]] = {}
+    for row in plan.skipped_rows:
+        skips.setdefault(row.get("reason") or "Skipped", []).append(row.get("value"))
+    detail = platform_reconcile_service.REASON_DETAIL
+    return {
+        "refusals": [
+            {
+                "reason": reason,
+                "detail": detail.get(reason),
+                "count": len(skus),
+                "examples": sorted(skus)[:5],
+            }
+            for reason, skus in sorted(refusals.items())
+        ],
+        "skipped": [
+            {
+                "reason": reason,
+                "detail": detail.get(reason),
+                "count": len(vals),
+                "examples": sorted(vals)[:5],
+            }
+            for reason, vals in sorted(skips.items())
+        ],
+    }
+
+
+async def _delist_rows(plan: Any) -> list[dict[str, Any]]:
+    """Every parent that would be delisted, with its sizes, title and brand.
+
+    The whole list, not a sample: the dialog searches it client side, so a cap would mean
+    "this SKU is not in the list" could be wrong. With prod's 8,719 parents and 39,753
+    sizes this is roughly 800KB of JSON before compression, which is acceptable for an
+    action an operator took deliberately. The dialog virtualises the rows so the DOM
+    stays small.
+
+    Sizes are label strings from child_products.size, never derived from the sku: a
+    parent sku can itself contain "/" (ESSX parents are ESSX/BRAND/SEASON/STYLE/COLOUR,
+    so ESSX/020-450/BLACK/S is size "S"), and 21 of the first 114 prod rows are that
+    shape. Only the label is sent because only the label is shown; dropping the per-size
+    sku roughly halves the payload.
+    """
+    rows = []
+    for parent in plan.parents:
+        if parent.outcome in (
+            platform_reconcile_service.DELIST_PARENT,
+            platform_reconcile_service.DELIST_SIZES,
+        ):
+            rows.append(
+                {
+                    "parent_sku": parent.parent_sku,
+                    "whole_parent": parent.outcome
+                    == platform_reconcile_service.DELIST_PARENT,
+                    "skus": parent.sizes,
+                    "sizes": [],
+                    "title": "",
+                    "brand": None,
+                }
+            )
+    if not rows:
+        return rows
+
+    parents = [row["parent_sku"] for row in rows]
+    pr = connections.get("product_db")
+
+    try:
+        titles = await pr.execute_query_dict(
+            "SELECT sku, title, brand FROM parent_products WHERE sku = ANY($1::text[])",
+            [parents],
+        )
+        by_parent = {r["sku"]: r for r in titles}
+        for row in rows:
+            found = by_parent.get(row["parent_sku"])
+            if found:
+                row["title"] = found.get("title") or ""
+                row["brand"] = found.get("brand")
+    except Exception:
+        # A title is decoration; the sku is the identity. Never fail a preview over it.
+        logger.warning("Could not read titles for the delist list", exc_info=True)
+
+    sizes_by_sku: dict[str, str] = {}
+    try:
+        child_rows = await pr.execute_query_dict(
+            "SELECT sku, size FROM child_products WHERE parent_sku = ANY($1::text[])",
+            [parents],
+        )
+        sizes_by_sku = {r["sku"]: r["size"] for r in child_rows if r.get("size")}
+    except Exception:
+        logger.warning("Could not read sizes for the delist list", exc_info=True)
+
+    for row in rows:
+        row["sizes"] = [sizes_by_sku.get(sku) or sku for sku in row.pop("skus")]
+
+    return rows
+
+
+async def _derive(platform: str, skus: list[str], skipped: list[dict[str, Any]]) -> Any:
+    state = await platform_reconcile_service.read_state(
+        platform_id=platform, file_skus=skus
+    )
+    return platform_reconcile_service.build_plan(
+        platform_id=platform, file_skus=skus, skipped_rows=skipped, **state
+    )
+
+
+@router.post("/import/preview", dependencies=[Depends(require_skubase_client)])
+async def preview_platform_import(
+    request: Request,
+    platform: str = Query(..., description="Platform identifier, e.g. 'spo'"),
+    file: UploadFile = File(..., description="The platform's own product export"),
+):
+    """Parse an export, stage it, and return what approving it would do.
+
+    Writes one job row and no catalog data.
+    """
+    await _import_platform_or_404(platform)
+    content = await file.read()
+    try:
+        parsed = platform_export_parsers.parse(platform, content, file.filename or "")
+    except platform_export_parsers.ExportRefused as exc:
+        # R6. Short enough for a snackbar; the diagnostics are already logged.
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    plan = await _derive(platform, parsed.skus, parsed.skipped)
+    counts = plan.counts()
+
+    job_id = await platform_import_job_service.create_staged(
+        platform_id=platform,
+        file_name=file.filename,
+        skus=parsed.skus,
+        skipped=parsed.skipped,
+        created_by=_import_user(request),
+    )
+    await platform_import_job_service.record_preview(
+        job_id,
+        preview_counts=counts,
+        total_parents=counts["delisted_parents"]
+        + counts["listed_parents"]
+        + counts["repairs"],
+    )
+
+    return {
+        "id": job_id,
+        "platform": platform,
+        "file_name": file.filename,
+        "file": parsed.summary(),
+        "counts": counts,
+        "delist_rows": await _delist_rows(plan),
+        "cannot_act_on": _cannot_act_on(plan),
+        "nothing_to_change": not any(p.writes for p in plan.parents) and not plan.repairs,
+    }
+
+
+@router.post("/import/approve", dependencies=[Depends(require_skubase_client)])
+async def approve_platform_import(
+    request: Request,
+    id: int = Query(..., description="Import job id from the preview"),
+):
+    """Hand an approved job to the poller. The run re-derives the plan and refuses to
+    act on more than these counts."""
+    job = await platform_import_job_service.get_job(id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import not found")
+    if job["status"] != "staged":
+        raise HTTPException(
+            status_code=409, detail=f"This import is already {job['status']}"
+        )
+    await platform_import_job_service.approve(id, _import_user(request))
+    return _job_view(await platform_import_job_service.get_job(id))
+
+
+@router.post("/import/cancel", dependencies=[Depends(require_skubase_client)])
+async def cancel_platform_import(
+    id: int = Query(..., description="Import job id"),
+):
+    """Discard a staged or approved job. A claimed one is left alone (R10)."""
+    job = await platform_import_job_service.get_job(id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import not found")
+    if not await platform_import_job_service.cancel(id):
+        raise HTTPException(
+            status_code=409, detail=f"This import is already {job['status']}"
+        )
+    return _job_view(await platform_import_job_service.get_job(id))
+
+
+@router.get("/import")
+async def get_platform_import(
+    id: Optional[int] = Query(None, description="Import job id"),
+    platform: Optional[str] = Query(None, description="Platform identifier"),
+):
+    """Status and progress, by job id or by platform.
+
+    The platform form is what lets the dashboard reopen a running or finished import
+    after the dialog is closed or the page reloaded (R20): the job id otherwise exists
+    only in the preview response. It also reports whether the platform has a parser at
+    all, which is what decides if the Import control shows (R1).
+    """
+    if id is None and not platform:
+        raise HTTPException(status_code=400, detail="Pass an id or a platform")
+    if id is not None:
+        job = await platform_import_job_service.get_job(id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Import not found")
+    else:
+        job = await platform_import_job_service.latest_for_platform(platform)
+
+    out = {
+        "import_supported": platform_export_parsers.has_parser(
+            job["platform_id"] if job else platform
+        ),
+        "job": _job_view(job),
+    }
+
+    # A staged job is one the operator has not answered yet, so reopening the dialog has
+    # to show the same thing they would have seen: the rows, not just the counts. The
+    # plan is re-derived rather than stored (KTD1), which also means a reopen reflects
+    # current data. Only 'staged' pays for this: the poll loop runs for pending and
+    # processing jobs, which never take this branch.
+    if job and job["status"] == "staged":
+        plan = await _derive(
+            job["platform_id"], job.get("skus") or [], job.get("skipped") or []
+        )
+        out["counts"] = plan.counts()
+        out["delist_rows"] = await _delist_rows(plan)
+        out["cannot_act_on"] = _cannot_act_on(plan)
+        out["nothing_to_change"] = (
+            not any(p.writes for p in plan.parents) and not plan.repairs
+        )
+
+    return out
+
+
+@router.post("/import/report", dependencies=[Depends(require_skubase_client)])
+async def download_platform_import_report(
+    id: int = Query(..., description="Import job id"),
+):
+    """The full before-and-after as a CSV, one row per child SKU (R9).
+
+    POST returning a blob, following /submissions/imports/error_template. The dialog
+    shows counts and a sample; this is where the thousands of rows live.
+    """
+    job = await platform_import_job_service.get_job(id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Import not found")
+
+    platform = job["platform_id"]
+    plan = await _derive(platform, job.get("skus") or [], job.get("skipped") or [])
+    in_file = set(job.get("skus") or [])
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        ["parent_sku", "child_sku", "in_file", "action", "reason", "previous_status"]
+    )
+    for parent in plan.parents:
+        for sku in parent.sizes or [""]:
+            writer.writerow(
+                [
+                    parent.parent_sku,
+                    sku,
+                    "yes" if sku in in_file else "no",
+                    parent.outcome,
+                    parent.reason or "",
+                    "",
+                ]
+            )
+    for repair in plan.repairs:
+        writer.writerow(
+            [repair.parent_sku, "", "yes", f"repair_{repair.outcome}", "",
+             repair.previous_status]
+        )
+    for row in plan.skipped_rows:
+        writer.writerow(["", row.get("value") or "", "yes", "skipped",
+                         row.get("reason") or "", ""])
+
+    name = f"import_{id}_{platform}_reconcile.csv"
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode()),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
