@@ -1,7 +1,7 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 from services.listing_options_service import listing_options_service
 from services.product_resolver import SkuResolutionError, resolve_parent
@@ -17,6 +17,9 @@ from models.api_models import (
     CountriesResponse,
     PlatformLink,
     PlatformLinksResponse,
+    ListingHistoryResponse,
+    PlatformDelistRequest,
+    PlatformDelistResponse,
     CreateSkuRequest,
     CreateSkuResponse,
     BulkAddSizesRequest,
@@ -51,6 +54,10 @@ from services.product_service import ProductService
 from services.sellercloud_service import sellercloud_service
 from services.grailed_service import COUNTRY_CODE_MAP
 from services import alias_bulk_import_job_service
+from services import platform_delist_service
+from services.platform_delist_service import DelistRefused
+from routes.batch_generation_routes import require_skubase_client
+from utils.load_app_data import add_user_data
 from config import config
 
 logger = logging.getLogger(__name__)
@@ -569,6 +576,116 @@ async def get_product_platform_links(
         logger.error(f"Error getting platform links for {sku}: {e}", exc_info=True)
         # Degrade to no links rather than failing: these are supplementary.
         return PlatformLinksResponse(success=True, parent_sku=None, links=[])
+
+
+# Listing history and the manual delist (platform_delist_service; plan KTD8). Named apart
+# from /internal_platforms/delist, which takes products down on Shop The Sample: these never
+# call a platform. The GET is registered like /products/details (view_catalog); the POSTs
+# under manage_batches, and they also require X-Requested-With: SkuBase.
+
+
+async def _parent_or_404(sku: str) -> str:
+    """The registered parent of a parent or child SKU. Never split by hand: parent SKUs can
+    contain "/" themselves."""
+    try:
+        return await resolve_parent(sku.strip())
+    except SkuResolutionError:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+
+def _refused(refused: DelistRefused) -> HTTPException:
+    """The service's refusal as the snackbar message; the service logged the diagnostics."""
+    return HTTPException(status_code=refused.status_code, detail=refused.message)
+
+
+async def _named_entry(entry: dict) -> dict:
+    return await add_user_data(entry, keys=["created_by", "restored_by"], new_keys=["name"])
+
+
+@router.get("/listing_history", response_model=ListingHistoryResponse)
+async def get_listing_history(
+    sku: str = Query(..., description="Product SKU (parent or child)"),
+):
+    """Where the product was submitted and listed on each platform, with its delists.
+
+    A child SKU gets its parent's history: presence and delists are per parent.
+    """
+    try:
+        parent_sku = await _parent_or_404(sku)
+        history = await platform_delist_service.get_history(parent_sku)
+        # open_delists are copies of timeline events, so both need names.
+        events = [
+            event
+            for platform in history["platforms"]
+            for event in (*platform["timeline"], *platform["open_delists"])
+        ]
+        await add_user_data(events, keys=["user_id"], new_keys=["name"])
+        return history
+    except DelistRefused as refused:
+        raise _refused(refused)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("listing_history: failed for %s", sku)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/platform_delist",
+    response_model=PlatformDelistResponse,
+    dependencies=[Depends(require_skubase_client)],
+)
+async def delist_from_platform(body: PlatformDelistRequest, request: Request):
+    """Record that a person took the product, or some sizes, down on a platform by hand.
+
+    Record-only: SkuBase stops treating those sizes as listed there, so the catalog and the
+    submit gate offer them again. Refused (409) while a submission to that platform is in
+    flight or awaiting action; SellerCloud, excluded and internal platforms never delist.
+    """
+    try:
+        parent_sku = await _parent_or_404(body.sku)
+        entry = await platform_delist_service.delist(
+            parent_sku,
+            body.platform_id,
+            body.child_skus,
+            body.comment,
+            request.state.user["id"],
+        )
+        return await _named_entry(entry)
+    except DelistRefused as refused:
+        raise _refused(refused)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "platform_delist: failed for %s on %s sizes=%s",
+            body.sku,
+            body.platform_id,
+            body.child_skus,
+        )
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/platform_delist/restore",
+    response_model=PlatformDelistResponse,
+    dependencies=[Depends(require_skubase_client)],
+)
+async def restore_platform_delist(
+    request: Request,
+    id: str = Query(..., description="Delist entry id"),
+):
+    """Undo one delist entry exactly, until the next submission to that platform."""
+    try:
+        entry = await platform_delist_service.restore(id, request.state.user["id"])
+        return await _named_entry(entry)
+    except DelistRefused as refused:
+        raise _refused(refused)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("platform_delist/restore: failed for %s", id)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/reassign/bulk/preview")

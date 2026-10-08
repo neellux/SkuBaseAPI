@@ -4,6 +4,7 @@ from typing import Any, Dict, List
 import uuid
 
 from tortoise import fields
+from tortoise.contrib.postgres.fields import ArrayField
 from tortoise.models import Model
 
 
@@ -1181,3 +1182,63 @@ class ExternalListingId(Model):
 
     def __str__(self):
         return f"ExternalListingId({self.platform_id}:{self.level}:{self.sku})"
+
+
+class PlatformDelist(Model):
+    """An operator took a parent, or some of its sizes, down on a platform by hand.
+
+    Append-only history, one entry per platform per delist: delisting more sizes later
+    adds another entry rather than widening an earlier one, so each entry can be
+    restored on its own. An entry is never edited except to mark it restored.
+
+    Whether an entry is OPEN is never stored. It is open until it is restored or an
+    attempt created after it is accepted by the platform, and the only definition of
+    that is the SQL function open_platform_delists() (migrations/add_platform_delists.sql).
+    Read it through that function; this model is for reading the history.
+
+    Like InternalPlatformSubmission, the entry carries its own rollback material: the
+    external_listing_ids rows it deleted and the ones it inserted, so Restore puts back
+    exactly what this entry changed.
+    """
+
+    id = fields.UUIDField(pk=True, default=uuid.uuid4)
+    platform_id = fields.CharField(
+        max_length=50,
+        description="Platform identifier (grailed, ebay, goat, spo, 1nventory). Never sellercloud",
+    )
+    # CharField over a TEXT column, as on ExternalListingId.
+    parent_sku = fields.CharField(
+        max_length=255,
+        description="The parent, matched against listings.product_id",
+    )
+    child_skus = ArrayField(
+        element_type="text",
+        null=True,
+        description="The child skus taken down, or NULL for the whole product",
+    )
+    comment = fields.TextField(
+        null=True, description="Optional operator note, 500 characters at most"
+    )
+    created_by = fields.CharField(max_length=100, description="User ID who recorded the delist")
+    created_at = fields.DatetimeField(
+        auto_now_add=True,
+        description="Only attempts created strictly after this can close the entry",
+    )
+    removed_rows = fields.JSONField(
+        default=list,
+        description="Pre-image of every external_listing_ids row this entry deleted",
+    )
+    inserted_rows = fields.JSONField(
+        default=list,
+        description="external_listing_ids rows this entry inserted when splitting a parent row",
+    )
+    restored_at = fields.DatetimeField(null=True)
+    restored_by = fields.CharField(max_length=100, null=True, description="User ID who restored it")
+
+    class Meta:
+        table = "platform_delists"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        scope = ",".join(self.child_skus) if self.child_skus else "all"
+        return f"PlatformDelist({self.platform_id}:{self.parent_sku}:{scope})"

@@ -1401,6 +1401,157 @@ class PlatformLinksResponse(BaseModel):
     error: Optional[str] = None
 
 
+# Product listing history and the manual delist (services/platform_delist_service.py, whose
+# module docstring is the payload's reference). Vocabularies below are the service's
+# constants; the four catalog ones share its ids so the UI reuses its labels.
+# No "delisted" row status: a delisted size is not listed. The size state keeps
+# "delisted" so the matrix knows which sizes a delist already took down.
+ListingHistoryRowStatus = Literal[
+    "excluded", "in_progress", "failed", "partially_listed", "listed", "none"
+]
+ListingHistorySizeState = Literal["listed", "delisted", "none"]
+
+
+class ListingHistorySize(BaseModel):
+
+    sku: str = Field(..., description="Child SKU")
+    size: str = Field(..., description="Size label")
+    active: bool = Field(
+        ...,
+        description=(
+            "False for an inactive child shown only because a platform still lists it or "
+            "an open delist covers it. Only active sizes count toward listed vs partially"
+        ),
+    )
+
+
+class ListingHistoryAttemptEvent(BaseModel):
+
+    kind: Literal["attempt"] = "attempt"
+    at: datetime = Field(..., description="When the attempt was created")
+    user_id: Optional[str] = Field(None, description="Who submitted it")
+    user_name: Optional[str] = None
+    submission_id: int
+    listing_id: str
+    batch_id: Optional[int] = None
+    batch_comment: Optional[str] = None
+    attempt_number: Optional[int] = None
+    status: Optional[str] = Field(None, description="listing_submissions.status")
+    platform_status: Optional[str] = None
+    reviewed: bool = Field(False, description="A failure someone marked reviewed")
+    accepted: bool = Field(False, description="The platform took it (would close a delist)")
+    error: Optional[str] = Field(None, description="First line of the error, at most 160 chars")
+    listed_at: Optional[datetime] = Field(
+        None, description="When it went live, if it shows as listed"
+    )
+    completed_at: Optional[datetime] = None
+
+
+class ListingHistoryDelistEvent(BaseModel):
+
+    kind: Literal["delist"] = "delist"
+    at: datetime = Field(..., description="When the delist was recorded")
+    user_id: Optional[str] = Field(None, description="Who recorded it")
+    user_name: Optional[str] = None
+    delist_id: str
+    comment: Optional[str] = None
+    child_skus: Optional[List[str]] = Field(None, description="Null means the whole product")
+    sizes: Optional[List[str]] = Field(None, description="Size labels of child_skus")
+    state: Literal["open", "relisted", "restored"]
+    can_restore: bool
+    restore_lock_reason: Optional[str] = Field(None, description="Why Restore is not offered")
+
+
+class ListingHistoryRestoreEvent(BaseModel):
+
+    kind: Literal["restore"] = "restore"
+    at: datetime = Field(..., description="When the delist was restored")
+    user_id: Optional[str] = Field(None, description="Who restored it")
+    user_name: Optional[str] = None
+    delist_id: str
+    child_skus: Optional[List[str]] = Field(None, description="Null means the whole product")
+    sizes: Optional[List[str]] = None
+
+
+ListingHistoryEvent = Annotated[
+    Union[ListingHistoryAttemptEvent, ListingHistoryDelistEvent, ListingHistoryRestoreEvent],
+    Field(discriminator="kind"),
+]
+
+
+class ListingHistoryPlatform(BaseModel):
+
+    platform_id: str
+    label: str
+    read_only: bool = Field(False, description="True for SellerCloud: shown, never delisted")
+    status: ListingHistoryRowStatus
+    excluded: bool = Field(
+        False,
+        description="Brand, product type or company excludes this platform for the "
+        "product. Independent of status: a platform can be excluded and still listed",
+    )
+    excluded_reasons: List[str] = Field(
+        default_factory=list, description="brand, company, product type"
+    )
+    listed_at: Optional[datetime] = None
+    listed_at_recorded: bool = Field(
+        False, description="listed_at comes from presence only: show Recorded as listed"
+    )
+    allow_partial_submit: bool = Field(
+        False, description="False means picking a size delists every size"
+    )
+    can_delist: bool
+    lock_reason: Optional[str] = Field(None, description="Why it cannot be delisted now")
+    lock_code: Optional[str] = Field(None, description="Refusal code behind lock_reason")
+    sizes: Dict[str, ListingHistorySizeState] = Field(
+        default_factory=dict, description="Child SKU -> state, for every SKU in sizes"
+    )
+    open_delists: List[ListingHistoryDelistEvent] = Field(
+        default_factory=list, description="Open delist entries, oldest first"
+    )
+    timeline: List[ListingHistoryEvent] = Field(
+        default_factory=list, description="Attempts, delists and restores, newest first"
+    )
+
+
+class ListingHistoryResponse(BaseModel):
+
+    parent_sku: str
+    sizes: List[ListingHistorySize] = Field(
+        default_factory=list, description="The matrix columns, in size order"
+    )
+    platforms: List[ListingHistoryPlatform] = Field(
+        default_factory=list, description="Enabled platforms, in app_settings order"
+    )
+
+
+class PlatformDelistRequest(BaseModel):
+
+    platform_id: str = Field(..., description="Platform the product was taken down on")
+    sku: str = Field(..., description="Product SKU (parent or child); the parent is delisted")
+    child_skus: Optional[List[str]] = Field(
+        None, description="Child SKUs taken down, or null for the whole product"
+    )
+    comment: Optional[str] = Field(
+        None, description="Optional note, up to 500 characters (checked by the service)"
+    )
+
+
+class PlatformDelistResponse(BaseModel):
+
+    id: str = Field(..., description="Delist entry id, what Restore takes")
+    platform_id: str
+    parent_sku: str
+    child_skus: Optional[List[str]] = Field(None, description="Null means the whole product")
+    comment: Optional[str] = None
+    created_by: Optional[str] = None
+    created_by_name: Optional[str] = None
+    created_at: Optional[datetime] = None
+    restored_at: Optional[datetime] = None
+    restored_by: Optional[str] = None
+    restored_by_name: Optional[str] = None
+
+
 class CreateSkuSize(BaseModel):
 
     size: str = Field(..., min_length=1, description="Size value")

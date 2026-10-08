@@ -31,7 +31,7 @@ from decimal import Decimal
 from models.db_models import AppSettings, ListingSubmission, SubmissionStatus
 from services.base_poller import BasePoller
 from services.ebay_service import (
-    IMPORT_WAIT_SECONDS,
+    JOB_WAIT_SECONDS,
     REVISE_CHUNK,
     ebay_service,
     render_tsv,
@@ -61,6 +61,39 @@ MID_BATCH_STEPS = frozenset(
      "listing_ids_read", "revise_sent"}
 )
 
+# The open eBay delists for a batch's parents, in one query (KTD6). Each entry carries what can
+# name the item id it ended: its pre-image, and the item_ids of every eBay attempt the platform
+# accepted before it, newest first. "Open" and "accepted" are the migration's own functions
+# (migrations/add_platform_delists.sql), never re-derived here.
+_OPEN_DELISTS_SQL = """
+SELECT d.parent_sku, d.child_skus, d.removed_rows,
+       COALESCE((
+           SELECT jsonb_agg(s.external_id -> 'item_ids' ORDER BY s.created_at DESC, s.id DESC)
+             FROM listings l
+             JOIN listing_submissions s ON s.listing_id = l.id
+            WHERE l.product_id = d.parent_sku
+              AND s.platform_id = d.platform_id
+              AND s.created_at < d.created_at
+              AND platform_delist_closing_attempt(s.status, s.platform_status, s.reviewed_at)
+              AND jsonb_typeof(s.external_id -> 'item_ids') = 'object'
+       ), '[]'::jsonb) AS attempt_item_ids
+  FROM open_platform_delists() d
+ WHERE d.platform_id = 'ebay'
+   AND d.parent_sku = ANY($1::text[])
+ ORDER BY d.created_at, d.id
+"""
+
+
+def _jsonb(value: Any) -> Any:
+    """A raw read hands JSONB back as text."""
+    return json.loads(value) if isinstance(value, str) else value
+
+
+def _item_id(value: Any) -> str | None:
+    """An eBay item id as text, or None where the export split would read "not listed"."""
+    text = str(value).strip() if value is not None else ""
+    return text if text and text != "0" else None
+
 
 class EbayPoller(BasePoller):
     name = "ebay_poller"
@@ -80,9 +113,9 @@ class EbayPoller(BasePoller):
 
         Submitting is driven by POST /submissions/create_batch and, once a day when
         platform_settings.ebay.scheduled_flush_days is set, by run_scheduled_check. That starts
-        the same batch in the background, so this cycle is not held for the up to ~17 minutes
-        a batch can take. What the cycle otherwise owns is what happens AFTER SellerCloud
-        accepts: publish jobs finish minutes to hours later, eBay item ids appear gradually as
+        the same batch in the background, so this cycle is not held while a batch waits on
+        SellerCloud's queue, which can be hours (JOB_WAIT_SECONDS). What the cycle otherwise
+        owns is what happens AFTER SellerCloud accepts: publish jobs finish minutes to hours later, eBay item ids appear gradually as
         it processes them, and neither event notifies anything. Measured on the 2026-08-25
         run, item ids went 222 -> 797 -> 1,074 over about an hour.
         """
@@ -292,6 +325,49 @@ class EbayPoller(BasePoller):
             logger.info("%s: left %d pending row(s) for a later batch, one per parent",
                         EbayPoller.name, len(pending_ids) - len(claimed))
         return claimed
+
+    @staticmethod
+    async def _delisted_children(
+        skus_by_parent: dict[str, list[str]], conn: Any
+    ) -> dict[str, str | None]:
+        """{child: the eBay item id its open delist ended, or None when none was recorded}.
+
+        For split_by_listing_id, which launches a delisted child while the export still
+        carries that id (KTD6). Only children this batch sends: an entry whose child_skus is
+        NULL is the whole product and covers every one of them. Empty when no parent has an
+        open eBay delist, the usual case, and the split is then exactly what it was before.
+
+        The ended id is the child's row in the entry's pre-image (removed_rows; a parent row
+        a per-size delist split is not a child's id), else the newest accepted eBay attempt
+        before the entry that recorded one for that child. Entries come oldest first and the
+        first id found wins: a whole-product delist made after a per-size one never saw the
+        rows the earlier one removed.
+        """
+        parents = sorted({parent for parent in skus_by_parent if parent})
+        if not parents:
+            return {}
+        entries = await conn.execute_query_dict(_OPEN_DELISTS_SQL, [parents])
+        ended: dict[str, str | None] = {}
+        for entry in entries:
+            skus = skus_by_parent.get(entry["parent_sku"]) or []
+            if entry.get("child_skus") is not None:
+                covered = set(entry["child_skus"])
+                skus = [sku for sku in skus if sku in covered]
+            removed = {
+                row.get("sku"): row.get("external_id")
+                for row in _jsonb(entry.get("removed_rows")) or []
+                if isinstance(row, dict) and row.get("level") == "child"
+            }
+            attempts = [
+                ids for ids in _jsonb(entry.get("attempt_item_ids")) or [] if isinstance(ids, dict)
+            ]
+            for sku in skus:
+                if ended.get(sku):
+                    continue
+                ended[sku] = _item_id(removed.get(sku)) or next(
+                    (found for ids in attempts if (found := _item_id(ids.get(sku)))), None
+                )
+        return ended
 
     async def run_batch(self, import_id: int, submission_ids: list[int]) -> dict[str, Any]:
         """The four SellerCloud round trips, for rows begin_batch already claimed.
@@ -700,6 +776,7 @@ class EbayPoller(BasePoller):
         current: dict[str, dict[str, str]],
         sku_owner: dict[str, int],
         jobs: dict[str, Any],
+        delisted: dict[str, str | None] | None = None,
     ) -> tuple[list[int], list[str]] | None:
         """Wait for the imports, revise children already on eBay, and return what is left.
 
@@ -710,6 +787,10 @@ class EbayPoller(BasePoller):
         resubmit refreshes what is live instead of launching it again ("already active on
         eBay"), and a partly listed parent can be finished: its listed sizes revise and the
         missing ones launch in the same attempt.
+
+        `delisted` is _delisted_children's answer: children an open eBay delist covers, with
+        the item id it ended. split_by_listing_id launches those while the export still
+        carries that id (KTD6). None or empty changes nothing.
         """
         await ListingSubmission.filter(
             id__in=sent_ids, status=SubmissionStatus.PROCESSING
@@ -730,7 +811,8 @@ class EbayPoller(BasePoller):
             )
             return None
         waited = await ebay_service.wait_for_jobs(
-            [job for job in (jobs.get("catalog"), jobs.get("specifics")) if job]
+            [job for job in (jobs.get("catalog"), jobs.get("specifics")) if job],
+            heartbeat=lambda: self._heartbeat(sent_ids),
         )
         await ListingSubmission.filter(
             id__in=sent_ids, status=SubmissionStatus.PROCESSING
@@ -740,14 +822,23 @@ class EbayPoller(BasePoller):
             await self._fail_rows(
                 sent_ids, jobs, "imports",
                 "SellerCloud imports still queued - nothing revised or published",
-                f"imports not finished after {IMPORT_WAIT_SECONDS}s: job(s) {', '.join(stuck)}",
+                f"imports not finished after {JOB_WAIT_SECONDS}s: job(s) {', '.join(stuck)}",
             )
             return None
 
         # 2. Which children are already on eBay, per submission. Recorded before any call,
         #    so settle, the image file and the dashboard read the split this attempt made
         #    rather than re-deriving it from a child list that may have changed since.
-        revise_map, launch_all = ebay_service.split_by_listing_id(current, catalog_skus)
+        revise_map, launch_all = ebay_service.split_by_listing_id(
+            current, catalog_skus, delisted
+        )
+        for sku in catalog_skus:
+            if delisted and sku in delisted:
+                logger.info(
+                    "%s: delisted %s goes to %s (export id %r, ended id %r)",
+                    self.name, sku, "revise" if sku in revise_map else "launch",
+                    ebay_service.export_listing_id(current, sku), delisted[sku],
+                )
         revise_by_sub: dict[int, dict[str, str]] = defaultdict(dict)
         launch_by_sub: dict[int, list[str]] = defaultdict(list)
         for sku, item_id in revise_map.items():
@@ -899,6 +990,8 @@ class EbayPoller(BasePoller):
         # a fault found after the export can be reported on the right row.
         fallback_oz: dict[str, Decimal] = {}
         sku_owner: dict[str, int] = {}
+        # Parent -> the children this batch sends for it, for the open-delist read.
+        skus_by_parent: dict[str, list[str]] = defaultdict(list)
 
         for sub in submissions:
             listing = sub.listing
@@ -926,6 +1019,7 @@ class EbayPoller(BasePoller):
                     for sku in listing_skus:
                         fallback_oz[sku] = type_oz
                 sku_owner.update({sku: sub.id for sku in listing_skus})
+                skus_by_parent[listing.product_id].extend(listing_skus)
 
         tsv = render_tsv(rows)
         logger.info(
@@ -979,6 +1073,13 @@ class EbayPoller(BasePoller):
                 self.name, len(orphan_ids), orphan_ids,
             )
 
+        # The open eBay delists, read before the first SellerCloud write so a failed read
+        # leaves these rows for the stale sweep to requeue: nothing has been sent. The answer
+        # still holds at the split: while these rows are in flight, a delist of their parent
+        # is refused (R12), a Restore is refused (an attempt exists since), and only this
+        # batch can bring the attempt that closes one.
+        delisted = await self._delisted_children(skus_by_parent, connections.get("default"))
+
         # Recorded IMMEDIATELY before the first write, and written by nothing else. That
         # makes the step a commitment marker: a row in PROCESSING without it provably never
         # reached SellerCloud, which is what lets recover_stale_processing requeue it safely
@@ -993,7 +1094,11 @@ class EbayPoller(BasePoller):
         try:
             # --- step 1: catalog info, export then diff then import ------------------
             catalog_skus = sorted({r[0] for r in rows})
-            current, export_job = await ebay_service.export_catalog_fields(catalog_skus)
+            # The export can sit in SellerCloud's queue for a long time, so the rows are kept
+            # fresh while it does: at `submitting` the stale sweep would fail them.
+            current, export_job = await ebay_service.export_catalog_fields(
+                catalog_skus, heartbeat=lambda: self._heartbeat(sent_ids)
+            )
             jobs["export"] = export_job
             await self._stage(sent_ids, "catalog_exported", jobs,
                               job=export_job, skus=len(catalog_skus))
@@ -1086,7 +1191,7 @@ class EbayPoller(BasePoller):
         if ok:
             try:
                 remaining = await self._revise_listed(
-                    sent_ids, catalog_skus, current, sku_owner, jobs
+                    sent_ids, catalog_skus, current, sku_owner, jobs, delisted
                 )
             except Exception as exc:  # noqa: BLE001 - recorded on the rows, not swallowed
                 # Nothing has been launched yet, and any revise call already made is on its

@@ -89,18 +89,24 @@ class ExternalListingService:
         allow_resubmit: bool,
         has_external_id: bool,
         manual_fallback: bool = False,
+        open_delist: bool = False,
     ) -> str | None:
         """None to submit, otherwise the reason this platform is skipped.
 
         Pure, so it can be table-tested. API/tests/ cannot import route modules
         (pyproject scopes pytest to tests/ because importing one used to fire a
         live authenticated PUT), so the decision lives here and the route calls
-        it.
+        it, once per platform, with inputs read under the per-product lock.
 
         Order matters. The in-flight reasons come FIRST and keep precedence over
         already_listed, so the pill tooltip names what is actually happening: a
         platform mid-submit is not "already listed", it is busy, and telling an
         operator otherwise sends them to the wrong screen.
+
+        open_delist: an operator took the parent down on this platform by hand
+        (platform_delists, open per open_platform_delists()). It overrides the
+        two "it is on the platform" answers and nothing else (KTD4): an attempt
+        in flight or awaiting action is a fact about now, not about the past.
         """
         if latest_status in _IN_FLIGHT_STATUSES:
             return SKIP_IN_FLIGHT
@@ -110,19 +116,26 @@ class ExternalListingService:
         if latest_status == SKIP_AWAITING_ACTION:
             return SKIP_AWAITING_ACTION
 
-        if platform_id in NEVER_GATED:
-            return None
-
         if allow_resubmit:
             return None
 
+        # Taken down since, so posting it again is a relist, not a duplicate.
+        if open_delist:
+            return None
+
+        # Before NEVER_GATED on purpose: the route has always skipped a successful
+        # row on any platform whose allow_resubmit is false, sellercloud included,
+        # and the pill locks it the same way. The exemption is from presence only.
         if latest_status == "success":
             return SKIP_NO_RESUBMIT
 
-        # New: no successful row on THIS listing, but the parent is demonstrably
-        # on the platform. Blocks regardless of what the row says, including a
-        # failed one, because posting again would duplicate. The escape hatches
-        # are deleting the row or flipping allow_resubmit.
+        if platform_id in NEVER_GATED:
+            return None
+
+        # No successful row on THIS listing, but the parent is demonstrably on the
+        # platform. Blocks regardless of what the row says, including a failed
+        # one, because posting again would duplicate. The escape hatches are
+        # delisting it from the product page or flipping allow_resubmit.
         if has_external_id:
             return SKIP_ALREADY_LISTED
 
@@ -132,42 +145,109 @@ class ExternalListingService:
     def gated_platforms(
         already_listed: Iterable[str],
         platform_settings: dict[str, Any],
+        open_delists: Iterable[str] = (),
     ) -> set[str]:
         """The platforms an external id actually blocks, for this submit.
 
         Split out from gate_decision because the mapping 422 chain needs it
         before any submission row is looked at: a platform we are not going to
-        submit must not 422 the operator into fixing its brand mapping.
+        submit must not 422 the operator into fixing its brand mapping. A
+        platform with an open delist is going to be submitted, so it is not
+        gated, the same answer gate_decision gives.
         """
+        delisted = set(open_delists)
         return {
             p
             for p in already_listed
             if p not in NEVER_GATED
+            and p not in delisted
             and not platform_settings.get(p, {}).get("allow_resubmit", True)
         }
 
     @staticmethod
-    async def platforms_for_parent(parent_sku: str | None) -> set[str]:
-        """Which platforms claim this parent. One index hit on
-        idx_external_listing_ids_gate."""
+    async def _platform_ids(sql: str, parent_sku: str | None, conn: Any, what: str) -> set[str]:
+        """DISTINCT platform_id rows for one parent, for the gate.
+
+        Without `conn`, a read failure must not 500 a submit, so it falls back to
+        "nothing": for presence that restores the gate as it was before
+        external_listing_ids, and for delists it gates MORE, since nothing is
+        lifted. Either way a duplicate post is recoverable and a blocked submit
+        with no explanation is not. This is the early read that only narrows the
+        mapping gates.
+
+        With `conn` it is the submit's authoritative read, on its transaction
+        under the per-product lock, and it raises: Postgres has already aborted
+        the transaction on the failed statement, so there is nothing left to
+        fall back to.
+        """
         if not parent_sku:
             return set()
+        if conn is not None:
+            rows = await conn.execute_query_dict(sql, [parent_sku])
+            return {r["platform_id"] for r in rows}
+        try:
+            rows = await connections.get("default").execute_query_dict(sql, [parent_sku])
+        except Exception:
+            logger.exception("%s lookup failed for %s; gate skipped", what, parent_sku)
+            return set()
+        return {r["platform_id"] for r in rows}
+
+    @staticmethod
+    async def platforms_for_parent(parent_sku: str | None, conn: Any = None) -> set[str]:
+        """Which platforms claim this parent. One index hit on
+        idx_external_listing_ids_gate. See _platform_ids for `conn`."""
+        return await ExternalListingService._platform_ids(
+            "SELECT DISTINCT platform_id FROM external_listing_ids WHERE parent_sku = $1",
+            parent_sku,
+            conn,
+            "external_listing_ids",
+        )
+
+    @staticmethod
+    async def open_delist_platforms(parent_sku: str | None, conn: Any = None) -> set[str]:
+        """Platforms with an open delist for this parent: gate_decision's open_delist.
+        open_platform_delists() is the only definition of open; never re-derive it.
+        See _platform_ids for `conn`."""
+        return await ExternalListingService._platform_ids(
+            "SELECT DISTINCT platform_id FROM open_platform_delists() WHERE parent_sku = $1",
+            parent_sku,
+            conn,
+            "platform_delists",
+        )
+
+    @staticmethod
+    async def open_delists_for_parent(parent_sku: str | None) -> dict[str, list[dict[str, Any]]]:
+        """{platform_id: [open entry, oldest first]} for the Listing view, where an
+        open delist unlocks the platform pill. Several entries per platform are
+        normal: delisting more sizes later adds an entry rather than widening one.
+
+        child_skus None means the whole product. Best effort, like
+        coverage_for_parent: the caller is polled, so a failure drops the entries,
+        not the poll.
+        """
+        if not parent_sku:
+            return {}
         try:
             rows = await connections.get("default").execute_query_dict(
-                "SELECT DISTINCT platform_id FROM external_listing_ids "
-                "WHERE parent_sku = $1",
+                "SELECT id::text AS id, platform_id, child_skus, created_at "
+                "FROM open_platform_delists() WHERE parent_sku = $1 "
+                "ORDER BY platform_id, created_at, id",
                 [parent_sku],
             )
         except Exception:
-            # Read failure must not 500 a submit. Falling back to "nothing is
-            # claimed" restores exactly today's behaviour, which is the safe
-            # direction: a duplicate post is recoverable, a blocked submit with
-            # no explanation is not.
-            logger.exception(
-                "external_listing_ids lookup failed for %s; gate skipped", parent_sku
+            logger.exception("open delists lookup failed for %s", parent_sku)
+            return {}
+        out: dict[str, list[dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["platform_id"], []).append(
+                {
+                    "id": r["id"],
+                    "platform_id": r["platform_id"],
+                    "child_skus": list(r["child_skus"]) if r["child_skus"] else None,
+                    "created_at": r["created_at"],
+                }
             )
-            return set()
-        return {r["platform_id"] for r in rows}
+        return out
 
     # A latest attempt in one of these is still on its way to the platform.
     SIBLING_IN_FLIGHT_STATUSES = ("queued", "pending", "processing", "awaiting_action")

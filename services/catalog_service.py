@@ -58,7 +58,7 @@ OUTER_SORTS = {
 SUMMARY_CACHE_SECONDS = 60
 PLATFORMS_CACHE_SECONDS = 60
 
-# What "is this parent on this platform" means, in two shapes that must agree:
+# What "is this parent on this platform" means, in the forms below, which must agree:
 #
 # - Excluded: its brand, product type or company excludes the platform (exclusions_for).
 #   Wins over everything below, as it does on the listing view, and never counts as None.
@@ -68,26 +68,51 @@ PLATFORMS_CACHE_SECONDS = 60
 #   listings.
 # - None: neither.
 #
+# An open delist (open_platform_delists(), the one definition) overrides only Listed (KTD4):
+# while one is open, neither the presence rows nor a success counts, and only attempts made
+# after the newest open entry are considered, so the answer is In progress or Failed from a
+# relist, else None. Presence rows a per-size delist left for the other sizes therefore do
+# not hide a relist in flight (AE7). A success after the entry that did not close it (a GOAT
+# denial, a reviewed failure) reads None. An exclusion still wins over all of it.
+#
 # coverage_state_sql is the per-row form, used for the pills on one page of rows; the
 # excluded case is applied in Python afterwards, from the cache.
 # COVERAGE_CTE is the set form, used to filter the whole catalog: evaluating the per-row
 # form for every one of ~42k parents took seconds, while the set form is two small scans.
-_COVERAGE_TEMPLATE = """CASE
-  WHEN EXISTS (
+# LISTING_STATE_CTE.listed_all is a third form, of Listed only. All three must agree.
+_COVERAGE_TEMPLATE = """(SELECT CASE
+  WHEN od.since IS NULL AND EXISTS (
       SELECT 1 FROM external_listing_ids e
        WHERE e.platform_id = {platform} AND e.parent_sku = {sku}
   ) THEN 'listed'
   ELSE COALESCE((
       SELECT CASE WHEN s.status IN ('queued', 'pending', 'processing', 'awaiting_action') THEN 'in_progress'
-                  WHEN s.status = 'success' THEN 'listed'
+                  WHEN s.status = 'success' AND od.since IS NULL THEN 'listed'
                   WHEN s.status = 'failed' THEN 'failed' END
         FROM listings l
         JOIN listing_submissions s ON s.listing_id = l.id
        WHERE l.product_id = {sku} AND s.platform_id = {platform}
+         AND (od.since IS NULL OR s.created_at > od.since)
        ORDER BY l.created_at DESC, s.attempt_number DESC
        LIMIT 1
   ), 'none')
-END"""
+END
+  FROM (SELECT max(d.created_at) AS since
+          FROM {delists} d
+         WHERE d.platform_id = {platform} AND d.parent_sku = {sku}) od)"""
+
+# open_platform_delists() is inlined, whole, wherever it is named: a scan of platform_delists
+# and an anti-join over listings and listing_submissions. Named once per form, a page query
+# carried three copies, and the queries that already cross jit_above_cost (Platforms pending,
+# several coverage platforms) JIT-compile every copy. Measured on prod's heaviest filter:
+# 229 functions before delists, 327 with three copies, 289 with this one. So a catalog query
+# reads the function once, here, and every form reads this.
+OPEN_DELISTS_CTE = """open_delists AS MATERIALIZED (
+    -- Each platform and parent with an open delist, and its newest open entry.
+    SELECT parent_sku, platform_id, max(created_at) AS created_at
+      FROM open_platform_delists()
+     GROUP BY parent_sku, platform_id
+)"""
 
 # Why a platform is excluded for a product: the rules listing_required_platforms applies to
 # a listing. A brand or product type (its value or an alias, case-insensitive) whose record
@@ -102,20 +127,27 @@ COVERAGE_CTE = """excl AS (
     SELECT sku, platform_id FROM excl_pairs WHERE platform_id = ANY({platforms})
 ),
 cov_listing AS (
+    -- open_delists (OPEN_DELISTS_CTE): while a delist is open nothing reads listed and only
+    -- attempts after its newest entry count (KTD4, see _COVERAGE_TEMPLATE).
     SELECT COALESCE(e.parent_sku, ls.product_id) AS sku,
            COALESCE(e.platform_id, ls.platform_id) AS platform_id,
            CASE WHEN e.parent_sku IS NOT NULL THEN 'listed'
                 WHEN ls.status IN ('queued', 'pending', 'processing', 'awaiting_action') THEN 'in_progress'
-                WHEN ls.status = 'success' THEN 'listed'
+                WHEN ls.status = 'success' AND ls.since IS NULL THEN 'listed'
                 WHEN ls.status = 'failed' THEN 'failed'
                 ELSE 'none' END AS state
-      FROM (SELECT DISTINCT parent_sku, platform_id FROM external_listing_ids
-             WHERE platform_id = ANY({platforms})) e
+      FROM (SELECT DISTINCT x.parent_sku, x.platform_id FROM external_listing_ids x
+             WHERE x.platform_id = ANY({platforms})
+               AND NOT EXISTS (SELECT 1 FROM open_delists d
+                                WHERE d.parent_sku = x.parent_sku AND d.platform_id = x.platform_id)) e
       FULL JOIN (
-          SELECT DISTINCT ON (l.product_id, s.platform_id) l.product_id, s.platform_id, s.status
+          SELECT DISTINCT ON (l.product_id, s.platform_id)
+                 l.product_id, s.platform_id, s.status, d.created_at AS since
             FROM listing_submissions s
             JOIN listings l ON l.id = s.listing_id
+            LEFT JOIN open_delists d ON d.parent_sku = l.product_id AND d.platform_id = s.platform_id
            WHERE s.platform_id = ANY({platforms})
+             AND (d.created_at IS NULL OR s.created_at > d.created_at)
            ORDER BY l.product_id, s.platform_id, l.created_at DESC, s.attempt_number DESC
       ) ls ON ls.product_id = e.parent_sku AND ls.platform_id = e.platform_id
 ),
@@ -128,21 +160,27 @@ cov AS (
       FULL JOIN cov_listing l ON l.sku = x.sku AND l.platform_id = x.platform_id
 ),
 cov_match AS (
-    -- One row per product with coverage on any picked platform: is every picked platform in
-    -- a chosen state? A picked platform with no row in cov is "none" for that product.
+    -- One row per product with coverage on any picked platform: are enough of the picked
+    -- platforms in a chosen state? Every one of them, or with coverage_any_platform at
+    -- least one ({enough}, from coverage_join). A picked platform with no row in cov is
+    -- "none" for that product.
     SELECT sku,
            count(*) FILTER (WHERE state = ANY({states}))
              + CASE WHEN 'none' = ANY({states}) THEN cardinality({platforms}) - count(*) ELSE 0 END
-             = cardinality({platforms}) AS ok
+             {enough} AS ok
       FROM cov
      GROUP BY sku
 )"""
 
 
-def coverage_state_sql(platform: str, sku: str = "c.sku") -> str:
-    """The per-row coverage CASE for one platform. Both arguments are SQL expressions (a
-    bound placeholder or a column name), never request text."""
-    return _COVERAGE_TEMPLATE.format(platform=platform, sku=sku)
+def coverage_state_sql(
+    platform: str, sku: str = "c.sku", delists: str = "open_platform_delists()"
+) -> str:
+    """The per-row coverage CASE for one platform. `platform` and `sku` are SQL expressions (a
+    bound placeholder or a column name), never request text. `delists` is where the open
+    delists come from: the function itself, or open_delists in a query that has
+    OPEN_DELISTS_CTE."""
+    return _COVERAGE_TEMPLATE.format(platform=platform, sku=sku, delists=delists)
 
 
 async def coverage_for_product(sku: Optional[str], platforms: Sequence[str]) -> Dict[str, str]:
@@ -207,20 +245,28 @@ LISTING_STATE_CTE = """excl_all AS (
 ),
 listed_all AS (
     -- "Listed" exactly as the tiles mean it: an external id, or a latest submission that
-    -- succeeded. Keep in step with cov_listing in COVERAGE_CTE.
-    SELECT DISTINCT parent_sku AS sku, platform_id
-      FROM external_listing_ids
-     WHERE platform_id = ANY({platforms})
-    UNION
-    SELECT ls.product_id, ls.platform_id
+    -- succeeded, and never while a delist is open (the tiles cannot read listed then).
+    -- Keep in step with cov_listing in COVERAGE_CTE.
+    SELECT u.sku, u.platform_id
       FROM (
-          SELECT DISTINCT ON (l.product_id, s.platform_id) l.product_id, s.platform_id, s.status
-            FROM listing_submissions s
-            JOIN listings l ON l.id = s.listing_id
-           WHERE s.platform_id = ANY({platforms})
-           ORDER BY l.product_id, s.platform_id, l.created_at DESC, s.attempt_number DESC
-      ) ls
-     WHERE ls.status = 'success'
+          SELECT DISTINCT parent_sku AS sku, platform_id
+            FROM external_listing_ids
+           WHERE platform_id = ANY({platforms})
+          UNION
+          SELECT ls.product_id, ls.platform_id
+            FROM (
+                SELECT DISTINCT ON (l.product_id, s.platform_id) l.product_id, s.platform_id, s.status
+                  FROM listing_submissions s
+                  JOIN listings l ON l.id = s.listing_id
+                 WHERE s.platform_id = ANY({platforms})
+                 ORDER BY l.product_id, s.platform_id, l.created_at DESC, s.attempt_number DESC
+            ) ls
+           WHERE ls.status = 'success'
+      ) u
+     WHERE NOT EXISTS (
+         SELECT 1 FROM open_delists d
+          WHERE d.parent_sku = u.sku AND d.platform_id = u.platform_id
+     )
 ),
 listing_state AS (
     -- Only for products that have an exclusion or a listing: those are the only ones whose
@@ -459,8 +505,11 @@ def exclusion_pairs_cte(params: List[Any], pairs: Tuple[List[str], List[str]]) -
 
 
 def coverage_filter_on(filters: CatalogFilters) -> bool:
-    """A coverage filter needs both a platform and a state; either alone filters nothing."""
-    return bool(filters.coverage_platform and filters.coverage_state)
+    """A coverage filter needs both a platform and a state; either alone filters nothing.
+    coverage_any_platform stands in for the platforms: it means every enabled one."""
+    return bool(
+        (filters.coverage_platform or filters.coverage_any_platform) and filters.coverage_state
+    )
 
 
 def listing_state_on(filters: CatalogFilters) -> bool:
@@ -470,7 +519,7 @@ def listing_state_on(filters: CatalogFilters) -> bool:
 
 def listing_state_join(params: List[Any], enabled: List[str]) -> Tuple[str, str, str]:
     """(CTEs, JOIN, platforms placeholder) for the quick filters, binding the enabled
-    platforms. Refers to excl_pairs, which must come first in the WITH.
+    platforms. Refers to excl_pairs and open_delists, which must come first in the WITH.
 
     The placeholder comes back because build_catalog_where needs it: a product with no
     listing_state row is eligible on every enabled platform, and that default is
@@ -485,23 +534,31 @@ def listing_state_join(params: List[Any], enabled: List[str]) -> Tuple[str, str,
     )
 
 
-def coverage_join(params: List[Any], filters: CatalogFilters) -> Tuple[str, str]:
+def coverage_join(
+    params: List[Any], filters: CatalogFilters, enabled: Sequence[str] = ()
+) -> Tuple[str, str]:
     """(CTEs, JOIN) for a coverage filter, or ("", "") without one. Binds the platforms, then
     the states.
 
     Several platforms combine with AND: a product matches only when every picked platform is
-    in one of the chosen states. The CTEs refer to excl_pairs, which must come first in the
-    WITH. Call before build_catalog_where: the CTEs' placeholders must be numbered first.
+    in one of the chosen states. coverage_any_platform is the other form: the platforms are
+    every enabled one (`enabled`, whatever coverage_platform holds) and they combine with OR,
+    so one of them in a chosen state is enough.
+
+    The CTEs refer to excl_pairs and open_delists, which must come first in the WITH. Call
+    before build_catalog_where: the CTEs' placeholders must be numbered first.
     """
     if not coverage_filter_on(filters):
         return "", ""
+    picked = enabled if filters.coverage_any_platform else filters.coverage_platform
     # Deduplicated, since cardinality() of the bound array is the number that must match.
-    params.append(list(dict.fromkeys(filters.coverage_platform)))
+    params.append(list(dict.fromkeys(picked)))
     platforms = f"${len(params)}::text[]"
     params.append(list(filters.coverage_state))
     states = f"${len(params)}::text[]"
+    enough = "> 0" if filters.coverage_any_platform else f"= cardinality({platforms})"
     return (
-        COVERAGE_CTE.format(platforms=platforms, states=states),
+        COVERAGE_CTE.format(platforms=platforms, states=states, enough=enough),
         "LEFT JOIN cov_match cm ON cm.sku = c.sku",
     )
 
@@ -525,10 +582,11 @@ def build_catalog_where(
         params.append(value)
         return f"${len(params)}"
 
-    if filters.coverage_platform and filters.coverage_state:
+    if coverage_filter_on(filters):
         # cov_match answers for products with coverage on some picked platform. A product
         # with none is "none" on every one of them, so it matches exactly when "none" is a
-        # chosen state. A fixed literal, never request text.
+        # chosen state, whether every platform has to match or only one. A fixed literal,
+        # never request text.
         none_chosen = "none" in filters.coverage_state
         clauses.append("COALESCE(cm.ok, TRUE)" if none_chosen else "COALESCE(cm.ok, FALSE)")
 
@@ -568,6 +626,12 @@ def build_catalog_where(
         clauses.append("im.parent_sku IS NOT NULL")
     elif filters.has_images is False:
         clauses.append("im.parent_sku IS NULL")
+
+    # No mirror row reads NULL, so a product with no images at all is "not edited" too.
+    if filters.images_edited is True:
+        clauses.append("im.edited IS TRUE")
+    elif filters.images_edited is False:
+        clauses.append("im.edited IS NOT TRUE")
 
     return "\n  AND ".join(clauses)
 
@@ -725,34 +789,39 @@ async def _filter_parts(
     snap: Snapshot,
     index: RuleIndex,
     enabled: Optional[List[str]] = None,
+    tiles: bool = False,
 ) -> Tuple[List[str], str, Optional[str]]:
     """(CTEs, JOIN fragments) for one request, binding in the order the SQL expects: the
     driving SKU array, then the exclusion pairs, then the coverage filter, then the quick
     filter.
 
     The exclusion pairs are bound only when a filter reads them. A page's own tiles no
-    longer need them in SQL: 50 rows are resolved from the cache in Python.
+    longer need them in SQL: 50 rows are resolved from the cache in Python. open_delists
+    (which binds nothing) is added when a filter or the page's tiles (`tiles`) read it.
     """
     ctes: List[str] = [catalog_cte(params, skus)]
     joins: List[str] = []
     needs_state = listing_state_on(filters)
     needs_coverage = coverage_filter_on(filters)
+    any_platform = needs_coverage and filters.coverage_any_platform
+    if enabled is None and (needs_state or any_platform):
+        enabled = await enabled_platforms()
     if needs_coverage or needs_state:
         platforms: Set[str] = set()
         if needs_coverage:
-            platforms.update(filters.coverage_platform)
+            platforms.update(enabled if any_platform else filters.coverage_platform)
         if needs_state:
-            platforms.update(enabled if enabled is not None else await enabled_platforms())
+            platforms.update(enabled)
         ctes.append(exclusion_pairs_cte(params, exclusion_pairs(snap, index, platforms)))
-    cov_ctes, cov_join = coverage_join(params, filters)
+    if needs_coverage or needs_state or tiles:
+        ctes.append(OPEN_DELISTS_CTE)
+    cov_ctes, cov_join = coverage_join(params, filters, enabled or ())
     if cov_ctes:
         ctes.append(cov_ctes)
         joins.append(cov_join)
     state_param: Optional[str] = None
     if needs_state:
-        state_ctes, state_join, state_param = listing_state_join(
-            params, enabled if enabled is not None else await enabled_platforms()
-        )
+        state_ctes, state_join, state_param = listing_state_join(params, enabled)
         ctes.append(state_ctes)
         joins.append(state_join)
     return ctes, "\n".join(joins), state_param
@@ -816,7 +885,7 @@ async def get_page(filters: CatalogFilters, page: int, page_size: int) -> List[D
 
     params: List[Any] = []
     ctes, joins, state_param = await _filter_parts(
-        params, filters, skus=skus, snap=snap, index=index, enabled=enabled
+        params, filters, skus=skus, snap=snap, index=index, enabled=enabled, tiles=True
     )
     where = build_catalog_where(params, filters, state_param)
     order = CATALOG_SORTS[filters.sort]
@@ -866,7 +935,7 @@ SELECT page.*, cx.coverage, ln.listing_id, ln.listing_in_progress
   ) ln ON true
   LEFT JOIN LATERAL (
       SELECT COALESCE(jsonb_object_agg(
-                 p.platform_id, {coverage_state_sql('p.platform_id', 'page.sku')}
+                 p.platform_id, {coverage_state_sql('p.platform_id', 'page.sku', 'open_delists')}
              ), '{{}}'::jsonb) AS coverage
         FROM unnest({platforms_param}) AS p(platform_id)
   ) cx ON true

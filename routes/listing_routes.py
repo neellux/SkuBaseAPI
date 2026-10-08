@@ -40,7 +40,13 @@ from exceptions.submission_exceptions import SellerCloudSubmitError
 from models.db_models import AppSettings, Listing, ListingSubmission
 from services.batch_service import DEFAULT_BATCH_SORT, BatchService
 from services.ebay_aspect_service import ebay_aspect_service
-from services.external_listing_service import ExternalListingService
+from services.external_listing_service import (
+    SKIP_ALREADY_LISTED,
+    SKIP_AWAITING_ACTION,
+    SKIP_IN_FLIGHT,
+    SKIP_NO_RESUBMIT,
+    ExternalListingService,
+)
 from services.ebay_service import (
     ebay_service,
     EbayService,
@@ -50,6 +56,7 @@ from services.ebay_service import (
 from services.grailed_service import grailed_service
 from services.listing_options_service import listing_options_service
 from services.listing_service import ListingService
+from services.platform_delist_service import SUBMIT_LOCK_SQL
 from services.product_info_service import ProductInfoService
 from services import catalog_service, product_queue_service
 from services.product_resolver import SkuResolutionError, resolve_parent
@@ -646,12 +653,25 @@ async def get_submission_status(
     # Excluded platforms are dropped the same way they are dropped from
     # `platforms` above: a platform this listing's brand or type is excluded from
     # is not part of the listing, whatever the presence table says.
+    #
+    # Open manual delists per platform, oldest first: {pid: [{id, platform_id,
+    # child_skus (None: the whole product), created_at}]}. An open one lifts the
+    # submit gate's already-listed answers for that platform (gate_decision), so
+    # the pill unlocks on it. Excluded platforms dropped, as above. Best effort.
+    # Both reads are independent, so they run together on this polled endpoint.
+    coverage_raw, open_delists_raw = await asyncio.gather(
+        ExternalListingService.coverage_for_parent(listing_model.product_id),
+        ExternalListingService.open_delists_for_parent(listing_model.product_id),
+    )
     external_listings = {
         pid: {**detail,
               "allow_resubmit": platform_settings.get(pid, {}).get("allow_resubmit", True)}
-        for pid, detail in (
-            await ExternalListingService.coverage_for_parent(listing_model.product_id)
-        ).items()
+        for pid, detail in coverage_raw.items()
+        if pid not in excluded_platforms
+    }
+    open_delists = {
+        pid: entries
+        for pid, entries in open_delists_raw.items()
         if pid not in excluded_platforms
     }
 
@@ -679,6 +699,7 @@ async def get_submission_status(
         # in lux_products_2 and this endpoint is polled every 1.5s.
         "external_listings": external_listings,
         "catalog_coverage": catalog_coverage,
+        "open_delists": open_delists,
     }
 
 
@@ -865,10 +886,18 @@ async def submit_listing(
     # exists, so folding this into `excluded` further down would still 422 an
     # operator into fixing a Grailed brand mapping for a submit Grailed is not
     # part of.
+    #
+    # An open delist takes a platform out of `gated`: it is going to be
+    # submitted, so its mappings must be checked. This read only narrows the
+    # gates. The decision is made again under the lock below (KTD5), because a
+    # Delist or Restore can commit in between.
     already_listed = await ExternalListingService.platforms_for_parent(
         listing.product_id
     )
-    gated = ExternalListingService.gated_platforms(already_listed, platform_settings)
+    delisted = await ExternalListingService.open_delist_platforms(listing.product_id)
+    gated = ExternalListingService.gated_platforms(
+        already_listed, platform_settings, delisted
+    )
 
     # NOT narrowed: `platforms`. It still drives the row-creation loop below,
     # where the per-platform skip lives, and it is what both `return`s echo back
@@ -1084,16 +1113,35 @@ async def submit_listing(
             )
 
     submission_records = {}
+    # Platforms presence gates as of the read under the lock. With `gated` it
+    # decides which of the two 409s an empty submit gets.
+    gated_now: set = set()
     try:
         async with in_transaction("default") as conn:
             # One submit per product at a time. The in-flight check below reads OTHER
             # listings' rows, so two sibling submits running together would each miss the
             # other's uncommitted row and both post. Taken first, and no trigger takes it.
+            # Delist and Restore take the same key, so all three share SUBMIT_LOCK_SQL.
             await conn.execute_query(
-                "SELECT pg_advisory_xact_lock(hashtext('listing_submit'), hashtext($1))",
+                SUBMIT_LOCK_SQL,
                 [listing_model.product_id or str(listing_id)],
             )
             await Listing.select_for_update().using_db(conn).get(id=listing_id)
+
+            # Presence and open delists again, on this transaction, AFTER the lock
+            # (KTD5). These reads decide; the ones before the mapping gates only
+            # narrowed them. A Restore that committed while this submit waited for the
+            # lock is visible here, so the platform it restored is skipped rather than
+            # posted a second time. Raises on failure: the transaction is aborted then.
+            listed_now = await ExternalListingService.platforms_for_parent(
+                listing_model.product_id, conn=conn
+            )
+            delisted_now = await ExternalListingService.open_delist_platforms(
+                listing_model.product_id, conn=conn
+            )
+            gated_now = ExternalListingService.gated_platforms(
+                listed_now, platform_settings, delisted_now
+            )
 
             for platform_id in platforms:
                 latest = (
@@ -1106,6 +1154,20 @@ async def submit_listing(
                     .first()
                 )
 
+                ps = platform_settings.get(platform_id, {})
+                # The whole per-platform answer, from the reads above. The branches below act
+                # on it in the order they always ran, with in_flight_elsewhere in
+                # between: a sibling listing's attempt is not this listing's state, and an
+                # open delist must never lift it.
+                skip_reason = ExternalListingService.gate_decision(
+                    platform_id,
+                    latest.status if latest else None,
+                    allow_resubmit=ps.get("allow_resubmit", True),
+                    has_external_id=platform_id in listed_now,
+                    manual_fallback=ps.get("manual_fallback", False),
+                    open_delist=platform_id in delisted_now,
+                )
+
                 # awaiting_action sits with the in-flight three: the platform accepted the
                 # submission and a person owes it a manual step, so a new attempt cannot
                 # advance it. For eBay the item is already live, and a resubmit returns
@@ -1116,9 +1178,7 @@ async def submit_listing(
                 # Enforced here as well as in the pill, because the pill is a prompt and this
                 # is the gate. recompute_listing_submitted reads the LATEST attempt, so a new
                 # row does not even clear the block it looks like it is clearing.
-                if latest and latest.status in (
-                    "queued", "pending", "processing", "awaiting_action",
-                ):
+                if skip_reason in (SKIP_IN_FLIGHT, SKIP_AWAITING_ACTION):
                     logger.info(f"Skipping {platform_id}: already in {latest.status}")
                     continue
 
@@ -1142,9 +1202,7 @@ async def submit_listing(
                     )
                     continue
 
-                ps = platform_settings.get(platform_id, {})
-                allow_resubmit = ps.get("allow_resubmit", True)
-                if latest and latest.status == "success" and not allow_resubmit:
+                if skip_reason == SKIP_NO_RESUBMIT:
                     logger.info(f"Skipping {platform_id}: resubmission not allowed")
                     continue
 
@@ -1159,12 +1217,23 @@ async def submit_listing(
                 # the other way round and uses an external id only when there is no
                 # row at all -- see external_ids_satisfy_completion.sql.
                 #
-                # `gated` already excludes sellercloud and any platform whose
-                # allow_resubmit is true.
-                if platform_id in gated:
+                # Never sellercloud, never a platform whose allow_resubmit is true,
+                # and never one with an open delist (gate_decision).
+                if skip_reason == SKIP_ALREADY_LISTED:
                     logger.info(
                         f"Skipping {platform_id}: {listing.product_id} is already "
                         f"listed there (external_listing_ids)"
+                    )
+                    continue
+
+                # Gated when this submit started, so the mapping gates above never
+                # checked it, and a delist has committed since. Posting it now could
+                # fail on a mapping nobody checked, which is a wasted real attempt;
+                # the next submit checks it and goes.
+                if platform_id in gated:
+                    logger.info(
+                        f"Skipping {platform_id}: {listing.product_id} was listed there "
+                        f"when this submit started, so its mappings were not checked"
                     )
                     continue
 
@@ -1201,12 +1270,15 @@ async def submit_listing(
     if not submission_records:
         # Two different situations behind one status. The detail renders as a
         # snackbar, so it says which, and the diagnostics stay in the log.
-        if gated and all(p in gated or p == "sellercloud" for p in platforms):
+        # Gated by either read: the loop skipped every platform in both sets, and a
+        # Restore that landed under the lock belongs with the listed answer.
+        listed_gated = gated | gated_now
+        if listed_gated and all(p in listed_gated or p == "sellercloud" for p in platforms):
             logger.info(
                 "Submit for %s produced no rows: every platform is already "
                 "listed externally (%s)",
                 listing.product_id,
-                ", ".join(sorted(gated)),
+                ", ".join(sorted(listed_gated)),
             )
             raise HTTPException(
                 status_code=409,

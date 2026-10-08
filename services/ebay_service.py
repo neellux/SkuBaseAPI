@@ -35,7 +35,7 @@ import logging
 import re
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 import orjson
@@ -255,8 +255,9 @@ def _is_unset(column: str, value: Any) -> bool:
 # Format enum on the request body. 0 = TAB_Delimited, 1 = CSV, 2 = Excel.
 FORMAT_TAB = 0
 
-# Export jobs are queued; 5 SKUs measured at ~51s.
-POLL_INTERVAL = 5
+# Export jobs are queued; 5 SKUs measured at ~51s. Once a minute: the wait is SellerCloud's
+# queue, which a tighter poll does not shorten.
+POLL_INTERVAL = 60
 
 # ReviseOnEbay answers synchronously and took 20.2s for two children, against the internal
 # client's 30s default, so it gets its own timeout and a bounded list per call. Small until a
@@ -265,9 +266,37 @@ POLL_INTERVAL = 5
 REVISE_CHUNK = 20
 REVISE_TIMEOUT_SECONDS = 120
 
-# How long a batch waits for its catalog and specifics imports before touching eBay. Well
-# under ebay_poller.recover_stale_processing's 30 minutes, which keys on updated_at.
-IMPORT_WAIT_SECONDS = 900
+# How long a batch waits on ONE queued SellerCloud job: its catalog export, then its catalog
+# and specifics imports. The wait is nearly all queue and almost no work -- export 4280830
+# sat queued for 5m37s and then ran for one second, and the company-wide queue has been seen
+# 30 minutes deep -- so a tight bound fails batches that had nothing wrong with them. Import
+# 7 lost all 52 submissions to the 180s the export used to get.
+#
+# Still bounded, because is_job_complete reads every error as "not done yet": a job
+# SellerCloud lost would otherwise be polled forever with its rows held in PROCESSING.
+JOB_WAIT_SECONDS = 6 * 60 * 60
+
+# The wait above runs well past ebay_poller.recover_stale_processing's 30 minutes, which
+# keys on updated_at, so both waits refresh it this often through the caller's heartbeat.
+HEARTBEAT_SECONDS = 60
+
+
+async def _beat_if_due(
+    heartbeat: Optional[Callable[[], Awaitable[None]]], last_beat: float
+) -> float:
+    """Call `heartbeat` once HEARTBEAT_SECONDS have passed; returns the new last-beat time.
+
+    A failed beat is logged and tried again a minute later rather than raised: the sweep
+    allows 30 minutes, and one database blip must not fail a batch that is only waiting.
+    """
+    now = time.monotonic()
+    if heartbeat is None or now - last_beat < HEARTBEAT_SECONDS:
+        return last_beat
+    try:
+        await heartbeat()
+    except Exception:  # noqa: BLE001 - a missed beat is retried, not fatal
+        logger.warning("eBay job wait heartbeat failed", exc_info=True)
+    return now
 
 # The template's own header and line ending, reproduced exactly.
 COLUMNS = ("ProductID", "SpecificName", "SpecificValue", "SpecificType", "Action")
@@ -799,7 +828,9 @@ class EbayService:
     # ------------------------------------------------------------------ step 1: catalog
     @staticmethod
     async def export_catalog_fields(
-        skus: List[str], poll_seconds: int = 180
+        skus: List[str],
+        poll_seconds: int = JOB_WAIT_SECONDS,
+        heartbeat: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Tuple[Dict[str, Dict[str, str]], str]:
         """Current CATALOG_COLUMNS per SKU, via a custom export.
 
@@ -814,7 +845,10 @@ class EbayService:
         DisplayName is sent even though swagger marks only OriginalName required: without
         it the export 500s with "Display names cannot contain null entries."
 
-        Measured at ~51s for 5 SKUs, so this is the slow step of a submit.
+        Measured at ~51s for 5 SKUs, so this is the slow step of a submit. That time is
+        SellerCloud's queue, not the export, so it does not scale with the batch and can be
+        many minutes on a busy day: see JOB_WAIT_SECONDS. `heartbeat` is called about once a
+        minute while waiting, so the caller's rows do not look stale.
         """
         body = {
             "Columns": [{"OriginalName": c, "DisplayName": c}
@@ -828,14 +862,18 @@ class EbayService:
             raise RuntimeError(f"{CATALOG_EXPORT_ENDPOINT} returned no job link: {queued}")
         job_id = link.split("id=")[1].split("&")[0]
 
-        waited = 0
-        while waited < poll_seconds:
+        # Wall clock, for the reason wait_for_jobs gives.
+        deadline = time.monotonic() + poll_seconds
+        last_beat = time.monotonic()
+        while True:
             await asyncio.sleep(POLL_INTERVAL)
-            waited += POLL_INTERVAL
             if await sellercloud_service.is_job_complete(job_id):
                 break
-        else:
-            raise TimeoutError(f"catalog export job {job_id} did not finish in {poll_seconds}s")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"catalog export job {job_id} did not finish in {poll_seconds}s"
+                )
+            last_beat = await _beat_if_due(heartbeat, last_beat)
 
         raw = await sellercloud_service.get_job_output_file(job_id)
         return EbayService.parse_catalog_export(raw.decode("utf-8", "replace")), job_id
@@ -1115,8 +1153,15 @@ class EbayService:
         return {"ok": ok, "job_id": job_id, "message": message, "response": result}
 
     @staticmethod
+    def export_listing_id(current: Dict[str, Dict[str, str]], sku: str) -> str:
+        """The child's eBay item id as the export has it, stripped. "" when blank or absent."""
+        return ((current.get(sku) or {}).get(LISTING_ID_COLUMN) or "").strip()
+
+    @staticmethod
     def split_by_listing_id(
-        current: Dict[str, Dict[str, str]], skus: List[str]
+        current: Dict[str, Dict[str, str]],
+        skus: List[str],
+        delisted: Optional[Dict[str, Optional[str]]] = None,
     ) -> Tuple[Dict[str, str], List[str]]:
         """({child: eBay item id} already live, [child] not listed), from the batch's export.
 
@@ -1128,12 +1173,37 @@ class EbayService:
         A blank cell, "0", or a child the export did not return all mean "not listed". A
         child SellerCloud has no id for cannot be revised, and launching it is exactly what
         the batch did before this existed.
+
+        DELISTED CHILDREN (KTD6). `delisted` maps each child an open eBay delist covers to the
+        item id that delist ended, or None when SkuBase never recorded one (the poller reads
+        it, ebay_poller._delisted_children). A listing an operator ended by hand on eBay can
+        keep its id in the export, so for these children the export alone cannot tell live
+        from ended:
+          - blank, "0", or the ended id: launch. Revising an ended id would read as done.
+          - any other id: an earlier attempt already relaunched it, even one recorded as
+            failed, so it is revised like any live child.
+          - ended id unknown: launch. See the comment in the loop.
+        Children not in `delisted` follow the rule above unchanged, so an empty or absent
+        mapping is exactly the split from before delists existed.
         """
+        delisted = delisted or {}
         revise: Dict[str, str] = {}
         launch: List[str] = []
         for sku in skus:
-            item_id = ((current.get(sku) or {}).get(LISTING_ID_COLUMN) or "").strip()
-            if item_id and item_id != "0":
+            item_id = EbayService.export_listing_id(current, sku)
+            live = bool(item_id) and item_id != "0"
+            if live and sku in delisted:
+                ended = delisted[sku]
+                # An unknown ended id launches. Revising is the SILENT failure here, not the
+                # visible one: ReviseOnEbay's Success only means "sent" (revise_on_ebay), so a
+                # revise of a listing that ended reads as done, the attempt closes the delist,
+                # and the size is still off eBay (docs/ebay_integration.md section 25,
+                # "Accepted risk"). A launch of a child that is in fact live does not post a
+                # second listing: AMR-MTPS-0085's relaunch on 2026-09-02 came back "already
+                # active on eBay" with the same item ids, which lands on that size's
+                # sku_errors where an operator sees it.
+                live = bool(ended) and item_id != ended
+            if live:
                 revise[sku] = item_id
             else:
                 launch.append(sku)
@@ -1179,7 +1249,9 @@ class EbayService:
 
     @staticmethod
     async def wait_for_jobs(
-        job_ids: List[str], timeout_seconds: int = IMPORT_WAIT_SECONDS
+        job_ids: List[str],
+        timeout_seconds: int = JOB_WAIT_SECONDS,
+        heartbeat: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Dict[str, str]:
         """{job id: "complete" | "reported_failed" | "timeout"} for queued SellerCloud jobs.
 
@@ -1196,9 +1268,10 @@ class EbayService:
         outcome: Dict[str, str] = {}
         pending = {str(job_id) for job_id in job_ids if job_id}
         # Wall clock, not slept seconds: each is_job_complete is an HTTP call that can itself
-        # take up to the client timeout, and counting only the sleeps let the bound run past
-        # the stale sweep's 30 minutes.
+        # take up to the client timeout, so counting only the sleeps lets the wait run well
+        # past its bound. `heartbeat` is what keeps the stale sweep off rows waiting here.
         deadline = time.monotonic() + timeout_seconds
+        last_beat = time.monotonic()
         while pending:
             for job_id in sorted(pending):
                 try:
@@ -1209,6 +1282,7 @@ class EbayService:
             pending -= set(outcome)
             if not pending or time.monotonic() >= deadline:
                 break
+            last_beat = await _beat_if_due(heartbeat, last_beat)
             await asyncio.sleep(POLL_INTERVAL)
         for job_id in pending:
             outcome[job_id] = "timeout"
