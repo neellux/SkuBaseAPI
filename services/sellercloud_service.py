@@ -655,7 +655,18 @@ class SellerCloudService:
                 "ProductID": product_id,
                 "Content": content_b64,
                 "FileName": filename,
-                "Properties": {"IsDefault": True},
+                # IsMainDescriptionImage as well as IsDefault: this is a new size
+                # taking over its template sibling's only image, and the two flags
+                # describe the same slot-1 shot.
+                #
+                # Photography sets both on every push (PhotoManagementNew's
+                # update_images_new), so this is the one writer that could disagree with
+                # it - and it did. A size added after the shoot is the only child
+                # photography never pushes to, and IsDefault alone left 72 active
+                # children with a gallery image and an empty DescriptionImageURL on
+                # 2026-09-21. On eBay that is a listing whose HTML description template
+                # renders with no photo in it.
+                "Properties": {"IsDefault": True, "IsMainDescriptionImage": True},
             },
         )
 
