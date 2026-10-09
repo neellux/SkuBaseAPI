@@ -1,8 +1,12 @@
-"""The SellerCloud image-import file.
+"""The SellerCloud image import files.
 
 `/Catalog/Imports/Images` takes a tab-separated file whose column order is fixed by
 SellerCloud's schema. Three callers build one now (the daily no-image backfill, the
 gallery sync poller, and the one-off remediation script), so the shape lives here.
+
+`/Catalog/Imports/Custom` takes a bulk-product-update file instead, whose columns are
+whatever you name in the header. `DescriptionImageURL` is the one we use; see
+build_description_image_tsv.
 
 A row either ADDs an image by URL or DELETEs one by ImageID. To replace a product's
 image, send both: the DELETE first, then the ADD.
@@ -16,6 +20,14 @@ Both pushes here send exactly one row per child -- the parent's `1_1500.jpg`, wh
 the priority-1 shot -- so both flags are always True on it. Do not try to express
 "studio vs edited" through IsMainDescriptionImage: withholding it would also withhold
 IsDefault, leaving the product with no visible image at all.
+
+DescriptionImageURL is the read-side name for the IsMainDescriptionImage row: a custom
+export reports it populated only while some image carries that flag. The flags travel
+together only because every writer here sets them together, so a writer that sets
+IsDefault alone leaves a product with a GalleryImageURL and an empty DescriptionImageURL.
+72 active children were in that state on 2026-09-21, all of them sizes added to a parent
+after its shoot, whose image is copied from a template sibling through POST /ProductImage
+(sellercloud_service.upload_product_image) rather than through this file.
 """
 import io
 from typing import Any, Dict, List, Optional
@@ -74,6 +86,29 @@ def build_image_import_tsv(rows: List[Dict[str, Any]]) -> bytes:
     buf = io.StringIO()
     df[IMAGE_IMPORT_COLUMNS].to_csv(buf, index=False, sep="\t")
     return buf.getvalue().encode("utf-8")
+
+
+def build_description_image_tsv(rows: List[tuple]) -> bytes:
+    """Bulk-product-update file for `/Catalog/Imports/Custom`: (product_id, image_url) in.
+
+    Measured against SellerCloud on 2026-09-21 (TEST-MSNK-0004, import job 4253201), and
+    it does NOT behave like the images file above:
+
+      * it ADDS a new image record and flags THAT one IsMainDescriptionImage, even when
+        the URL given is one the product already holds. The old image keeps IsDefault and
+        loses IsMainDescriptionImage, so the product ends up with a gallery image and a
+        separate description image rather than one image carrying both flags.
+      * it is therefore NOT idempotent. Sending the same row twice adds a second copy.
+        Every caller must first establish that the product has no description image, via
+        `/ProductImage/GetProductsImages` or a DescriptionImageURL export column.
+
+    Which is why this is only ever used to repair a product that HAS an image and lacks
+    the description flag. A product with no image at all gets add_default_image_row
+    instead, one image carrying both flags.
+    """
+    header = "ProductID\tDescriptionImageURL\n"
+    body = "".join(f"{product_id}\t{image_url}\n" for product_id, image_url in rows)
+    return (header + body).encode("utf-8")
 
 
 def image_rows_from_export(raw: bytes) -> List[Dict[str, Optional[str]]]:

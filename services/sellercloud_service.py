@@ -19,6 +19,7 @@ from services.listing_options_service import listing_options_service
 from services.product_resolver import child_skus_for, resolve_parent
 from services.template_render import render_template, resolve_field_template
 from tortoise import Tortoise
+from utils.sellercloud_image_import import build_description_image_tsv
 
 logger = logging.getLogger(__name__)
 
@@ -696,6 +697,111 @@ class SellerCloudService:
                 f"Catalog/Imports/Images returned no job link: {resp.text[:200]}"
             )
         return link.split("id=")[1].split("&")[0]
+
+    async def get_products_images(
+        self, product_ids: List[str], chunk_size: int = 500
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """{product_id: [image, ...]} straight off `/ProductImage/GetProductsImages`.
+
+        Each image carries ImageID, Url, IsDefault and IsMainDescriptionImage. This is
+        the only SYNCHRONOUS read of those flags: the alternative, a StandardExportKind
+        11 export, is a queued job that takes about a minute, which is too slow to sit
+        inside a submit. Measured at ~40 products/second, so a parent's children come
+        back in well under a second.
+
+        A product with no images is returned with an empty list, or not at all.
+        """
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        for start in range(0, len(product_ids), chunk_size):
+            chunk = product_ids[start : start + chunk_size]
+            response = await self._make_request(
+                "POST", "/ProductImage/GetProductsImages", data={"ProductsIDs": chunk}
+            )
+            for entry in orjson.loads(response.content) or []:
+                product_id = entry.get("ProductID")
+                if product_id:
+                    out[product_id] = entry.get("Images") or []
+        return out
+
+    async def create_custom_import(self, tsv_bytes: bytes) -> str:
+        """Submit a bulk-product-update file, return the queued job id.
+
+        Unlike `/Catalog/Imports/Images`, this endpoint wants JSON, and `Metadata` is
+        required and must not contain nulls -- a null ScheduleDate or CompanyIdForNewProduct
+        comes back as a bare 400 "Invalid Request." naming nothing (measured 2026-09-21).
+
+        CreateProductIfDoesntExist stays False. A typo'd SKU in the file must be ignored,
+        never minted as a new product in whichever company SellerCloud picks.
+        """
+        payload = {
+            "FileContents": base64.b64encode(tsv_bytes).decode("utf-8"),
+            "FileExtension": ".txt",
+            "Format": 0,
+            "Metadata": {
+                "CreateProductIfDoesntExist": False,
+                "DoNotUpdateProducts": False,
+            },
+        }
+        response = await self._make_request(
+            "POST", "/Catalog/Imports/Custom", data=payload
+        )
+        link = (orjson.loads(response.content) or {}).get("QueuedJobLink", "") or ""
+        if "id=" not in link:
+            raise RuntimeError(
+                f"Catalog/Imports/Custom returned no job link: {response.text[:200]}"
+            )
+        return link.split("id=")[1].split("&")[0]
+
+    async def ensure_description_images(
+        self, product_ids: List[str]
+    ) -> Dict[str, Any]:
+        """Give every child that has an image but no description image one, and say so.
+
+        SellerCloud has no way to point DescriptionImageURL at an image a product already
+        holds, so the repair sends that image's own SellerCloud URL back through
+        `/Catalog/Imports/Custom`, which attaches a second copy and flags it. That is
+        also why this reads the current flags first and sends rows only for the children
+        that are actually missing one: the import is not idempotent, and an unconditional
+        push would attach a copy per submit. See build_description_image_tsv.
+
+        A child with NO image is not repairable here - there is nothing to point at - so
+        it is reported instead. daily_image_import_poller is what gives those an image,
+        from GCS, with both flags on one row.
+        """
+        result: Dict[str, Any] = {"job_id": None, "fixed": [], "no_image": []}
+        if not product_ids:
+            return result
+
+        images = await self.get_products_images(product_ids)
+        rows: List[tuple] = []
+        for product_id in product_ids:
+            shots = images.get(product_id) or []
+            if any(shot.get("IsMainDescriptionImage") for shot in shots):
+                continue
+            # The default image is the one shoppers already see, so the description
+            # image should be the same picture. Any image beats none if nothing is
+            # flagged default.
+            source = next(
+                (shot for shot in shots if shot.get("IsDefault")),
+                shots[0] if shots else None,
+            )
+            if not source or not source.get("Url"):
+                result["no_image"].append(product_id)
+                continue
+            rows.append((product_id, source["Url"]))
+
+        if not rows:
+            return result
+
+        result["job_id"] = await self.create_custom_import(
+            build_description_image_tsv(rows)
+        )
+        result["fixed"] = [product_id for product_id, _ in rows]
+        logger.info(
+            f"Queued custom import {result['job_id']} setting DescriptionImageURL on "
+            f"{len(rows)} child(ren): {result['fixed'][:5]}"
+        )
+        return result
 
     async def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Fetch a queued job's details (Basic.CompletedOn, TotalRecords, TotalProcessed)."""
@@ -1773,6 +1879,25 @@ class SellerCloudService:
                     stage=stage,
                     failures=failures,
                     succeeded=succeeded,
+                )
+
+            # DescriptionImageURL is what an eBay HTML description template renders, and
+            # nothing on the listing form touches it. Photography sets it on every shoot;
+            # a size added to a parent afterwards is the child that can be missing one.
+            # Deliberately not fatal: every field this submission was asked to write is
+            # already written, and a missed image is not worth failing a submit over.
+            try:
+                outcome = await self.ensure_description_images(all_product_ids)
+                if outcome["no_image"]:
+                    logger.info(
+                        f"{len(outcome['no_image'])} child(ren) of {parent_product_id} have "
+                        f"no SellerCloud image to use as a description image; leaving them "
+                        f"to the daily image import"
+                    )
+            except Exception:
+                logger.exception(
+                    f"Description image check failed for {parent_product_id}; the "
+                    f"SellerCloud submission itself succeeded"
                 )
 
             logger.info(

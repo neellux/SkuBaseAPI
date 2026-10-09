@@ -3,7 +3,9 @@
 Runs on a cron (default 04:30 America/New_York). Each cycle:
   1. Pull active child SKUs + DB UPC/keyword state.
   2. Pull SellerCloud alias state via ExportStandardInfo Kind=2 (50k SKU batches).
-  3. Pull SellerCloud UPC state via ExportCustomInfo (job + poll + download).
+  3. Pull SellerCloud UPC state via ExportCustomInfo (job + poll + download). The same
+     export carries the daily parent values and the description-image gaps, so neither
+     costs a second export.
   4. Reconcile (see services/daily_sellercloud_sync_service.py).
   5. Apply safety gates (allowlist, per-cycle caps, % drift guard, runtime).
   6. Write XLSX + rollback CSV to reports_dir.
@@ -38,6 +40,7 @@ from services.sellercloud_internal_service import (
     sellercloud_internal_service,
 )
 from services.sellercloud_sync_logger import complete_operation, create_operation
+from utils.sellercloud_image_import import build_description_image_tsv
 from services.daily_sellercloud_sync_service import (
     Action,
     State,
@@ -78,6 +81,13 @@ class DailySellercloudSyncPoller:
         # false = values only: the custom export and write_parent_values, with no alias
         # export and no reconcile. TEST runs this way.
         self.reconcile_enabled: bool = bool(cfg.get("reconcile_enabled", True))
+        # The description-image repair rides on this cycle's export. On by default, with
+        # a cap so a run that somehow sees the whole catalog as a gap cannot attach an
+        # image to every child in one job.
+        self.repair_description_images: bool = bool(
+            cfg.get("repair_description_images", True)
+        )
+        self.description_image_cap: int = int(cfg.get("description_image_cap", 2000))
         self.max_actions_per_cycle: int = int(cfg.get("max_actions_per_cycle", 500))
         self.max_deletes_per_cycle: int = int(cfg.get("max_deletes_per_cycle", 50))
         self.max_pct_of_total_aliases_changed: float = float(
@@ -180,6 +190,7 @@ class DailySellercloudSyncPoller:
                 f"{len(sc_primaries)} with a primary UPC"
             )
             await self._write_values(export, len(all_skus))
+            await self._repair_description_images(export)
 
             if not self.reconcile_enabled:
                 logger.info(f"{self.name}: reconcile_enabled=false; values only this cycle")
@@ -401,6 +412,48 @@ class DailySellercloudSyncPoller:
             pass  # logged at ERROR by write_parent_values; the previous values stay
         except Exception:  # noqa: BLE001
             logger.exception(f"{self.name}: writing parent values failed; the previous values stay")
+
+    async def _repair_description_images(self, export) -> None:
+        """Give every child with an image and no description image one, from this export.
+
+        A child in that state renders an eBay HTML description with no photo in it. The
+        state is only reachable through a size added to a parent after its shoot, whose
+        image is copied by sellercloud_service.upload_product_image -- fixed at source on
+        2026-09-21, so this exists to clear the ones that predate the fix and to catch any
+        writer that regresses. 72 children qualified on the day it was built.
+
+        Children with NO image are not here: they have nothing to point at, and
+        daily_image_import_poller gives them one from GCS at 05:00.
+
+        Never raises. The UPC reconcile this cycle exists for must not fail over an image.
+        """
+        gaps = getattr(export, "description_image_gaps", None) or {}
+        if not gaps:
+            logger.info(f"{self.name}: no description-image gaps in this export")
+            return
+
+        if not self.repair_description_images:
+            logger.info(
+                f"{self.name}: {len(gaps)} child(ren) need a description image; "
+                f"repair_description_images=false, so reporting only"
+            )
+            return
+
+        capped = sorted(gaps.items())[: self.description_image_cap]
+        try:
+            from services.sellercloud_service import sellercloud_service
+
+            job_id = await sellercloud_service.create_custom_import(
+                build_description_image_tsv(capped)
+            )
+            logger.info(
+                f"{self.name}: custom import {job_id} setting DescriptionImageURL on "
+                f"{len(capped)} of {len(gaps)} child(ren)"
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"{self.name}: description image repair failed for {len(capped)} child(ren)"
+            )
 
     async def _poll_job(
         self, client: httpx.AsyncClient, base_url: str, job_id: str, deadline: float

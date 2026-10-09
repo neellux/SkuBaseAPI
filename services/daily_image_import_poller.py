@@ -13,6 +13,12 @@ Flow (once per day, after the SellerCloud scheduled task 346 export has run):
   4. Build the `image_upload_format` tab-separated file (one row per child pointing at
      the parent's GCS image) and submit it to `/Catalog/Imports/Images` in chunks.
 
+Each row sets IsDefault and IsMainDescriptionImage, so a product this fixes comes out of
+it with both a GalleryImageURL and a DescriptionImageURL. The GCS pre-check is what keeps
+the run honest: a child whose parent has no top shot has nothing to send, and on
+2026-09-21 that was true of all 15,243 parents behind the 45,124 children SellerCloud
+held no image for. Photography, not this poller, is where an image normally comes from.
+
 Scheduled with APScheduler at a fixed wall-clock time, mirroring
 `secondary_inventory_transfer_poller`.
 """

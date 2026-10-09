@@ -20,7 +20,7 @@ import csv
 import io
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -44,7 +44,20 @@ logger = logging.getLogger(__name__)
 # 200 rows, so they are the same number under three names.
 QTY_FIELD = "AggregateQty"
 PRICE_FIELD = "SitePrice"
-EXPORT_FIELD_NAMES = ["ProductID", "UPC", QTY_FIELD, PRICE_FIELD]
+
+# A third consumer rides along on the same export: a child whose DescriptionImageURL is
+# blank while its GalleryImageURL is not has an image and no description image, which is
+# what an eBay HTML description template renders. Asking for two more columns costs
+# nothing - this job already exports every active child - and they are deliberately NOT
+# in REQUIRED_EXPORT_COLUMNS, so if SellerCloud ever stops returning them the UPC
+# reconcile and the daily values carry on rather than the whole cycle failing.
+DESCRIPTION_IMAGE_FIELD = "DescriptionImageURL"
+GALLERY_IMAGE_FIELD = "GalleryImageURL"
+EXPORT_FIELD_NAMES = [
+    "ProductID", "UPC", QTY_FIELD, PRICE_FIELD,
+    DESCRIPTION_IMAGE_FIELD, GALLERY_IMAGE_FIELD,
+]
+REQUIRED_EXPORT_COLUMNS = ["ProductID", "UPC", QTY_FIELD, PRICE_FIELD]
 
 # Guards. A failed SellerCloud export can look like an empty one, and an unknown field name
 # exports a blank column, so a write needs positive evidence the export is whole.
@@ -74,6 +87,9 @@ class CustomExport:
     returned: int
     blank_qty: int
     blank_price: int
+    # sku -> the gallery image URL to make its description image. Only children that
+    # have one image URL and not the other; empty when the columns were not returned.
+    description_image_gaps: Dict[str, str] = field(default_factory=dict)
 
 
 def parse_number(text: Optional[str]) -> Optional[Decimal]:
@@ -93,7 +109,7 @@ def parse_custom_export_tsv(data: bytes) -> CustomExport:
     text = data.decode("utf-8-sig", "replace")
     reader = csv.reader(io.StringIO(text), delimiter="\t", quoting=csv.QUOTE_NONE)
     header = [name.strip() for name in next(reader, [])]
-    missing = [name for name in EXPORT_FIELD_NAMES if name not in header]
+    missing = [name for name in REQUIRED_EXPORT_COLUMNS if name not in header]
     if missing:
         raise MissingExportColumn(f"custom export is missing {missing}; header was {header}")
 
@@ -102,9 +118,13 @@ def parse_custom_export_tsv(data: bytes) -> CustomExport:
     qty_i = header.index(QTY_FIELD)
     price_i = header.index(PRICE_FIELD)
     width = max(sku_i, upc_i, qty_i, price_i)
+    # Optional, so a header without them simply yields no gaps.
+    desc_i = header.index(DESCRIPTION_IMAGE_FIELD) if DESCRIPTION_IMAGE_FIELD in header else None
+    gallery_i = header.index(GALLERY_IMAGE_FIELD) if GALLERY_IMAGE_FIELD in header else None
 
     upcs: Dict[str, str] = {}
     rows: Dict[str, Dict[str, Any]] = {}
+    description_image_gaps: Dict[str, str] = {}
     returned = blank_qty = blank_price = 0
     for parts in reader:
         if len(parts) <= width:
@@ -125,8 +145,21 @@ def parse_custom_export_tsv(data: bytes) -> CustomExport:
         if qty is not None and price is not None:
             rows[sku] = {QTY_FIELD: int(qty), PRICE_FIELD: price}
 
+        if desc_i is not None and gallery_i is not None and len(parts) > max(desc_i, gallery_i):
+            # The export is CRLF, so the last column arrives with a trailing \r on some
+            # readers and would never test as blank unstripped.
+            description = parts[desc_i].strip()
+            gallery = parts[gallery_i].strip()
+            if gallery and not description:
+                description_image_gaps[sku] = gallery
+
     return CustomExport(
-        upcs=upcs, rows=rows, returned=returned, blank_qty=blank_qty, blank_price=blank_price
+        upcs=upcs,
+        rows=rows,
+        returned=returned,
+        blank_qty=blank_qty,
+        blank_price=blank_price,
+        description_image_gaps=description_image_gaps,
     )
 
 
