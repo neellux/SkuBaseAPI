@@ -391,6 +391,45 @@ class ListingService:
         return True
 
     @staticmethod
+    def normalize_style_name(data: Dict[str, Any]) -> bool:
+        """Title-case a style_name that arrived all in one case. Returns True if changed.
+
+        The style_name counterpart of normalize_brand_color, with the same rule
+        (utils.text_case.to_title_case) and for the same reason: SellerCloud mostly holds
+        the supplier's name in caps ("BOLT ARROW HOODIE"), and the fix was an operator
+        pressing the toggle on the field, one listing at a time.
+
+        Unlike brand_color, a MIXED-CASE value is left exactly as it came. The rule
+        lowercases first, so it cannot tell an acronym from a word, and style names are
+        full of them where colours are not. Measured over the 512 shipped listings that
+        carry a creation snapshot:
+
+            arrived in caps   358   75 ended on exactly this output, 33 shipped still in
+                                    caps, 12 only had an acronym put back ("MA Necklace")
+            arrived mixed      37   0 ended on this output, and 11 that shipped untouched
+                                    would have been damaged ("Hardies NYC Beanie" ->
+                                    "Hardies Nyc Beanie", "FW24 Flame Skullie" -> "Fw24...")
+
+        A value in a single case has no casing to lose, so that is where this runs. The
+        acronym it flattens there ("LYOCELL SS SHIRT" -> "Lyocell Ss Shirt") is the known
+        cost, and the button does the same to the same value.
+
+        Idempotent, like the two normalizers above: its own output is mixed-case or
+        already in form, so a second pass is a no-op.
+        """
+        name = data.get("style_name")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if name != name.upper() and name != name.lower():
+            return False
+        cased = to_title_case(name)
+        if cased == name:
+            return False
+        data["style_name"] = cased
+        logger.info(f"Title-cased style name {name!r} -> {cased!r}")
+        return True
+
+    @staticmethod
     async def _apply_product_type_derived(
         data: Dict[str, Any],
         *,
@@ -581,6 +620,13 @@ class ListingService:
                         except Exception as e:
                             logger.warning(f"Failed to fetch color info for {color}: {e}")
 
+                    # Ahead of the AI search below, not down with the other normalizers.
+                    # The search records the style_name it was formed against and the
+                    # card compares that to the field EXACTLY (see style_name_service),
+                    # so casing it afterwards would open every such listing with a
+                    # suggestion marked as checked against a value nobody ever edited.
+                    ListingService.normalize_style_name(prefilled_data)
+
                     original_description = prefilled_data.get("LongDescription")
 
                     fields_for_ai = ListingService._get_ai_tagging_fields(
@@ -691,6 +737,11 @@ class ListingService:
             # rewrites it from the title template. This is what the title field's restore
             # button reverts to, so it is read here and never written again.
             original_title = prefilled_data.get("title")
+
+            # Again here because this is where every branch above meets: the two that
+            # never reach the AI search, and a style_name the aspects call filled in.
+            # Before the title block so the generated title is built from the cased name.
+            ListingService.normalize_style_name(prefilled_data)
 
             style_name = prefilled_data.get("style_name")
             if style_name and len(str(style_name).strip()) >= 3:
