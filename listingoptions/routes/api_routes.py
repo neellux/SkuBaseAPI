@@ -3,7 +3,7 @@ import traceback
 from typing import Any, Dict, List
 
 import pandas as pd
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from listingoptions.models.api_models import (
     AddAliasResponse,
     BulkGetProductTypesByClassRequest,
@@ -17,7 +17,12 @@ from listingoptions.models.api_models import (
     TableSchema,
 )
 from listingoptions.services.database_service import DatabaseService
+from models.api_models import ProductListingDatesResponse
+from routes.api_routes import require_api_key
+from services import platform_delist_service
 from services.parent_type_service import ParentTypeService
+from services.platform_delist_service import DelistRefused
+from services.product_resolver import SkuResolutionError, resolve_parent
 from listingoptions.services.sizing_service import SizingService
 
 logger = logging.getLogger(__name__)
@@ -412,3 +417,40 @@ async def list_tables():
     except Exception as e:
         logger.error(f"Error listing tables: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# Listing data rather than listing options, but grouped here with the rest of the public
+# API by request. Unlike its neighbours it keeps require_api_key: it answers for a real
+# product, not reference data.
+@router.get(
+    "/listing_dates",
+    response_model=ProductListingDatesResponse,
+    summary="Listing dates",
+    dependencies=[Depends(require_api_key)],
+)
+async def listing_dates_public(
+    sku: str = Query(..., description="Parent or child SKU"),
+):
+    """Platforms the product is listed on now, with the listing date for each.
+
+    A platform it is not listed on is absent.
+    """
+    try:
+        parent_sku = await resolve_parent(sku.strip())
+    except SkuResolutionError:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    try:
+        listings = await platform_delist_service.get_listing_dates(parent_sku)
+    except DelistRefused as refused:
+        # The service's only refusal on this read is the 404 for a product the products DB
+        # knows and parent_products does not.
+        raise HTTPException(status_code=refused.status_code, detail=refused.message)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("listing_dates: failed for %s", sku)
+        # Static: this route sits outside AuthMiddleware, so internals stay in the log.
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+    return {"parent_sku": parent_sku, "listings": listings}

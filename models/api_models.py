@@ -1546,6 +1546,22 @@ class ListingHistoryResponse(BaseModel):
     )
 
 
+ListingDateSource = Literal["skubase", "manual"]
+
+
+class ProductListingDate(BaseModel):
+
+    platform_id: str
+    source: ListingDateSource
+    listing_date: Optional[datetime] = Field(None, description="UTC, null when manual")
+
+
+class ProductListingDatesResponse(BaseModel):
+
+    parent_sku: str
+    listings: List[ProductListingDate] = Field(default_factory=list)
+
+
 class PlatformDelistRequest(BaseModel):
 
     platform_id: str = Field(..., description="Platform the product was taken down on")

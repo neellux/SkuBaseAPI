@@ -157,6 +157,14 @@ EXCLUDED = "excluded"
 # attempt_outcome's third value, beside IN_PROGRESS and FAILED.
 ACCEPTED = "accepted"
 
+# Listing-date sources on the public API (/api/listing_dates). "skubase" means an attempt
+# SkuBase sent was accepted by the platform, so the date is a real listing date; "manual"
+# means nobody here listed it and all we hold is a presence row, whose first_seen_at is when
+# a backfill noticed it rather than when it went live, so that date is not published. The UI
+# calls the same two things SkuBase and External; these are the wire values, keep them.
+SOURCE_SKUBASE = "skubase"
+SOURCE_MANUAL = "manual"
+
 # Delist entry states in the timeline.
 OPEN = "open"
 RELISTED = "relisted"
@@ -330,6 +338,17 @@ def _parse_ts(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """UTC, for a payload that promises UTC. A `listed` step carries whatever offset the
+    writer used, and _parse_ts keeps it, so the instant is right but the printed offset is
+    not necessarily Z."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def listed_step_at(steps: Any) -> Optional[datetime]:
@@ -922,6 +941,47 @@ def build_history(
     }
 
 
+def build_listing_dates(
+    *,
+    platforms: Sequence[str],
+    product: ProductFacts,
+    attempts: Sequence[Dict[str, Any]],
+    rows: Sequence[Dict[str, Any]],
+    entries: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """One entry per platform the parent is listed on RIGHT NOW. Pure.
+
+    A platform the product is not listed on is absent rather than present with a null date,
+    so a caller never has to tell "not listed" from "listed, date unknown". Listedness is
+    `facts.anything_listed`, not the row status, because the status is a display precedence:
+    an in-flight resubmission reads In progress over Listed, and a product that is live on
+    the platform must not drop out of this list while a resubmit is in flight.
+
+    An open delist makes its sizes not listed (size_states), so a delisted product leaves
+    the list even though its accepted attempt is still on record.
+    """
+    sizes = size_list(product, rows, entries)
+    out: List[Dict[str, Any]] = []
+    for platform_id in platforms:
+        facts = platform_facts(platform_id, sizes, attempts, rows, entries)
+        if not facts.anything_listed:
+            continue
+        listed_at, recorded = listed_date(
+            [a for a in attempts if a.get("platform_id") == platform_id],
+            [r for r in rows if r.get("platform_id") == platform_id],
+        )
+        out.append(
+            {
+                "platform_id": platform_id,
+                "source": SOURCE_MANUAL if recorded else SOURCE_SKUBASE,
+                # Withheld on purpose when recorded: see SOURCE_MANUAL. The caller gets
+                # null rather than a backfill timestamp dressed up as a listing date.
+                "listing_date": None if recorded else _as_utc(listed_at),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Reads
 # ---------------------------------------------------------------------------
@@ -1079,6 +1139,39 @@ async def get_history(parent_sku: str) -> Dict[str, Any]:
         settings=settings,
         product=product,
         exclusions=exclusions,
+        attempts=attempts,
+        rows=rows,
+        entries=entries,
+    )
+
+
+async def get_listing_dates(parent_sku: str) -> List[Dict[str, Any]]:
+    """build_listing_dates for a PARENT sku (the route resolves a child first).
+
+    Reads the same three groups as get_history and skips the rest of its work: no
+    exclusions (an excluded platform can still be listed, and exclusion is not part of this
+    contract) and no timeline. Read-only and concurrent, as in get_history; an unknown
+    product raises before any other read's error.
+    """
+
+    async def read_state():
+        return await _read_state(connections.get("default"), parent_sku, None)
+
+    product, config, state = await asyncio.gather(
+        _load_product(parent_sku), _load_platform_config(), read_state(), return_exceptions=True
+    )
+    if isinstance(product, BaseException):
+        raise product
+    if product is None:
+        raise _not_found()
+    for result in (config, state):
+        if isinstance(result, BaseException):
+            raise result
+    platforms, _settings = config
+    attempts, rows, entries = state
+    return build_listing_dates(
+        platforms=platforms,
+        product=product,
         attempts=attempts,
         rows=rows,
         entries=entries,
