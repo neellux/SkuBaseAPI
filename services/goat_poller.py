@@ -58,6 +58,12 @@ logger = logging.getLogger(__name__)
 # spelling of it in config.toml would be one more thing to keep in agreement.
 SYNC_STORE = "high-end-merchandise"
 
+# The name shown on the From line of the batch email. The mailbox is still the
+# email AppScript's owner.
+EMAIL_SENDER_NAME = "Luxury Emporium PT Submissions"
+# Who the batch email tells its readers to contact. Hardcoded for now.
+EMAIL_CONTACT = "yehuda@luxemporiumusa.com"
+
 # Where a submission rests while the GOAT team fills its cell.
 #
 # PROCESSING keeps batch completion behaving exactly as it does today. The
@@ -70,6 +76,26 @@ PARKED_STATUS = SubmissionStatus.PROCESSING
 # A weekend with the poller off, or the first cycle after enablement, must not
 # produce one enormous all-or-nothing append.
 MAX_CLAIM = 500
+
+
+def build_batch_email(url: str) -> tuple[str, str]:
+    """(plain text, HTML) bodies of the batch-ready email.
+
+    The plain-text one spells the URL out, because the AppScript may render only
+    that one. The HTML version carries the "here" hyperlink.
+    """
+    body = (
+        f"Please see the new PT sheet here: {url}\n\n"
+        "This is an automated email.\n"
+        f"Please reach out to {EMAIL_CONTACT} for any questions."
+    )
+    html_body = (
+        f'<p>Please see the new PT sheet <a href="{url}">here</a></p>'
+        "<p>This is an automated email.<br>"
+        f'Please reach out to <a href="mailto:{EMAIL_CONTACT}">{EMAIL_CONTACT}</a>'
+        " for any questions.</p>"
+    )
+    return body, html_body
 
 
 class GoatPoller(BasePoller):
@@ -360,12 +386,10 @@ class GoatPoller(BasePoller):
         # the same day as the tab name (goat_sheets.tab_title_for).
         now = datetime.now(EASTERN)
         subject = f"New PT Sheet: {now.month}/{now.day}/{now.year}"
-        url = tab["sheet_url"]
-        # Plain-text fallback spells the URL out, because the AppScript may render
-        # only this one. The HTML version carries the "here" hyperlink.
-        body = f"Please see the new PT sheet here: {url}"
-        html_body = f'<p>Please see the new PT sheet <a href="{url}">here</a></p>'
-        await email_service.send_to_list(list_name, subject, body, html_body)
+        body, html_body = build_batch_email(tab["sheet_url"])
+        await email_service.send_to_list(
+            list_name, subject, body, html_body, sender_name=EMAIL_SENDER_NAME
+        )
 
     # -- stage 2 -----------------------------------------------------------
 

@@ -79,6 +79,7 @@ async def send(
     html_body: str | None = None,
     cc: Sequence[str] = (),
     bcc: Sequence[str] = (),
+    sender_name: str | None = None,
 ) -> bool:
     """Send one email. Returns whether it went out; never raises.
 
@@ -93,6 +94,11 @@ async def send(
     success either way). Sending both means the message is correct under either
     behaviour: the rich version if it is supported, a readable plain-text version
     with the URL spelled out if it is not.
+
+    `sender_name` is the display name on the From line, sent as `name` because
+    that is what MailApp.sendEmail calls it. The address is always the AppScript
+    owner's mailbox. Like `htmlBody`, it only takes effect if the AppScript passes
+    it on, and a script that ignores it still answers success.
     """
     if not (ENDPOINT and API_KEY):
         logger.debug("email: [email] endpoint/api_key not configured, skipping")
@@ -109,6 +115,8 @@ async def send(
     }
     if html_body:
         payload["htmlBody"] = html_body
+    if sender_name:
+        payload["name"] = sender_name
     if cc:
         payload["cc"] = ", ".join(cc)
     if bcc:
@@ -137,7 +145,8 @@ async def send(
 
 
 async def send_to_list(
-    name: str, subject: str, body: str, html_body: str | None = None
+    name: str, subject: str, body: str, html_body: str | None = None,
+    *, sender_name: str | None = None,
 ) -> bool:
     """Resolve a named list and send to it. Never raises."""
     try:
@@ -146,7 +155,7 @@ async def send_to_list(
             return False
         return await send(
             recipients["to"], subject, body, html_body=html_body,
-            cc=recipients["cc"], bcc=recipients["bcc"],
+            cc=recipients["cc"], bcc=recipients["bcc"], sender_name=sender_name,
         )
     except Exception:  # noqa: BLE001 - a notification must never break a caller
         logger.exception("email: unexpected failure sending %r", subject)
