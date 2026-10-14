@@ -2,9 +2,10 @@ import asyncio
 import copy
 import logging
 import re
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import base64
@@ -30,6 +31,17 @@ CUSTOM_COLUMN_FIELDS = {"SIZING_SCHEME", "GENDER", "HTMLDESCRIPTION_FIXED"}
 DERIVED_SELLERCLOUD_FIELDS = {"ShippingWeight", "LongDescription"}
 
 CHILD_UPDATE_CONCURRENCY = 3
+
+# Custom catalog exports (POST /Catalog/Exports/Custom). Queued jobs: 18 SKUs took 37s
+# to 49s on prod, nearly all of it SellerCloud's queue, which has been seen 30 minutes
+# deep. So the wait is long and the poll is slow, as for eBay's export
+# (ebay_service.JOB_WAIT_SECONDS). Still bounded, because is_job_complete reads every
+# error as "not done yet" and a lost job would otherwise be polled forever.
+CUSTOM_EXPORT_ENDPOINT = "/Catalog/Exports/Custom"
+CUSTOM_EXPORT_KEY = "ProductID"
+CUSTOM_EXPORT_CHUNK = 2000
+EXPORT_POLL_SECONDS = 60
+EXPORT_WAIT_SECONDS = 6 * 60 * 60
 
 FIELD_NAME_OVERRIDES = {
     "ProductType": "ProductTypeName",
@@ -856,6 +868,72 @@ class SellerCloudService:
             return base64.b64decode(response.content, validate=True)
         except Exception:
             return response.content
+
+    async def export_custom_columns(
+        self,
+        product_ids: List[str],
+        columns: List[str],
+        *,
+        wait_seconds: int = EXPORT_WAIT_SECONDS,
+        poll_seconds: int = EXPORT_POLL_SECONDS,
+        heartbeat: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+        """`columns` for each product, keyed by ProductID, via custom export jobs.
+
+        Returns (rows, job ids). Read-only on SellerCloud's side.
+
+        Two silent cases the caller must handle, both verified on prod 2026-10-14:
+        a product SellerCloud does not know is simply absent from the file, so a missing
+        key means "unknown", never zero; and an unknown COLUMN name does not error, it
+        exports blank on every row (AvailableQty does this; the column is
+        InventoryAvailableQty).
+
+        Every chunk is queued before any is waited on, since the time is the queue's.
+        `heartbeat` is awaited once per poll while jobs are pending, so the caller's rows
+        do not look stale. Raises TimeoutError past `wait_seconds`, RuntimeError when no
+        job is queued or SellerCloud reports one failed.
+        """
+        ids = list(dict.fromkeys(p for p in product_ids if p))
+        if not ids:
+            return {}, []
+        body_columns = [{"OriginalName": c, "DisplayName": c} for c in columns]
+        job_ids: List[str] = []
+        for start in range(0, len(ids), CUSTOM_EXPORT_CHUNK):
+            queued = await self.post(
+                CUSTOM_EXPORT_ENDPOINT,
+                data={
+                    "Columns": body_columns,
+                    "ProductIds": ids[start : start + CUSTOM_EXPORT_CHUNK],
+                    "FileFormat": 0,  # tab delimited
+                },
+            )
+            link = (queued or {}).get("QueuedJobLink") or ""
+            if "id=" not in link:
+                raise RuntimeError(f"{CUSTOM_EXPORT_ENDPOINT} returned no job link: {queued}")
+            job_ids.append(link.split("id=")[1].split("&")[0])
+
+        deadline = time.monotonic() + wait_seconds
+        pending = list(job_ids)
+        while pending:
+            await asyncio.sleep(poll_seconds)
+            pending = [job_id for job_id in pending if not await self.is_job_complete(job_id)]
+            if not pending:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"export job(s) {', '.join(pending)} did not finish in {wait_seconds}s"
+                )
+            if heartbeat is not None:
+                try:
+                    await heartbeat()
+                except Exception:  # noqa: BLE001 - a missed beat is retried, not fatal
+                    logger.warning("Custom export heartbeat failed", exc_info=True)
+
+        rows: Dict[str, Dict[str, str]] = {}
+        for job_id in job_ids:
+            raw = await self.get_job_output_file(job_id)
+            rows.update(parse_tab_export(raw.decode("utf-8", "replace")))
+        return rows, job_ids
 
     async def update_product_upc(self, product_id: str, upc: str) -> Dict[str, Any]:
         response = await self.put(
@@ -1976,6 +2054,25 @@ class SellerCloudService:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+
+def parse_tab_export(text: str, key: str = CUSTOM_EXPORT_KEY) -> Dict[str, Dict[str, str]]:
+    """A tab-delimited export's rows keyed by `key`, every cell stripped.
+
+    By HEADER NAME, never by position: SellerCloud inserts ProductName after ProductID
+    without being asked, so the column order is its choice and not ours.
+    """
+    lines = [line for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
+    if not lines:
+        return {}
+    header = [name.strip() for name in lines[0].split("\t")]
+    out: Dict[str, Dict[str, str]] = {}
+    for line in lines[1:]:
+        row = {name: cell.strip() for name, cell in zip(header, line.split("\t"))}
+        product_id = row.get(key) or ""
+        if product_id:
+            out[product_id] = row
+    return out
 
 
 sellercloud_service = SellerCloudService()

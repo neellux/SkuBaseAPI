@@ -716,10 +716,8 @@ class DatabaseService:
         """Add platform_id to excluded_platforms for the named records (dedup).
 
         The inverse of clear_excluded_platform_for_internal_values: records a
-        global "this value is intentionally not mapped here" exclusion. The
-        `- $1 || jsonb_build_array($1)` idiom removes any existing occurrence
-        first so the platform_id is never duplicated. No-op on tables without
-        the column.
+        global "this value is intentionally not mapped here" exclusion. Never
+        duplicates the platform_id. No-op on tables without the column.
         """
         if not internal_values:
             return
@@ -728,13 +726,24 @@ class DatabaseService:
             return
         col = validate_sql_identifier(schema.primary_business_column)
         main_table = DatabaseService._table(table_name)
+        # Sorted, and skipped when already excluded. Record saves write this column
+        # sorted, so appending here left the same set in a different order, and the
+        # next save of the record then counted as a real change and re-ran
+        # trigger_recompute_on_brand_exclusion over every listing of the brand.
         sql = f"""
             UPDATE "{main_table}"
-            SET excluded_platforms =
-                    (COALESCE(excluded_platforms, '[]'::jsonb) - $1)
-                    || jsonb_build_array($1),
+            SET excluded_platforms = (
+                    SELECT COALESCE(jsonb_agg(p ORDER BY p), '[]'::jsonb)
+                    FROM (
+                        SELECT jsonb_array_elements_text(
+                                   COALESCE(excluded_platforms, '[]'::jsonb)) AS p
+                        UNION
+                        SELECT $1::text
+                    ) merged
+                ),
                 updated_at = NOW()
             WHERE LOWER("{col}") = ANY($2)
+              AND NOT COALESCE(excluded_platforms, '[]'::jsonb) ? $1::text
         """
         try:
             await Tortoise.get_connection("default").execute_query(
@@ -774,6 +783,36 @@ class DatabaseService:
         except Exception:
             # Table has no excluded_platforms column (exclude not enabled): nothing to clear.
             pass
+
+    @staticmethod
+    async def internal_values_mapped_on_platform(
+        table_name: str, internal_values: List[str], platform_id: str
+    ) -> List[str]:
+        """Which of the named records already carry a mapping on platform_id.
+
+        Records are matched the way sync_default_list_internal_values resolves
+        them (exact primary value), because this guards that write.
+        """
+        if not internal_values:
+            return []
+        mapping_table = DatabaseService._table(f"{table_name}_default_list")
+        if not await DatabaseService.table_exists(mapping_table):
+            return []
+        schema = await DatabaseService.get_table_schema(table_name)
+        if not schema or not schema.primary_business_column:
+            return []
+        primary_col = validate_sql_identifier(schema.primary_business_column)
+        sql = f"""
+            SELECT DISTINCT r."{primary_col}" AS internal_value
+            FROM "{DatabaseService._table(table_name)}" r
+            JOIN "{mapping_table}" dl ON dl.primary_id = r.id
+            WHERE r."{primary_col}" = ANY($1) AND dl.platform_id = $2
+            ORDER BY 1
+        """
+        rows = await Tortoise.get_connection("default").execute_query_dict(
+            sql, [list(internal_values), platform_id]
+        )
+        return [str(r["internal_value"]) for r in rows]
 
     @staticmethod
     async def insert_record(table_name: str, data: Dict[str, Any]) -> str:

@@ -247,6 +247,15 @@ GOAT_DEFAULT_SETTINGS = {
 }
 
 
+# goat_sneakers is goat's flow with a different sheet layout (goat_sneakers_service). The
+# Shoes layout has no Main Color column, so there is no colour mapping to require; a True
+# here would 422 every submit on a colour the sheet never receives.
+GOAT_SNEAKERS_DEFAULT_SETTINGS = {
+    **GOAT_DEFAULT_SETTINGS,
+    "require_color_mapping": False,
+}
+
+
 # The scheduled daily flush (services/scheduled_flush.py), on every batch platform. None, not
 # 0: the GET returns null, the field renders blank, and a save writes null, because blank is
 # what "off" looks like.
@@ -263,6 +272,7 @@ def _hydrate_platform_settings(platform_settings: dict) -> dict:
         ("grailed", GRAILED_DEFAULT_SETTINGS),
         ("ebay", EBAY_DEFAULT_SETTINGS),
         ("goat", GOAT_DEFAULT_SETTINGS),
+        ("goat_sneakers", GOAT_SNEAKERS_DEFAULT_SETTINGS),
     ):
         platform = dict(merged.get(platform_id) or {})
         for key, default_value in {**defaults, **SCHEDULED_FLUSH_DEFAULTS}.items():

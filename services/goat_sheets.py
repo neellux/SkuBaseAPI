@@ -69,10 +69,14 @@ _TRANSIENT_REASONS = frozenset(
 EASTERN: Final = ZoneInfo("America/New_York")
 
 
-def tab_title_for(when: datetime | None = None) -> str:
-    """`9.4.2026` - M.D.YYYY, unpadded, matching the Master Sheet dashboard. Eastern date."""
+def tab_title_for(when: datetime | None = None, suffix: str = "") -> str:
+    """`9.4.2026` - M.D.YYYY, unpadded, matching the Master Sheet dashboard. Eastern date.
+
+    `suffix` is what tells two platforms' tabs apart when they share a spreadsheet:
+    goat_sneakers writes `9.4.2026 - Shoes`.
+    """
     d = when.astimezone(EASTERN) if when else datetime.now(EASTERN)
-    return f"{d.month}.{d.day}.{d.year}"
+    return f"{d.month}.{d.day}.{d.year}{suffix}"
 
 
 def a1(tab_title: str, cells: str) -> str:
@@ -84,11 +88,24 @@ def a1(tab_title: str, cells: str) -> str:
     return f"'{tab_title.replace(chr(39), chr(39) * 2)}'!{cells}"
 
 
-class GoatSheets:
-    """One spreadsheet. Owns the token and the HTTP client, nothing else."""
+# One lock per spreadsheet, shared by every GoatSheets pointed at it. goat and
+# goat_sneakers normally write into the same file from two pollers, and two of the
+# writes are multi-call: a tab is list -> copyTo -> rename, and the dashboard is
+# clear -> update. Interleaved, the first can mint a duplicate title and the second
+# can leave the dashboard blank.
+_spreadsheet_locks: dict[str, asyncio.Lock] = {}
 
-    def __init__(self) -> None:
-        cfg = config.get("goat", {})
+
+class GoatSheets:
+    """One spreadsheet. Owns the token and the HTTP client, nothing else.
+
+    `section` is the config.toml table it reads, one per GOAT-family platform:
+    `[goat]` and `[goat_sneakers]`.
+    """
+
+    def __init__(self, section: str = "goat") -> None:
+        self.section = section
+        cfg = config.get(section, {})
         self.service_account: str = cfg.get("service_account", "service-account-3.json")
         self.spreadsheet_id: str = cfg.get("spreadsheet_id", "")
         self.master_tab: str = cfg.get("master_tab", "Master Sheet")
@@ -106,6 +123,12 @@ class GoatSheets:
     @property
     def configured(self) -> bool:
         return bool(self.spreadsheet_id and self.template_file_id)
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """The lock for this spreadsheet. Not reentrant: create_tab takes it itself,
+        and the poller holds it around its dashboard compare-and-write."""
+        return _spreadsheet_locks.setdefault(self.spreadsheet_id, asyncio.Lock())
 
     def tab_url(self, tab_id: int) -> str:
         return f"https://docs.google.com/spreadsheets/d/{self.spreadsheet_id}/edit#gid={tab_id}"
@@ -140,13 +163,13 @@ class GoatSheets:
     def _require_execute(self, what: str) -> None:
         if not self.execute:
             raise GoatPermanentError(
-                f"GOAT writes are disabled ([goat] execute = false), refusing {what}"
+                f"GOAT writes are disabled ([{self.section}] execute = false), refusing {what}"
             )
 
     def _require_configured(self) -> None:
         if not self.configured:
             raise GoatPermanentError(
-                "GOAT: [goat] spreadsheet_id or template_file_id is not set"
+                f"GOAT: [{self.section}] spreadsheet_id or template_file_id is not set"
             )
 
     @staticmethod
@@ -268,28 +291,31 @@ class GoatSheets:
         self._require_execute("a tab creation")
         self._require_configured()
 
-        existing = await self.list_tabs()
-        title, n = desired_title, 1
-        while title in existing:
-            n += 1
-            title = f"{desired_title} ({n})"
+        # Under the spreadsheet lock: the title is only unique if nothing else adds
+        # a tab between the listing and the rename.
+        async with self.lock:
+            existing = await self.list_tabs()
+            title, n = desired_title, 1
+            while title in existing:
+                n += 1
+                title = f"{desired_title} ({n})"
 
-        props = await self._request(
-            "POST",
-            f"{SHEETS}/{self.template_file_id}/sheets/{self.template_tab_id}:copyTo",
-            "sheets.copyTo",
-            json={"destinationSpreadsheetId": self.spreadsheet_id},
-        )
-        tab_id = props["sheetId"]
+            props = await self._request(
+                "POST",
+                f"{SHEETS}/{self.template_file_id}/sheets/{self.template_tab_id}:copyTo",
+                "sheets.copyTo",
+                json={"destinationSpreadsheetId": self.spreadsheet_id},
+            )
+            tab_id = props["sheetId"]
 
-        await self._request(
-            "POST", f"{SHEETS}/{self.spreadsheet_id}:batchUpdate",
-            "batchUpdate.updateSheetProperties",
-            json={"requests": [{"updateSheetProperties": {
-                "properties": {"sheetId": tab_id, "title": title, "index": 1},
-                "fields": "title,index",
-            }}]},
-        )
+            await self._request(
+                "POST", f"{SHEETS}/{self.spreadsheet_id}:batchUpdate",
+                "batchUpdate.updateSheetProperties",
+                json={"requests": [{"updateSheetProperties": {
+                    "properties": {"sheetId": tab_id, "title": title, "index": 1},
+                    "fields": "title,index",
+                }}]},
+            )
         logger.info("GOAT: created tab %r (gid=%s)", title, tab_id)
         return {"tab_id": tab_id, "tab_title": title, "sheet_url": self.tab_url(tab_id)}
 
@@ -342,6 +368,9 @@ class GoatSheets:
         USER_ENTERED, unlike every other write here, because the Sheet Name column
         is a live HYPERLINK formula. Clearing first stops a shrinking dashboard
         leaving orphaned rows behind.
+
+        The caller holds `self.lock`: the clear and the update are two calls, and
+        the signature check that decides whether to write at all sits with them.
         """
         self._require_execute("a master sheet write")
         self._require_configured()
@@ -360,4 +389,5 @@ class GoatSheets:
         )
 
 
-goat_sheets = GoatSheets()
+goat_sheets = GoatSheets("goat")
+goat_sneakers_sheets = GoatSheets("goat_sneakers")

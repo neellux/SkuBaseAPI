@@ -8,10 +8,12 @@ from listingoptions.models.api_models import (
     DefaultListResponse,
     SizingListResponse,
     SuccessResponse,
+    MappingSyncResponse,
     PaginatedResponse,
     DefaultListInternalValuesUpdate,
 )
 from listingoptions.services.database_service import DatabaseService
+from listingoptions.services.exclusive_platforms import applies_to, exclusive_counterpart
 import logging
 import json
 import csv
@@ -115,7 +117,7 @@ async def update_default_list_entry(
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@router.put("/default/internal_values", response_model=SuccessResponse)
+@router.put("/default/internal_values", response_model=MappingSyncResponse)
 async def sync_default_internal_values(
     payload: DefaultListInternalValuesUpdate,
     table_name: str = Query(..., description="Name of the table"),
@@ -130,7 +132,28 @@ async def sync_default_internal_values(
                 internal_values=payload.internal_values,
                 platform_id=payload.platform_id,
             )
-            return SuccessResponse(message="Exclusion saved successfully")
+            return MappingSyncResponse(message="Exclusion saved successfully")
+
+        # goat / goat_sneakers: a type is mapped to one of the pair, never both
+        # (exclusive_platforms); brands may be on both. Refused rather than moved, so
+        # a mapping is only ever removed by the operator who owns it. 400, not 409:
+        # every caller reads a 409 from this endpoint as the remap confirmation.
+        counterpart = exclusive_counterpart(payload.platform_id)
+        if counterpart and not applies_to(await DatabaseService.get_table_schema(table_name)):
+            counterpart = None
+        if counterpart:
+            already_mapped = await DatabaseService.internal_values_mapped_on_platform(
+                table_name, payload.internal_values, counterpart
+            )
+            if already_mapped:
+                other = await DatabaseService.get_platform_by_id(counterpart)
+                shown = ", ".join(already_mapped[:3])
+                if len(already_mapped) > 3:
+                    shown += f" and {len(already_mapped) - 3} more"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Already mapped to {other.name if other else counterpart}: {shown}",
+                )
 
         # Create mode: fail fast if the platform value already exists, before
         # the conflict check, so the user is told to edit the existing entry
@@ -179,7 +202,20 @@ async def sync_default_internal_values(
             internal_values=payload.internal_values,
             platform_id=payload.platform_id,
         )
-        return SuccessResponse(message="Platform mapping updated successfully")
+        # ...and excludes it from the counterpart platform. Returned so the mapping
+        # dialog can close that platform's tab instead of asking for a mapping the
+        # check above would now refuse.
+        also_excluded = []
+        if counterpart and payload.internal_values:
+            await DatabaseService.add_excluded_platform_for_internal_values(
+                table_name=table_name,
+                internal_values=payload.internal_values,
+                platform_id=counterpart,
+            )
+            also_excluded = [counterpart]
+        return MappingSyncResponse(
+            message="Platform mapping updated successfully", also_excluded=also_excluded
+        )
     except HTTPException:
         raise
     except ValueError as e:

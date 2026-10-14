@@ -202,6 +202,7 @@ PLATFORM_LABELS = {
     "ebay": "eBay",
     "1nventory": "1nventory",
     "goat": "GOAT",
+    "goat_sneakers": "GOAT Sneakers",
 }
 
 # The key listing_routes takes before creating submission rows. Delist and Restore take the

@@ -332,6 +332,17 @@ class SuccessResponse(BaseModel):
     message: str
 
 
+class MappingSyncResponse(SuccessResponse):
+
+    also_excluded: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Platforms the mapped values were excluded from as a result of this mapping "
+            "(see listingoptions/services/exclusive_platforms.py)."
+        ),
+    )
+
+
 class ErrorResponse(BaseModel):
 
     success: bool = False

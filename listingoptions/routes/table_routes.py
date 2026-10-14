@@ -18,6 +18,11 @@ from listingoptions.models.api_models import (
 import traceback
 import time
 from listingoptions.services.database_service import DatabaseService
+from listingoptions.services.exclusive_platforms import (
+    applies_to,
+    exclusive_counterpart,
+    resolve_exclusive,
+)
 from listingoptions.models.db_models import Platform
 from fastapi.responses import StreamingResponse
 import pandas as pd
@@ -40,7 +45,31 @@ EXCLUDED_SENTINEL = "__EXCLUDED__"
 # Platforms integrated in our listing/submission flow. A blank ("skip") mapping
 # is only allowed for these; every other platform must have a value or be
 # explicitly Excluded. Hardcoded for now — will move to DB/settings later.
-LISTING_PLATFORM_IDS = {"spo", "grailed", "ebay", "goat"}
+LISTING_PLATFORM_IDS = {"spo", "grailed", "ebay", "goat", "goat_sneakers"}
+
+
+async def _apply_exclusive_platforms(
+    table_schema, platform_mappings: Dict[str, str], excluded_platform_ids: set
+) -> None:
+    """A record mapped to one platform of an exclusive pair is excluded from the other.
+
+    Adds the counterpart to the exclusions about to be saved, and refuses a record
+    mapped to both. The update route then unlinks nothing by itself: the counterpart
+    is only ever blank here, never a mapping the operator did not clear. Types only:
+    a brand may be mapped to both (exclusive_platforms).
+    """
+    if not applies_to(table_schema):
+        return
+    to_exclude, conflict = resolve_exclusive(platform_mappings)
+    if conflict:
+        names = []
+        for platform_id in conflict:
+            platform = await DatabaseService.get_platform_by_id(platform_id)
+            names.append(platform.name if platform else platform_id)
+        raise HTTPException(
+            status_code=400, detail=f"Map to {names[0]} or {names[1]}, not both"
+        )
+    excluded_platform_ids.update(to_exclude)
 
 
 @router.post("/create", response_model=SuccessResponse)
@@ -304,6 +333,14 @@ async def get_table_schema(
                 },
                 "ui:placeholder": f"Select or enter {platform_name} value",
             }
+            # Mapping this field excludes the record from its counterpart platform
+            # (exclusive_platforms). Named here so the form can tick that field's
+            # Exclude box as soon as a value is picked, before the save does it.
+            counterpart = exclusive_counterpart(platform_id)
+            if counterpart in enabled_platform_ids and applies_to(db_schema):
+                current_field_ui_props["ui:options"]["excludes_field"] = (
+                    f"platform_mapping_for_{counterpart}_of_{db_schema.primary_business_column}"
+                )
             ui_schema_props[field_name] = current_field_ui_props
 
             if not first_platform_field_name_for_grid:
@@ -515,6 +552,10 @@ async def create_record(
                 # blank / None: a deliberate skip, neither a mapping nor an exclusion.
             else:
                 main_record_data[key] = value
+
+        await _apply_exclusive_platforms(
+            table_schema, parsed_platform_mappings, excluded_platform_ids
+        )
 
         # Persist exclusions on the record itself (hidden text_list column on tables
         # that allow exclude). insert_record drops it for tables without the column.
@@ -738,6 +779,10 @@ async def update_record(
                 # blank / None: a deliberate skip, neither a mapping nor an exclusion.
             else:
                 main_record_data[key] = value
+
+        await _apply_exclusive_platforms(
+            table_schema, parsed_platform_mappings, excluded_platform_ids
+        )
 
         # Full-replace the record's exclusions from the submitted form. Excluded
         # platforms are intentionally left out of parsed_platform_mappings so the

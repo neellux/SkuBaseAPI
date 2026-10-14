@@ -45,7 +45,7 @@ from services import catalog_product_cache
 from services.daily_sellercloud_sync_poller import daily_sellercloud_sync_poller
 from services.batch_value_service import batch_value_refresh_poller
 from services.ebay_poller import ebay_poller
-from services.goat_poller import goat_poller
+from services.goat_poller import goat_poller, goat_sneakers_poller
 from services.spo_poller import spo_poller
 from services.grailed_poller import grailed_poller
 from services.submission_poller import submission_poller
@@ -163,6 +163,7 @@ async def startup_event():
     await submission_poller.start()
     await spo_poller.start()
     await goat_poller.start()
+    await goat_sneakers_poller.start()
     await ebay_poller.start()
     await grailed_poller.start()
     await sellercloud_sync_poller.start()
@@ -216,6 +217,7 @@ async def shutdown_event():
     await gallery_image_sync_poller.stop()
     await sellercloud_sync_poller.stop()
     await goat_poller.stop()
+    await goat_sneakers_poller.stop()
     await grailed_poller.stop()
     await ebay_poller.stop()
     await spo_poller.stop()

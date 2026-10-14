@@ -14,6 +14,11 @@ the key that scopes matching to one batch, which is what keeps a non-unique
 Custom SKU (183 duplicates in prod) from attributing a GOAT SKU to the wrong
 listing.
 
+One class, two platforms. goat and goat_sneakers share this whole flow and differ
+only in what a GoatVariant holds: the platform id, the config sections and the sheet
+layout. Each gets its own poller instance (GOAT_POLLERS), so one platform's failed
+cycle never stops the other's, and normally both write tabs into the same spreadsheet.
+
 Stage 2 is a wait measured in days: the tab sits with the GOAT team until someone
 fills a cell. That is why the stale sweep here covers ONLY the `sheet_writing`
 window and never touches `awaiting_sku` - failing a row for taking a week would
@@ -22,11 +27,13 @@ be wrong, and is the eBay incident recorded at ebay_poller.py:71-78.
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable, Mapping
 
 from tortoise import connections
 from tortoise.transactions import in_transaction
@@ -35,11 +42,18 @@ from config import config
 from exceptions.goat_exceptions import GoatBuildError, GoatPermanentError, GoatTransientError
 from models.db_models import AppSettings, ListingSubmission, SubmissionStatus
 from services import goat_service
+from services import goat_sneakers_service
 from services import email_service
 from services.base_poller import BasePoller
 from services.goat_service import GoatStage
 from services.external_listing_service import ExternalListingService
-from services.goat_sheets import EASTERN, goat_sheets, tab_title_for
+from services.goat_sheets import (
+    EASTERN,
+    GoatSheets,
+    goat_sheets,
+    goat_sneakers_sheets,
+    tab_title_for,
+)
 from services.scheduled_flush import FlushStamp, run_scheduled_check, settle_stamp, stamp_flush
 from services.shopify_admin import ShopifyAdmin
 from services.shopify_client import (
@@ -78,6 +92,72 @@ PARKED_STATUS = SubmissionStatus.PROCESSING
 MAX_CLAIM = 500
 
 
+@dataclass(frozen=True, slots=True)
+class GoatVariant:
+    """One GOAT-family platform: everything that differs between goat and goat_sneakers.
+
+    The flow is the same for both, so there is one poller class and two instances of
+    it. What a variant owns is its identity, its config, and its sheet layout.
+    """
+
+    platform_id: str
+    # Prefix of every log line and build error.
+    label: str
+    name: str
+    # config.toml tables: the spreadsheet, template, email list and metafield keys,
+    # and the poller's own cadence.
+    config_section: str
+    poller_section: str
+    # Appended to the dated tab title, so two platforms can share one spreadsheet.
+    tab_suffix: str
+    default_sources: Mapping[str, str]
+    build_row: Callable[[str, Mapping[str, Any], goat_service.GoatLookups], Any]
+    # BasePoller turns a poller ON when its config section is missing. goat keeps that
+    # (its config comment documents it). A variant added later must not inherit it: a
+    # deploy that reaches a server before its config does would start a poller with no
+    # spreadsheet, which claims and requeues its pending rows on every cycle.
+    enabled_without_config: bool
+    # A layout with a Qty column exports each child's available quantity from SellerCloud
+    # while the batch is built: (listing data list, heartbeat=) -> (quantities, job ids).
+    load_quantities: Callable[..., Awaitable[tuple[dict[str, int], list[str]]]] | None = None
+
+    @property
+    def batch_sequence(self) -> str:
+        return f"{self.platform_id}_batch_seq"
+
+
+GOAT = GoatVariant(
+    platform_id=goat_service.PLATFORM_ID,
+    label=goat_service.LABEL,
+    name="GoatPoller",
+    config_section="goat",
+    poller_section="goat_poller",
+    tab_suffix="",
+    default_sources=goat_service.DEFAULT_SOURCES,
+    build_row=goat_service.build_row,
+    enabled_without_config=True,
+)
+
+GOAT_SNEAKERS = GoatVariant(
+    platform_id=goat_sneakers_service.PLATFORM_ID,
+    label=goat_sneakers_service.LABEL,
+    name="GoatSneakersPoller",
+    config_section="goat_sneakers",
+    poller_section="goat_sneakers_poller",
+    tab_suffix=" - Shoes",
+    default_sources=goat_sneakers_service.DEFAULT_SOURCES,
+    build_row=goat_sneakers_service.build_row,
+    enabled_without_config=False,
+    load_quantities=goat_sneakers_service.load_quantities,
+)
+
+# Signature of each dashboard as last written, so an unchanged dashboard costs zero
+# calls. Keyed by (spreadsheet id, dashboard tab) and shared between the pollers that
+# write into it: both compute the same combined grid, and whichever gets there first
+# writes it. Read and written under GoatSheets.lock.
+_master_signatures: dict[tuple[str, str], str] = {}
+
+
 def build_batch_email(url: str) -> tuple[str, str]:
     """(plain text, HTML) bodies of the batch-ready email.
 
@@ -99,11 +179,15 @@ def build_batch_email(url: str) -> tuple[str, str]:
 
 
 class GoatPoller(BasePoller):
-    PLATFORM_ID = goat_service.PLATFORM_ID
-
-    def __init__(self) -> None:
-        super().__init__(config_section="goat_poller", name="GoatPoller")
-        cfg = config.get("goat_poller", {})
+    def __init__(self, variant: GoatVariant = GOAT, sheets: GoatSheets = goat_sheets) -> None:
+        super().__init__(config_section=variant.poller_section, name=variant.name)
+        self.variant = variant
+        self.platform_id = variant.platform_id
+        self.tag = variant.label
+        self.sheets = sheets
+        if variant.poller_section not in config and not variant.enabled_without_config:
+            self.enabled = False
+        cfg = config.get(variant.poller_section, {})
         self.stale_minutes: int = int(cfg.get("stale_processing_timeout_minutes", 30))
         self.readback_interval = timedelta(
             minutes=int(cfg.get("readback_interval_minutes", 60))
@@ -116,10 +200,11 @@ class GoatPoller(BasePoller):
         # The spreadsheet's modifiedTime immediately after OUR last write. Without
         # this the quiet gate never opens: our own dashboard write bumps
         # modifiedTime every cycle and would look like somebody typing.
+        #
+        # Per poller even when two share a spreadsheet. Shared, the other poller's
+        # write would move this past an edit the GOAT team made in between, and the
+        # gate would then read that edit as "nothing happened since our write".
         self._our_write_mtime: datetime | None = None
-        # Signature of the dashboard as last written, so an unchanged dashboard
-        # costs zero calls.
-        self._master_signature: str | None = None
         # Each batch's flush clock stamp, held between begin_batch and run_batch because the
         # submit route calls them separately (services/scheduled_flush.py).
         self._flush_stamps: dict[int, FlushStamp | None] = {}
@@ -130,7 +215,7 @@ class GoatPoller(BasePoller):
         settings = await AppSettings.first()
         if not settings:
             return {}
-        return (settings.platform_settings or {}).get(self.PLATFORM_ID) or {}
+        return (settings.platform_settings or {}).get(self.platform_id) or {}
 
     @staticmethod
     def _parse_min_batch_size(settings: dict[str, Any]) -> int:
@@ -142,7 +227,7 @@ class GoatPoller(BasePoller):
     async def _poll_cycle(self) -> None:
         await self._recover_stale_processing()
         await run_scheduled_check(
-            self.PLATFORM_ID, count_ready=self._count_pending, flush=self._scheduled_flush
+            self.platform_id, count_ready=self._count_pending, flush=self._scheduled_flush
         )
         await self._batch_upload_pending(force=False)
         await self._check_readback()
@@ -153,7 +238,7 @@ class GoatPoller(BasePoller):
         # The raw count, although one flush claims at most MAX_CLAIM: a minimum that high
         # would be unusual, and the size trigger drains what is left.
         return await ListingSubmission.filter(
-            platform_id=self.PLATFORM_ID, status=SubmissionStatus.PENDING
+            platform_id=self.platform_id, status=SubmissionStatus.PENDING
         ).count()
 
     async def _scheduled_flush(self) -> int:
@@ -172,7 +257,7 @@ class GoatPoller(BasePoller):
         """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.stale_minutes)
         stale = await ListingSubmission.filter(
-            platform_id=self.PLATFORM_ID,
+            platform_id=self.platform_id,
             status=SubmissionStatus.PROCESSING,
             platform_status=GoatStage.SHEET_WRITING,
             updated_at__lt=cutoff,
@@ -196,13 +281,16 @@ class GoatPoller(BasePoller):
                 await sub.save(update_fields=["status", "platform_status", "updated_at"])
                 await record_step(sub.id, "requeued", stage="sheet_writing")
         if stale:
-            logger.info("GOAT: recovered %d stale sheet_writing rows", len(stale))
+            logger.info("%s: recovered %d stale sheet_writing rows", self.tag, len(stale))
 
     # -- stage 1 -----------------------------------------------------------
 
     async def _next_batch_number(self) -> int:
         conn = connections.get("default")
-        rows = await conn.execute_query_dict("SELECT nextval('goat_batch_seq') AS n")
+        # ::text::regclass, not ::regclass: asyncpg binds a regclass parameter as an oid.
+        rows = await conn.execute_query_dict(
+            "SELECT nextval($1::text::regclass) AS n", [self.variant.batch_sequence]
+        )
         return int(rows[0]["n"])
 
     async def begin_batch(self, force: bool = False) -> tuple[int | None, list[int]]:
@@ -222,7 +310,7 @@ class GoatPoller(BasePoller):
         async with in_transaction("default") as conn:
             pending = await (
                 ListingSubmission.filter(
-                    platform_id=self.PLATFORM_ID, status=SubmissionStatus.PENDING
+                    platform_id=self.platform_id, status=SubmissionStatus.PENDING
                 )
                 .order_by("id")
                 .limit(MAX_CLAIM)
@@ -252,7 +340,7 @@ class GoatPoller(BasePoller):
             ids, "sheet_writing", meta={"product_import_id": import_id}, batch_size=len(ids)
         )
         # The flush clock, settled when run_batch finishes (services/scheduled_flush.py).
-        self._flush_stamps[import_id] = await stamp_flush(self.PLATFORM_ID)
+        self._flush_stamps[import_id] = await stamp_flush(self.platform_id)
         return import_id, ids
 
     async def run_batch(self, import_id: int, submission_ids: list[int]) -> dict[str, Any]:
@@ -277,7 +365,7 @@ class GoatPoller(BasePoller):
         app_settings = await AppSettings.first()
         field_templates = (app_settings.field_templates or {}) if app_settings else {}
         platform_settings = (
-            (app_settings.platform_settings or {}).get(self.PLATFORM_ID) or {}
+            (app_settings.platform_settings or {}).get(self.platform_id) or {}
         ) if app_settings else {}
         template = await self._load_template()
         field_definitions = template.field_definitions if template else []
@@ -291,13 +379,34 @@ class GoatPoller(BasePoller):
         lookups = await goat_service.load_lookups(
             [s.listing.data or {} for s in usable],
             field_definitions, platform_settings, field_templates,
+            platform_id=self.platform_id,
+            default_sources=self.variant.default_sources,
+            label=self.tag,
         )
+
+        if self.variant.load_quantities is not None and usable:
+            # One SellerCloud export for the whole batch. Before the tab exists, so a
+            # failure here has sent nothing and the batch goes back to pending.
+            try:
+                quantities, job_ids = await self.variant.load_quantities(
+                    [s.listing.data or {} for s in usable],
+                    heartbeat=lambda: self._heartbeat(sorted(live)),
+                )
+            except Exception as exc:  # noqa: BLE001 - every failure puts the batch back
+                logger.warning("%s: quantity export failed for batch %s: %s",
+                               self.tag, import_id, exc)
+                await self._requeue(sorted(live), stage="qty_export",
+                                    reason=f"Quantity export failed: {exc}"[:300])
+                return {"submission_count": 0, "product_import_id": import_id}
+            await record_step(sorted(live), "qty_exported", job_ids=job_ids,
+                              skus=len(quantities))
+            lookups = dataclasses.replace(lookups, quantities=quantities)
 
         rows: list[list[Any]] = []
         row_ids: list[int] = []
         for sub in usable:
             try:
-                row = goat_service.build_row(
+                row = self.variant.build_row(
                     sub.listing.product_id, sub.listing.data or {}, lookups
                 )
             except GoatBuildError as exc:
@@ -305,7 +414,7 @@ class GoatPoller(BasePoller):
                 live.discard(sub.id)
                 continue
             except Exception:
-                await self._fail(sub, "Failed to build the GOAT row", stage="build_row",
+                await self._fail(sub, f"Failed to build the {self.tag} row", stage="build_row",
                                  error=traceback.format_exc())
                 live.discard(sub.id)
                 continue
@@ -318,9 +427,9 @@ class GoatPoller(BasePoller):
             return {"submission_count": 0, "product_import_id": import_id}
 
         try:
-            tab = await goat_sheets.create_tab(tab_title_for())
+            tab = await self.sheets.create_tab(tab_title_for(suffix=self.variant.tab_suffix))
         except (GoatTransientError, GoatPermanentError) as exc:
-            logger.warning("GOAT: tab creation failed: %s", exc.detail)
+            logger.warning("%s: tab creation failed: %s", self.tag, exc.detail)
             await self._requeue(row_ids, stage="sheet_writing", reason=str(exc))
             return {"submission_count": 0, "product_import_id": import_id}
 
@@ -334,7 +443,7 @@ class GoatPoller(BasePoller):
         )
 
         try:
-            written = await goat_sheets.write_rows(tab["tab_title"], rows)
+            written = await self.sheets.write_rows(tab["tab_title"], rows)
         except Exception as exc:
             # Ambiguous by construction: values.append has no idempotency key, so
             # a timeout may have committed. Never retried; a human reconciles
@@ -354,8 +463,8 @@ class GoatPoller(BasePoller):
         await ListingSubmission.filter(id__in=row_ids).update(
             status=PARKED_STATUS, platform_status=GoatStage.AWAITING_SKU
         )
-        logger.info("GOAT: batch %s wrote %d rows to tab %r",
-                    import_id, written, tab["tab_title"])
+        logger.info("%s: batch %s wrote %d rows to tab %r",
+                    self.tag, import_id, written, tab["tab_title"])
         await self._notify_batch_ready(tab, written, import_id)
         return {"submission_count": written, "product_import_id": import_id,
                 "sheet_url": tab["sheet_url"]}
@@ -378,14 +487,14 @@ class GoatPoller(BasePoller):
         sent: with one shared spreadsheet there is nothing to grant, so the
         notification is the only thing that tells anyone a new tab exists.
         """
-        list_name = config.get("goat", {}).get("email_list_name", "")
+        list_name = config.get(self.variant.config_section, {}).get("email_list_name", "")
         if not list_name:
             return
         # M/D/YYYY with slashes in the subject, matching how the sheet is
         # referred to in conversation. The tab itself is named with dots. Eastern date,
         # the same day as the tab name (goat_sheets.tab_title_for).
         now = datetime.now(EASTERN)
-        subject = f"New PT Sheet: {now.month}/{now.day}/{now.year}"
+        subject = f"New PT Sheet: {now.month}/{now.day}/{now.year}{self.variant.tab_suffix}"
         body, html_body = build_batch_email(tab["sheet_url"])
         await email_service.send_to_list(
             list_name, subject, body, html_body, sender_name=EMAIL_SENDER_NAME
@@ -397,7 +506,7 @@ class GoatPoller(BasePoller):
         """Remember the file's modifiedTime after we write, so the quiet gate can
         tell our own edit apart from the GOAT team's."""
         with contextlib.suppress(Exception):
-            self._our_write_mtime = await goat_sheets.file_modified_time()
+            self._our_write_mtime = await self.sheets.file_modified_time()
 
     async def _check_readback(self) -> None:
         now = datetime.now(timezone.utc)
@@ -405,7 +514,7 @@ class GoatPoller(BasePoller):
             return
 
         open_rows = await ListingSubmission.filter(
-            platform_id=self.PLATFORM_ID,
+            platform_id=self.platform_id,
             status=PARKED_STATUS,
             platform_status=GoatStage.AWAITING_SKU,
         ).prefetch_related("listing")
@@ -428,9 +537,9 @@ class GoatPoller(BasePoller):
             return
 
         try:
-            mtime = await goat_sheets.file_modified_time()
+            mtime = await self.sheets.file_modified_time()
         except (GoatTransientError, GoatPermanentError) as exc:
-            logger.warning("GOAT: modifiedTime check failed: %s", exc.detail)
+            logger.warning("%s: modifiedTime check failed: %s", self.tag, exc.detail)
             return
 
         # Nothing has happened since our own last write.
@@ -439,21 +548,21 @@ class GoatPoller(BasePoller):
             return
         # Somebody edited recently; they may still be typing.
         if now - mtime < self.readback_quiet:
-            logger.debug("GOAT: sheet edited %s ago, waiting for quiet", now - mtime)
+            logger.debug("%s: sheet edited %s ago, waiting for quiet", self.tag, now - mtime)
             return
 
         self._last_readback = now
         try:
-            grids = await goat_sheets.batch_read_tabs(rows_per_tab)
+            grids = await self.sheets.batch_read_tabs(rows_per_tab)
         except (GoatTransientError, GoatPermanentError) as exc:
-            logger.warning("GOAT: read-back failed: %s", exc.detail)
+            logger.warning("%s: read-back failed: %s", self.tag, exc.detail)
             return
 
         for title, grid in grids.items():
             try:
                 await self._apply_readback(title, grid, by_tab[title])
             except (GoatBuildError, GoatTransientError, GoatPermanentError) as exc:
-                logger.warning("GOAT: read-back of tab %r failed: %s", title, exc)
+                logger.warning("%s: read-back of tab %r failed: %s", self.tag, title, exc)
 
     async def _apply_readback(
         self, tab_title: str, grid: list[list[Any]], candidates: list[ListingSubmission]
@@ -484,16 +593,18 @@ class GoatPoller(BasePoller):
                 continue
             matches = by_sku.get(parsed.custom_sku)
             if not matches:
-                logger.info("GOAT: tab %r row for %r matches no open row", tab_title, parsed.custom_sku)
+                logger.info("%s: tab %r row for %r matches no open row",
+                            self.tag, tab_title, parsed.custom_sku)
                 continue
             if len(matches) > 1:
-                logger.warning("GOAT: %r is ambiguous in tab %r, skipping", parsed.custom_sku, tab_title)
+                logger.warning("%s: %r is ambiguous in tab %r, skipping",
+                               self.tag, parsed.custom_sku, tab_title)
                 continue
             sub = matches[0]
             expected = goat_service.clean_cell((sub.listing.data or {}).get("manufacturer_sku"))
             if expected and parsed.style_code and expected != parsed.style_code:
-                logger.warning("GOAT: style code disagrees for %r in tab %r, skipping",
-                               parsed.custom_sku, tab_title)
+                logger.warning("%s: style code disagrees for %r in tab %r, skipping",
+                               self.tag, parsed.custom_sku, tab_title)
                 continue
 
             if parsed.outcome == goat_service.OUTCOME_DENIED:
@@ -513,8 +624,8 @@ class GoatPoller(BasePoller):
         # products. Refuse them all rather than writing it to Shopify.
         duplicated = {sku for sku, n in seen_skus.items() if n > 1}
         if duplicated:
-            logger.warning("GOAT: tab %r repeats %d GOAT SKU(s); those rows are skipped",
-                           tab_title, len(duplicated))
+            logger.warning("%s: tab %r repeats %d GOAT SKU(s); those rows are skipped",
+                           self.tag, tab_title, len(duplicated))
             approved = {k: v for k, v in approved.items() if v["goat_sku"] not in duplicated}
 
         if denied:
@@ -522,7 +633,7 @@ class GoatPoller(BasePoller):
                 status=SubmissionStatus.SUCCESS, platform_status=GoatStage.DENIED
             )
             await record_step(denied, "denied", tab=tab_title)
-            logger.info("GOAT: %d row(s) denied in tab %r", len(denied), tab_title)
+            logger.info("%s: %d row(s) denied in tab %r", self.tag, len(denied), tab_title)
 
         if approved:
             await self._record_goat_skus(approved)
@@ -539,7 +650,7 @@ class GoatPoller(BasePoller):
             # This runs at the read-back, not at submit, which is the right moment:
             # a row parked in the sheet with no SKU (GOAT) yet is not on GOAT.
             await ExternalListingService.record(
-                "goat",
+                self.platform_id,
                 [
                     {"level": "parent", "sku": info["parent_sku"],
                      "parent_sku": info["parent_sku"],
@@ -549,7 +660,7 @@ class GoatPoller(BasePoller):
                     if info.get("parent_sku")
                 ],
             )
-            logger.info("GOAT: read back %d SKU(s) from tab %r", len(approved), tab_title)
+            logger.info("%s: read back %d SKU(s) from tab %r", self.tag, len(approved), tab_title)
 
     @staticmethod
     async def _record_goat_skus(found: dict[int, dict[str, Any]]) -> None:
@@ -591,14 +702,15 @@ class GoatPoller(BasePoller):
     async def _sync_to_1nventory(self) -> None:
         """Write goat.goat_sku onto the Shopify product, once it exists."""
         waiting = await ListingSubmission.filter(
-            platform_id=self.PLATFORM_ID,
+            platform_id=self.platform_id,
             status=PARKED_STATUS,
             platform_status=GoatStage.AWAITING_1NVENTORY,
         ).order_by("updated_at").limit(200)
         if not waiting:
             return
-        if not goat_sheets.execute:
-            logger.debug("GOAT: [goat] execute is false, skipping the 1nventory sync")
+        if not self.sheets.execute:
+            logger.debug("%s: [%s] execute is false, skipping the 1nventory sync",
+                         self.tag, self.variant.config_section)
             return
 
         gids = await self._product_gids([s.listing_id for s in waiting])
@@ -606,7 +718,7 @@ class GoatPoller(BasePoller):
         if not ready:
             return
 
-        settings = config.get("goat", {})
+        settings = config.get(self.variant.config_section, {})
         entries = [
             {"ownerId": gid,
              "namespace": settings.get("metafield_namespace", "goat"),
@@ -626,16 +738,16 @@ class GoatPoller(BasePoller):
         try:
             failures = await admin.set_metafields(entries)
         except ShopifyTransientError as exc:
-            logger.warning("GOAT: metafield write deferred: %s", exc)
+            logger.warning("%s: metafield write deferred: %s", self.tag, exc)
             return
         except ShopifyPermanentError as exc:
-            logger.error("GOAT: metafield write rejected: %s", exc)
+            logger.error("%s: metafield write rejected: %s", self.tag, exc)
             return
 
         done_ids: list[int] = []
         for sub, gid in ready:
             if gid in failures:
-                logger.warning("GOAT: %s metafield failed: %s", gid, failures[gid])
+                logger.warning("%s: %s metafield failed: %s", self.tag, gid, failures[gid])
                 continue
             # STV is GOAT's checkbox, read back in stage 2. It is the whole
             # derivation of the gsync tag - there is no local predicate.
@@ -650,7 +762,7 @@ class GoatPoller(BasePoller):
             await ListingSubmission.filter(id__in=done_ids).update(
                 status=SubmissionStatus.SUCCESS, platform_status=GoatStage.LISTED
             )
-            logger.info("GOAT: synced %d row(s) to 1nventory", len(done_ids))
+            logger.info("%s: synced %d row(s) to 1nventory", self.tag, len(done_ids))
 
     @staticmethod
     async def _product_gids(listing_ids: list[Any]) -> dict[Any, str]:
@@ -679,14 +791,28 @@ class GoatPoller(BasePoller):
 
     # -- the Master Sheet dashboard ----------------------------------------
 
+    def _dashboard_platforms(self) -> list[str]:
+        """Every GOAT-family platform whose tabs belong on this poller's dashboard."""
+        return [
+            poller.platform_id
+            for poller in GOAT_POLLERS.values()
+            if poller.sheets.spreadsheet_id == self.sheets.spreadsheet_id
+            and poller.sheets.master_tab == self.sheets.master_tab
+        ]
+
     async def _update_master(self) -> None:
         """Rewrite the whole dashboard, but only when a count actually changed.
 
         One grouped query builds every row, so a tab that is Done costs nothing to
         keep rendering. The signature check is what stops us writing - and so
         bumping the file's modifiedTime, which the quiet gate reads - every cycle.
+
+        The dashboard belongs to the spreadsheet, not to the platform: goat and
+        goat_sneakers normally share one file, so each poller renders the tabs of
+        both and the signature is shared (_master_signatures). Whichever poller
+        notices a change writes it; the other then finds the signature current.
         """
-        if not goat_sheets.execute or not goat_sheets.configured:
+        if not self.sheets.execute or not self.sheets.configured:
             return
         conn = connections.get("default")
         rows = await conn.execute_query_dict(
@@ -697,10 +823,10 @@ class GoatPoller(BasePoller):
                    count(*) FILTER (WHERE platform_meta ? 'goat_sku') AS approved,
                    count(*) FILTER (WHERE platform_status = $1)       AS denied
               FROM listing_submissions
-             WHERE platform_id = $2 AND platform_meta ? 'tab_title'
+             WHERE platform_id = ANY($2::text[]) AND platform_meta ? 'tab_title'
              GROUP BY 1, 2
             """,
-            [GoatStage.DENIED.value, self.PLATFORM_ID],
+            [GoatStage.DENIED.value, self._dashboard_platforms()],
         )
         if not rows:
             return
@@ -712,18 +838,22 @@ class GoatPoller(BasePoller):
             )
             for r in rows if r["tab_title"] and r["tab_id"] is not None
         ]
-        grid = goat_service.master_grid(master_rows, goat_sheets.spreadsheet_id)
+        grid = goat_service.master_grid(master_rows, self.sheets.spreadsheet_id)
         signature = json.dumps(grid, sort_keys=True, default=str)
-        if signature == self._master_signature:
-            return
-        try:
-            await goat_sheets.write_master(grid)
-        except (GoatTransientError, GoatPermanentError) as exc:
-            logger.warning("GOAT: master sheet update failed: %s", exc.detail)
-            return
-        self._master_signature = signature
+        key = (self.sheets.spreadsheet_id, self.sheets.master_tab)
+        # The lock covers the compare as well as the two-call write, so the other
+        # poller cannot clear the dashboard between this one's clear and update.
+        async with self.sheets.lock:
+            if signature == _master_signatures.get(key):
+                return
+            try:
+                await self.sheets.write_master(grid)
+            except (GoatTransientError, GoatPermanentError) as exc:
+                logger.warning("%s: master sheet update failed: %s", self.tag, exc.detail)
+                return
+            _master_signatures[key] = signature
         await self._note_our_write()
-        logger.info("GOAT: master sheet updated, %d batch row(s)", len(master_rows))
+        logger.info("%s: master sheet updated, %d batch row(s)", self.tag, len(master_rows))
 
     # -- helpers -----------------------------------------------------------
 
@@ -747,6 +877,15 @@ class GoatPoller(BasePoller):
         await record_step(sub.id, "failed", stage=stage, reason=display[:300])
 
     @staticmethod
+    async def _heartbeat(ids: list[int]) -> None:
+        """Refresh updated_at on rows still claimed, so a long SellerCloud wait is not
+        mistaken for a dead batch by _recover_stale_processing."""
+        if ids:
+            await ListingSubmission.filter(
+                id__in=ids, status=SubmissionStatus.PROCESSING
+            ).update(updated_at=datetime.now(timezone.utc))
+
+    @staticmethod
     async def _requeue(ids: list[int], *, stage: str, reason: str | None = None) -> None:
         if not ids:
             return
@@ -756,4 +895,10 @@ class GoatPoller(BasePoller):
         await record_step(ids, "requeued", stage=stage, reason=reason)
 
 
-goat_poller = GoatPoller()
+goat_poller = GoatPoller(GOAT, goat_sheets)
+goat_sneakers_poller = GoatPoller(GOAT_SNEAKERS, goat_sneakers_sheets)
+
+# By platform id, for the routes that act on whichever one the request names.
+GOAT_POLLERS: dict[str, GoatPoller] = {
+    poller.platform_id: poller for poller in (goat_poller, goat_sneakers_poller)
+}

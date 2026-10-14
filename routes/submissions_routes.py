@@ -29,7 +29,7 @@ from services import platform_reconcile_service
 from services import spo_service as spo_service_module
 from services.ebay_poller import ebay_poller
 from services.grailed_poller import grailed_poller
-from services.goat_poller import goat_poller
+from services.goat_poller import GOAT_POLLERS
 from services.scheduled_flush import schedule_summary
 from services.spo_poller import spo_poller
 from services.spo_service import spo_service
@@ -340,8 +340,8 @@ async def get_dashboard(
             poller = {
                 "spo": spo_poller,
                 "grailed": grailed_poller,
-                "goat": goat_poller,
                 "ebay": ebay_poller,
+                **GOAT_POLLERS,
             }.get(platform)
             schedule = await schedule_summary(
                 platform,
@@ -440,7 +440,9 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
             product_import_id=import_id,
         )
 
-    if platform == "goat":
+    if platform in GOAT_POLLERS:
+        # goat and goat_sneakers, each through its own poller.
+        #
         # eBay's shape, not Grailed's. The rows are claimed under the lock here so
         # submission_count is the real number: counting first and claiming later in a
         # background task lets the scheduled cycle claim the same rows in the gap and
@@ -448,6 +450,7 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
         #
         # Backgrounded because a flush is a Drive copy plus one permission call per GOAT
         # address plus the append, which is seconds of network the browser should not hold.
+        goat_poller = GOAT_POLLERS[platform]
         import_id, submission_ids = await goat_poller.begin_batch(force=True)
         if not submission_ids or import_id is None:
             return CreateBatchResponse(
@@ -460,7 +463,7 @@ async def create_batch(platform: str = Query(..., description="Platform identifi
             except Exception:
                 # run_batch records its own failures on the rows; this only catches a
                 # crash outside them, which would otherwise vanish with the task.
-                logger.exception("Background GOAT batch %s failed", import_id)
+                logger.exception("Background %s batch %s failed", platform, import_id)
 
         _background_tasks.add(task := asyncio.create_task(_run_goat_batch()))
         task.add_done_callback(_background_tasks.discard)

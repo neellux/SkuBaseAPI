@@ -197,10 +197,10 @@ class SubmissionPoller(BasePoller):
                 # run_submission owns the status/step/external_id writes, so a row from
                 # here is indistinguishable from one submitted inline by listing_routes.
                 await oneinventory_service.run_submission(submission, listing)
-            elif submission.platform_id in ("grailed", "spo", "ebay", "goat"):
+            elif submission.platform_id in ("grailed", "spo", "ebay", "goat", "goat_sneakers"):
                 # manual_fallback batch platforms handled by their own pollers
-                # (grailed_poller / spo_poller / goat_poller); nothing to do
-                # per-listing.
+                # (grailed_poller / spo_poller / goat_poller, which runs both goat
+                # platforms); nothing to do per-listing.
                 #
                 # ebay is listed here before it has a poller on purpose. It is disabled
                 # (absent from app_settings.platforms) so no rows should exist, but the

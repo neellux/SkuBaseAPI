@@ -19,11 +19,16 @@ time. Batched it is five queries and a couple of seconds.
 
 Taking `product_id: str` rather than a Listing model is also deliberate: it means
 the unit tests need no Tortoise initialisation.
+
+This module is also the shared half of the GOAT family. goat_sneakers is a second
+platform with the same flow and a different sheet layout (goat_sneakers_service):
+it reuses load_lookups and the resolve_* helpers below under its own platform id,
+which GoatLookups carries so no lookup can resolve under the wrong platform.
 """
 
 import logging
 import re
-from dataclasses import dataclass, fields as dataclass_fields
+from dataclasses import dataclass, field, fields as dataclass_fields
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Final, Mapping, Sequence
@@ -38,6 +43,8 @@ from services.template_render import build_field_value
 logger = logging.getLogger(__name__)
 
 PLATFORM_ID: Final = "goat"
+# Prefix of every build error, which is shown to the operator as error_display.
+LABEL: Final = "GOAT"
 
 GCS_BUCKET: Final = config.get("gcs_bucket_products", "lux_products")
 GCS_BASE_URL: Final = f"https://storage.googleapis.com/{GCS_BUCKET}"
@@ -222,23 +229,27 @@ class GoatRow:
     sizes: str = ""
 
     def as_cells(self) -> list[Any]:
-        """Cells for one sheet row.
-
-        The two checkbox columns bypass clean_cell deliberately: it stringifies
-        bools, and writing "false" into a cell whose data validation is BOOLEAN
-        breaks the checkbox. Under valueInputOption=RAW a JSON false is stored as
-        a real boolean, which is what the checkbox reads.
-        """
-        return [
-            bool(getattr(self, f.name))
-            if f.name in BOOLEAN_COLUMNS
-            else clean_cell(getattr(self, f.name))
-            for f in dataclass_fields(self)
-        ]
+        return row_cells(self)
 
 
-# GoatRow fields that are checkbox columns rather than text.
+# Row fields that are checkbox columns rather than text, on every GOAT layout.
 BOOLEAN_COLUMNS: Final[frozenset[str]] = frozenset({"stv", "denied"})
+
+
+def row_cells(row: Any) -> list[Any]:
+    """Cells for one sheet row, in the row dataclass's field order.
+
+    The two checkbox columns bypass clean_cell deliberately: it stringifies
+    bools, and writing "false" into a cell whose data validation is BOOLEAN
+    breaks the checkbox. Under valueInputOption=RAW a JSON false is stored as
+    a real boolean, which is what the checkbox reads.
+    """
+    return [
+        bool(getattr(row, f.name))
+        if f.name in BOOLEAN_COLUMNS
+        else clean_cell(getattr(row, f.name))
+        for f in dataclass_fields(row)
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,22 +282,35 @@ class GoatLookups:
     color_by_name: Mapping[str, str]
     taxonomy_by_type: Mapping[str, TypeTaxonomy]
     scheme_by_name: Mapping[str, SizingScheme]
+    # Which platform these were resolved FOR. Brand and colour mappings, column
+    # overrides and field templates are all per platform, so the builders read it
+    # from here rather than from a module constant.
+    platform_id: str = PLATFORM_ID
+    label: str = LABEL
+    # Available quantity per child SKU, exported from SellerCloud when the batch is
+    # created. Filled only for a layout with a Qty column (goat_sneakers); goat's is empty.
+    quantities: Mapping[str, int] = field(default_factory=dict)
 
 
-def column_sources(field_definitions: Sequence[Mapping[str, Any]]) -> dict[str, str]:
-    """DEFAULT_SOURCES, overridden by any goat entry in field_definitions.
+def column_sources(
+    field_definitions: Sequence[Mapping[str, Any]],
+    platform_id: str = PLATFORM_ID,
+    defaults: Mapping[str, str] = DEFAULT_SOURCES,
+) -> dict[str, str]:
+    """The layout's default sources, overridden by that platform's entries in
+    field_definitions.
 
     A field def maps a local field to a platform: {"name": "style_name",
     "platforms": [{"platform_id": "goat", "field_id": "name"}]} routes
     `style_name` into the sheet's Name column.
     """
-    sources = dict(DEFAULT_SOURCES)
+    sources = dict(defaults)
     for field_def in field_definitions or ():
         local_name = field_def.get("name")
         if not local_name:
             continue
         for platform in field_def.get("platforms") or ():
-            if platform.get("platform_id") == PLATFORM_ID and platform.get("field_id"):
+            if platform.get("platform_id") == platform_id and platform.get("field_id"):
                 sources[platform["field_id"]] = local_name
     return sources
 
@@ -296,6 +320,10 @@ async def load_lookups(
     field_definitions: Sequence[Mapping[str, Any]],
     platform_settings: Mapping[str, Any],
     field_templates: Mapping[str, Any],
+    *,
+    platform_id: str = PLATFORM_ID,
+    default_sources: Mapping[str, str] = DEFAULT_SOURCES,
+    label: str = LABEL,
 ) -> GoatLookups:
     """Every database read the batch needs, in four queries.
 
@@ -304,7 +332,7 @@ async def load_lookups(
     message needs to say which, and a plain join collapses them.
     """
     conn = connections.get("default")
-    sources = column_sources(field_definitions)
+    sources = column_sources(field_definitions, platform_id, default_sources)
 
     def distinct(local_name: str) -> list[str]:
         seen = {
@@ -315,7 +343,8 @@ async def load_lookups(
         return sorted(seen)
 
     brands = distinct(sources.get("brand", "brand_name"))
-    colors = distinct(sources.get("main_color", "standard_color"))
+    # A layout with no Main Color column (goat_sneakers) has no colour to map.
+    colors = distinct(sources["main_color"]) if "main_color" in sources else []
     types = distinct("product_type")
     schemes = sorted(
         {clean_cell(fd.get("SIZING_SCHEME")) for fd in form_datas if clean_cell(fd.get("SIZING_SCHEME"))}
@@ -338,7 +367,7 @@ async def load_lookups(
               LEFT JOIN listingoptions_brands_default_list bdl
                      ON bdl.primary_id = b.id AND bdl.platform_id = $2
             """,
-            [brands, PLATFORM_ID],
+            [brands, platform_id],
         )
         for row in rows:
             if row["known"]:
@@ -362,7 +391,7 @@ async def load_lookups(
               LEFT JOIN listingoptions_colors_default_list cdl
                      ON cdl.primary_id = c.id AND cdl.platform_id = $2
             """,
-            [colors, PLATFORM_ID],
+            [colors, platform_id],
         )
         color_by_name = {r["needle"]: r["platform_value"] for r in rows if r["platform_value"]}
 
@@ -421,7 +450,74 @@ async def load_lookups(
         color_by_name=color_by_name,
         taxonomy_by_type=taxonomy_by_type,
         scheme_by_name=scheme_by_name,
+        platform_id=platform_id,
+        label=label,
     )
+
+
+def field_value(column: str, form_data: Mapping[str, Any], lookups: GoatLookups) -> str:
+    """One mapped column: the local field feeding it, through any field template."""
+    local_name = lookups.column_sources.get(column)
+    if not local_name:
+        return ""
+    return clean_cell(
+        build_field_value(
+            lookups.field_templates,
+            lookups.platform_id,
+            local_name,
+            lookups.field_defs_by_name.get(local_name),
+            form_data,
+        )
+    )
+
+
+def resolve_brand(form_data: Mapping[str, Any], lookups: GoatLookups) -> str:
+    """The platform's brand for this listing, or the raw one when no mapping is required."""
+    brand_raw = field_value("brand", form_data, lookups)
+    if not brand_raw:
+        return brand_raw
+    mapped = lookups.brand_by_name.get(brand_raw.lower())
+    if mapped:
+        return mapped
+    if lookups.require_brand_mapping:
+        known = brand_raw.lower() in lookups.brand_known
+        raise GoatBuildError(
+            f"{lookups.label}: no brand mapping for {brand_raw!r}"
+            + ("" if known else " (brand not in listing options)")
+        )
+    return brand_raw
+
+
+def resolve_color(form_data: Mapping[str, Any], lookups: GoatLookups) -> str:
+    color_raw = field_value("main_color", form_data, lookups)
+    if not color_raw:
+        return color_raw
+    mapped = lookups.color_by_name.get(color_raw.lower())
+    if mapped:
+        return mapped
+    if lookups.require_color_mapping:
+        raise GoatBuildError(f"{lookups.label}: no colour mapping for {color_raw!r}")
+    return color_raw
+
+
+def resolve_taxonomy(form_data: Mapping[str, Any], lookups: GoatLookups) -> TypeTaxonomy | None:
+    """The listing's type record. None only when the listing has no product type."""
+    product_type_raw = clean_cell(form_data.get("product_type"))
+    taxonomy = lookups.taxonomy_by_type.get(product_type_raw.lower())
+    if product_type_raw and taxonomy is None:
+        raise GoatBuildError(
+            f"{lookups.label}: product type {product_type_raw!r} is not in listing options"
+        )
+    return taxonomy
+
+
+def goat_gender(taxonomy: TypeTaxonomy | None) -> str:
+    """Never a gate: a missing or unrecognised gender must not hold a batch."""
+    return GOAT_GENDER.get(clean_cell(taxonomy.gender if taxonomy else ""), GENDER_FALLBACK)
+
+
+def image_url(product_id: str) -> str:
+    return f"{GCS_BASE_URL}/{quote(clean_cell(product_id))}/{IMAGE_VARIANT}"
 
 
 def build_row(
@@ -436,45 +532,11 @@ def build_row(
     """
 
     def value(column: str) -> str:
-        local_name = lookups.column_sources.get(column)
-        if not local_name:
-            return ""
-        return clean_cell(
-            build_field_value(
-                lookups.field_templates,
-                PLATFORM_ID,
-                local_name,
-                lookups.field_defs_by_name.get(local_name),
-                form_data,
-            )
-        )
+        return field_value(column, form_data, lookups)
 
-    brand_raw = value("brand")
-    brand = brand_raw
-    if brand_raw:
-        mapped = lookups.brand_by_name.get(brand_raw.lower())
-        if mapped:
-            brand = mapped
-        elif lookups.require_brand_mapping:
-            known = brand_raw.lower() in lookups.brand_known
-            raise GoatBuildError(
-                f"GOAT: no brand mapping for {brand_raw!r}"
-                + ("" if known else " (brand not in listing options)")
-            )
-
-    color_raw = value("main_color")
-    main_color = color_raw
-    if color_raw:
-        mapped = lookups.color_by_name.get(color_raw.lower())
-        if mapped:
-            main_color = mapped
-        elif lookups.require_color_mapping:
-            raise GoatBuildError(f"GOAT: no colour mapping for {color_raw!r}")
-
-    product_type_raw = clean_cell(form_data.get("product_type"))
-    taxonomy = lookups.taxonomy_by_type.get(product_type_raw.lower())
-    if product_type_raw and taxonomy is None:
-        raise GoatBuildError(f"GOAT: product type {product_type_raw!r} is not in listing options")
+    brand = resolve_brand(form_data, lookups)
+    main_color = resolve_color(form_data, lookups)
+    taxonomy = resolve_taxonomy(form_data, lookups)
 
     scheme_raw = clean_cell(form_data.get("SIZING_SCHEME"))
     scheme = lookups.scheme_by_name.get(scheme_raw)
@@ -496,21 +558,20 @@ def build_row(
     sizes_cell = ""
     if goat_code.upper() == GOAT_CODE_NO_CHART:
         size_unit = GOAT_CODE_NO_CHART
-        sizes_cell = ", ".join(_ordered_sizes(form_data, scheme))
+        sizes_cell = ", ".join(ordered_sizes(form_data, scheme))
 
-    gender_raw = clean_cell(taxonomy.gender if taxonomy else "")
     return GoatRow(
         goat_sku="",
         style_code=value("style_code"),
         custom_sku=clean_cell(product_id),
-        image=f"{GCS_BASE_URL}/{quote(clean_cell(product_id))}/{IMAGE_VARIANT}",
+        image=image_url(product_id),
         name=value("name"),
         brand=brand,
         season="",
         product_type=clean_cell(taxonomy.sizing_type if taxonomy else ""),
         main_color=main_color,
         colorway=value("colorway"),
-        gender=GOAT_GENDER.get(gender_raw, GENDER_FALLBACK),
+        gender=goat_gender(taxonomy),
         composition=value("composition"),
         care_instructions="",
         country_of_manufacture=value("country_of_manufacture"),
@@ -521,7 +582,7 @@ def build_row(
     )
 
 
-def _ordered_sizes(form_data: Mapping[str, Any], scheme: SizingScheme) -> list[str]:
+def ordered_sizes(form_data: Mapping[str, Any], scheme: SizingScheme) -> list[str]:
     """This listing's distinct child sizes, in the scheme's display order.
 
     child_size_overrides is {child_sku: size}, so several children share a size

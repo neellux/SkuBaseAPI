@@ -920,6 +920,10 @@ async def submit_listing(
             },
         )
 
+    # Platforms this listing's brand or type is excluded from. Set by the gates
+    # below, read again by the row-creation loop.
+    excluded: set = set()
+
     # Mapping gates run in a fixed order so the front end resolves them one
     # category at a time (each resubmit surfaces the next): brands -> types ->
     # sizes -> colors. A brand or type explicitly excluded from a platform means
@@ -1204,6 +1208,17 @@ async def submit_listing(
 
                 if skip_reason == SKIP_NO_RESUBMIT:
                     logger.info(f"Skipping {platform_id}: resubmission not allowed")
+                    continue
+
+                # The brand or type is excluded from this platform, so the item is not
+                # listed there at all. The pills deselect an excluded platform, but the
+                # request can still name one: mapping a brand in the submit dialog
+                # excludes its counterpart platform (goat / goat_sneakers) and resubmits
+                # with the selection made before that. The gates above waved it through
+                # as "intentionally unmapped"; posting it would fail in the builder on
+                # that same missing mapping, which is a wasted real attempt.
+                if platform_id in excluded:
+                    logger.info(f"Skipping {platform_id}: brand or type is excluded there")
                     continue
 
                 # An external listing id says this parent is already on the
