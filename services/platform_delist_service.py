@@ -4,7 +4,10 @@ A person takes a listing down on a platform by hand. SkuBase would still treat t
 as listed there (presence rows in external_listing_ids, a successful attempt), so the catalog
 would never offer it again and the submit gate would block a relist. A delist records the
 takedown as a platform_delists entry and removes the presence rows it contradicts. It never
-calls a platform. Restore undoes one entry exactly, until the next attempt to that platform.
+calls a platform itself: once a delist or Restore commits, the platform's own actions run, if
+it has any (platform_actions; GOAT and GOAT Sneakers take the GOAT link off the Shopify
+product and put it back). Restore undoes one entry exactly, until the next attempt to that
+platform.
 
 Plan: docs/plans/2026-09-30-1031-feat-product-listing-history-delist-plan.md (U3).
 Schema and the one definition of an OPEN delist: migrations/add_platform_delists.sql.
@@ -191,7 +194,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from tortoise import connections
 from tortoise.transactions import in_transaction
 
-from services import catalog_service
+from services import catalog_service, platform_actions
 from services.catalog_product_cache import Product
 from services.external_listing_service import NEVER_GATED, ExternalListingService
 
@@ -1573,7 +1576,8 @@ async def delist(
 ) -> Dict[str, Any]:
     """Record that `platform_id` no longer lists `child_skus` of the parent (None: all).
 
-    One transaction under the submit lock. Raises DelistRefused. Never calls a platform.
+    One transaction under the submit lock, then the platform's actions
+    (platform_actions.after_delist). Raises DelistRefused.
     """
     comment = normalize_comment(comment)
     if platform_id in NEVER_GATED:
@@ -1634,6 +1638,13 @@ async def delist(
         user_id,
         len(plan.remove_ids),
         inserted,
+    )
+    await platform_actions.after_delist(
+        platform_id=platform_id,
+        delist_id=entry["id"],
+        parent_sku=parent_sku,
+        scope=plan.scope,
+        child_skus=product.child_skus,
     )
     return entry
 
@@ -1781,7 +1792,8 @@ SELECT count(*) AS recomputed
 
 
 async def restore(delist_id: str, user_id: str) -> Dict[str, Any]:
-    """Undo one delist entry exactly (R18). Raises DelistRefused."""
+    """Undo one delist entry exactly (R18), then the platform's actions
+    (platform_actions.after_restore). Raises DelistRefused."""
     try:
         delist_id = str(uuid.UUID(str(delist_id)))
     except ValueError:
@@ -1812,4 +1824,7 @@ async def restore(delist_id: str, user_id: str) -> Dict[str, Any]:
 
     _clear_summary_cache()
     logger.info("restore %s: %s %s by %s", delist_id, marked["platform_id"], parent_sku, user_id)
+    await platform_actions.after_restore(
+        platform_id=marked["platform_id"], delist_id=delist_id, parent_sku=parent_sku
+    )
     return _entry_out(marked)

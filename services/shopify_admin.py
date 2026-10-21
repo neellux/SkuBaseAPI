@@ -414,6 +414,61 @@ class ShopifyAdmin:
                 failures[owner] = err.get("message", "metafieldsSet rejected the value")
         return failures
 
+    async def delete_metafields(self, entries: Sequence[Mapping[str, Any]]) -> None:
+        """Delete product metafields. `entries` are {ownerId, namespace, key} dicts.
+
+        One call, so keep it to METAFIELDS_SET_CHUNK; the only caller deletes one. A
+        metafield that is already gone is not an error: Shopify answers null for it in
+        deletedMetafields.
+        """
+        if not entries:
+            return
+        await self.client.execute(
+            """
+            mutation($metafields: [MetafieldIdentifierInput!]!) {
+              metafieldsDelete(metafields: $metafields) {
+                deletedMetafields { ownerId namespace key }
+                userErrors { field message }
+              }
+            }
+            """,
+            {"metafields": [dict(e) for e in entries]},
+            operation=f"metafieldsDelete[{self.store_id}]",
+            mutation_name="metafieldsDelete",
+            is_write=True,
+        )
+
+    async def product_metafield(
+        self, gid: str, namespace: str, key: str
+    ) -> dict[str, Any] | None:
+        """One product's tags, variant SKUs and one metafield, or None if it does not exist.
+
+        Returns {id, tags, skus, metafield}, metafield being {type, value} or None. The
+        SKUs let a caller check the product is the one it means before writing to it.
+        """
+        data = await self.client.execute(
+            """
+            query($id: ID!, $ns: String!, $key: String!) {
+              product(id: $id) {
+                id tags
+                metafield(namespace: $ns, key: $key) { type value }
+                variants(first: 100) { nodes { sku } }
+              }
+            }
+            """,
+            {"id": gid, "ns": namespace, "key": key},
+            operation=f"product.metafield[{self.store_id}]",
+        )
+        node = data.get("product")
+        if not node:
+            return None
+        return {
+            "id": node["id"],
+            "tags": list(node.get("tags") or []),
+            "skus": [v.get("sku") for v in (node.get("variants") or {}).get("nodes") or []],
+            "metafield": node.get("metafield"),
+        }
+
     async def remove_tags(self, gid: str, tags: Sequence[str]) -> None:
         """Remove ONLY tags this automation owns. Never a blanket replace."""
         if not tags:

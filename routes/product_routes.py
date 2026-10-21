@@ -641,9 +641,10 @@ async def get_listing_history(
 async def delist_from_platform(body: PlatformDelistRequest, request: Request):
     """Record that a person took the product, or some sizes, down on a platform by hand.
 
-    Record-only: SkuBase stops treating those sizes as listed there, so the catalog and the
-    submit gate offer them again. Refused (409) while a submission to that platform is in
-    flight or awaiting action; SellerCloud, excluded and internal platforms never delist.
+    SkuBase stops treating those sizes as listed there, so the catalog and the submit gate
+    offer them again, and the platform's own actions run, if it has any (platform_actions).
+    Refused (409) while a submission to that platform is in flight or awaiting action;
+    SellerCloud, excluded and internal platforms never delist.
     """
     try:
         parent_sku = await _parent_or_404(body.sku)
@@ -678,7 +679,8 @@ async def restore_platform_delist(
     request: Request,
     id: str = Query(..., description="Delist entry id"),
 ):
-    """Undo one delist entry exactly, until the next submission to that platform."""
+    """Undo one delist entry exactly, until the next submission to that platform, with the
+    platform's own actions (platform_actions)."""
     try:
         entry = await platform_delist_service.restore(id, request.state.user["id"])
         return await _named_entry(entry)
@@ -699,8 +701,9 @@ async def restore_platform_delist(
 async def save_listing_ids(body: ListingIdSaveRequest, request: Request):
     """Save one platform's listing ids and delists for a product, as one recorded change.
 
-    Record-only (listing_id_service): a changed id replaces the stored one and records a
-    manual submission; a cleared id or a Delist records a delist. Answers with the fresh
+    Recorded in SkuBase (listing_id_service): a changed id replaces the stored one and
+    records a manual submission; a cleared id or a Delist records a delist. Then the
+    platform's own actions run, if it has any (platform_actions). Answers with the fresh
     listing history, so the page needs no second call. Refused, with nothing written, when
     a value changed since the page loaded it (409), an id is in use (409), the platform is
     locked (409), the product is busy (409), an id fails its format check (400), or the

@@ -1,7 +1,8 @@
 """Listing ids saved by hand on the Listing history tab, with the delists that go with them.
 
 One call saves one platform's id changes and delists for one product, as one recorded
-change. Nothing is ever sent to a platform. Plan:
+change. Nothing is sent to a platform here: once the save commits, the platform's own
+actions run, if it has any (step 5 below). Plan:
 docs/plans/2026-10-15-1256-feat-listing-history-tab-ids-plan.md (U3; R6 to R14, R17; KTD4
 to KTD9). The reading side (what each size shows and whether it can be edited) is the
 history payload's ID EDITOR in platform_delist_service, and the save judges every field
@@ -42,6 +43,9 @@ last check passes. In order:
            used by <sku>") (KTD9)
     4. Write, in this order: the delist (platform_delist_service.write_delist, the same
        core delist() runs), then the manual row, then the presence upsert.
+    5. After the commit, the platform's actions (platform_actions): after_delist for the
+       delist, as delist() runs it, and after_id_change for the changed ids. GOAT and
+       GOAT Sneakers write the GOAT ID to the Shopify metafield, or take it off.
 
     Unchanged is judged on normalized values, so 1nventory "123" against a stored
     gid://shopify/Product/123 is no change, and a save whose every change is unchanged
@@ -99,6 +103,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from tortoise.transactions import in_transaction
 
+from services import platform_actions
 from services import platform_delist_service as pds
 from services.external_listing_service import CHILD, NEVER_GATED, PARENT, SOURCE_MANUAL
 from services.goat_service import validate_goat_sku
@@ -552,9 +557,10 @@ async def save_listing_ids(
 ) -> Dict[str, Any]:
     """Save one platform's id changes and delists for a PARENT sku (module docstring).
 
-    One transaction under the submit lock. Raises DelistRefused. Returns {"platform_id",
-    "parent_sku", "delist_id", "submission_id", "changes"}, the ids null when nothing of
-    that kind was written; the route answers with the fresh history instead."""
+    One transaction under the submit lock, then the platform's actions. Raises
+    DelistRefused. Returns {"platform_id", "parent_sku", "delist_id", "submission_id",
+    "changes"}, the ids null when nothing of that kind was written; the route answers with
+    the fresh history instead."""
     saved, _product, _config = await save_listing_ids_with_inputs(
         parent_sku,
         platform_id,
@@ -680,6 +686,22 @@ async def save_listing_ids_with_inputs(
 
     if delist_id or submission_id:
         pds._clear_summary_cache()
+    if delist_id:
+        await platform_actions.after_delist(
+            platform_id=platform_id,
+            delist_id=delist_id,
+            parent_sku=parent_sku,
+            scope=plan.delist.scope,
+            child_skus=product.child_skus,
+        )
+    if submission_id:
+        await platform_actions.after_id_change(
+            platform_id=platform_id,
+            parent_sku=parent_sku,
+            child_skus=product.child_skus,
+            changes=[e.record() for e in plan.edits],
+            submission_id=submission_id,
+        )
     logger.info(
         "listing ids %s %s by %s: %d changed, delist %s, manual row %s",
         platform_id,
