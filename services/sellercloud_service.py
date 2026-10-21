@@ -869,6 +869,56 @@ class SellerCloudService:
         except Exception:
             return response.content
 
+    async def get_latest_task_output(
+        self,
+        task_id: int,
+        *,
+        max_age_hours: float,
+        task_timezone: str = "America/New_York",
+    ) -> Optional[Tuple[str, datetime, bytes]]:
+        """(job id, completed at, output bytes) of a scheduled task's newest finished run.
+
+        None when the newest completed run is older than `max_age_hours`, so a task that
+        silently stopped running is never read as today's data.
+
+        SellerCloud answers with NAIVE timestamps in the account's own timezone, not UTC:
+        measured 2026-10-20 on task 339, which runs every 15 minutes, the newest run read
+        01:14 at 05:24 UTC.
+        """
+        history = await self.get(
+            f"/ScheduledTasks/{task_id}/ExecutionHistory",
+            params={"pageNumber": 1, "pageSize": 10},
+        )
+        runs = [
+            r for r in (history or {}).get("Results") or []
+            if r.get("Status") == "Completed" and r.get("JobID")
+        ]
+        if not runs:
+            logger.warning(f"Scheduled task {task_id}: no completed run in its history")
+            return None
+        latest = runs[0]
+
+        stamp = latest.get("CompletedOn") or latest.get("ExecutedOn") or ""
+        try:
+            completed = datetime.fromisoformat(stamp)
+        except ValueError:
+            logger.warning(f"Scheduled task {task_id}: unreadable CompletedOn {stamp!r}")
+            return None
+        if completed.tzinfo is None:
+            from zoneinfo import ZoneInfo
+
+            completed = completed.replace(tzinfo=ZoneInfo(task_timezone))
+        age = datetime.now(timezone.utc) - completed
+        if age > timedelta(hours=max_age_hours):
+            logger.warning(
+                f"Scheduled task {task_id}: newest completed run (job {latest['JobID']}) "
+                f"is {age} old, over {max_age_hours}h"
+            )
+            return None
+
+        job_id = str(latest["JobID"])
+        return job_id, completed, await self.get_job_output_file(job_id)
+
     async def export_custom_columns(
         self,
         product_ids: List[str],

@@ -12,6 +12,7 @@ from routes.api_routes import router as api_router
 from routes.image_routes import router as image_router
 from routes.batch_generation_routes import router as batch_generation_router
 from routes.catalog_routes import router as catalog_router
+from routes.essx_shoot_list_routes import router as essx_shoot_list_router
 from routes.listing_routes import router as listing_router
 from routes.product_routes import router as product_router
 from routes.settings_routes import router as settings_router
@@ -34,6 +35,7 @@ from services.alias_bulk_import_poller import alias_bulk_import_poller
 from services.photo_upload_poller import photo_upload_poller
 from services.secondary_inventory_transfer_poller import secondary_inventory_transfer_poller
 from services.daily_image_import_poller import daily_image_import_poller
+from services.essx_shoot_list_poller import essx_shoot_list_poller
 from services.sellercloud_sync_poller import sellercloud_sync_poller
 from services.gallery_image_sync_poller import gallery_image_sync_poller
 from services.ai_search_poller import ai_search_poller
@@ -107,6 +109,7 @@ app.include_router(template_router)
 app.include_router(batch_generation_router)
 app.include_router(listing_router)
 app.include_router(catalog_router)
+app.include_router(essx_shoot_list_router)
 app.include_router(settings_router)
 app.include_router(submissions_router)
 # Authenticated app only, never api_app: /api is excluded from AuthMiddleware.
@@ -190,6 +193,7 @@ async def startup_event():
     await photo_upload_poller.start()
     await secondary_inventory_transfer_poller.start()
     await daily_image_import_poller.start()
+    await essx_shoot_list_poller.start()
     await daily_sellercloud_sync_poller.start()
     await batch_value_refresh_poller.start()
     # Both default enabled=false. They act on live Shopify storefronts and the source
@@ -206,6 +210,7 @@ async def shutdown_event():
     await internal_platform_dest_poller.stop()
     await batch_value_refresh_poller.stop()
     await daily_sellercloud_sync_poller.stop()
+    await essx_shoot_list_poller.stop()
     await daily_image_import_poller.stop()
     await secondary_inventory_transfer_poller.stop()
     await photo_upload_poller.stop()
