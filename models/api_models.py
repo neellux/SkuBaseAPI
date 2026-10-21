@@ -673,7 +673,11 @@ class QueueWindowResponse(BaseModel):
 
 class QueueSummaryResponse(BaseModel):
 
-    count: int = Field(0, description="Products in the queue under the current filters")
+    count: int = Field(
+        0,
+        description="Products in the queue under the current filters, excluding those "
+        "valued at exactly 0 (see zero_valued)",
+    )
     total_value: Decimal = Field(
         Decimal(0),
         description=(

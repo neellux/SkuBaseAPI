@@ -49,6 +49,10 @@ router = APIRouter(prefix="/submissions", tags=["submissions"])
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 
+# The step a poller's begin_batch records when it claims pending rows into a batch:
+# ebay_poller writes queued_batch, goat_poller (goat and goat_sneakers) sheet_writing.
+_BATCH_CLAIM_STEPS = ("queued_batch", "sheet_writing")
+
 
 def _effective_status(sub: ListingSubmission) -> str:
     """A failed submission that has been manually reviewed counts as success.
@@ -201,17 +205,17 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         # Imports that predate that field fall back to the oldest submission's
         # created_at, which can be days earlier than the real upload.
         uploaded_ats = []
-        # When the batch CLAIMED its rows, from the queued_batch step ebay_poller.begin_batch
-        # writes. An eBay submission sits in `pending` until a person clicks Submit on the
-        # submissions dashboard, so its created_at is when the LISTING was submitted, not
-        # when the import happened -- import 3 held submissions from 26 Aug to 2 Sep and was
-        # actually claimed on 3 Sep, so the oldest-submission fallback dated it eight days
-        # early. No eBay import carries uploaded_at, which is the SPO sweep's field, so
-        # without this every one of them is wrong.
+        # When the batch CLAIMED its rows, from the step each poller's begin_batch writes
+        # (_BATCH_CLAIM_STEPS). A submission sits in `pending` until its batch is claimed,
+        # so its created_at is when the LISTING was submitted, not when the import
+        # happened -- eBay import 3 held submissions from 26 Aug to 2 Sep and was actually
+        # claimed on 3 Sep, and GOAT import 4 showed 12 Oct for a batch claimed on 14 Oct.
+        # Neither platform writes uploaded_at, which is the SPO sweep's field, so without
+        # this every one of their imports is wrong.
         #
-        # Read generically rather than under `if platform_id == "ebay"`: only ebay_poller
-        # writes this step today, so the list is simply empty everywhere else, and a poller
-        # that adopts it later is right for free.
+        # The row's LAST claim step, not its first: a requeued row is claimed again by a
+        # later batch, which overwrites product_import_id in the same write that appends
+        # the new claim step, so only the newest claim belongs to the import it is in now.
         batch_claimed_ats = []
         stored_file_name = None
         batch_number = None
@@ -223,8 +227,8 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                     uploaded_ats.append(datetime.fromisoformat(raw))
                 except (TypeError, ValueError):
                     pass
-            for step in meta.get("steps") or []:
-                if step.get("step") == "queued_batch" and step.get("at"):
+            for step in reversed(meta.get("steps") or []):
+                if step.get("step") in _BATCH_CLAIM_STEPS and step.get("at"):
                     try:
                         batch_claimed_ats.append(datetime.fromisoformat(step["at"]))
                     except (TypeError, ValueError):

@@ -359,6 +359,9 @@ async def get_queue_summary(
     different conditions with different fixes, and the row treatment distinguishes
     them.
 
+    count leaves out the zero_valued products, so the pending figure is work worth
+    something. Unvalued products stay in it: no snapshot entry is not the same as $0.
+
     total_value double-counts a product sitting in two open batches (DNT-MBTM-0061 is
     in 810 and 814). Both are real work and both belong in the queue, so this is a
     known imprecision in the sum, not in the count.
@@ -412,7 +415,7 @@ listed_today AS (
          = (now() AT TIME ZONE '{QUEUE_TIMEZONE}')::date
   {where_listed}
 )
-SELECT count(*)                              AS count,
+SELECT count(*) FILTER (WHERE value IS DISTINCT FROM 0) AS count,
        COALESCE(sum(value), 0)               AS total_value,
        count(*) FILTER (WHERE value IS NULL) AS unvalued,
        count(*) FILTER (WHERE value = 0)     AS zero_valued,
