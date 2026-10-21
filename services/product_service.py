@@ -16,6 +16,20 @@ from services.sellercloud_service import sellercloud_service
 
 logger = logging.getLogger(__name__)
 
+# SellerCloud custom column PURCHASING_COMPANY: the company that bought the stock, which
+# stays put when a product later moves company (company_change_service). It holds NAMES,
+# in the vocabulary already on 36k+ children (measured 2026-10-20), not company ids.
+PURCHASING_COMPANY_COLUMN = "PURCHASING_COMPANY"
+PURCHASING_COMPANY_BY_CODE = {182: "LUX", 249: "ESSX"}
+
+
+def purchasing_company_for(company_code: Any) -> Optional[str]:
+    """The PURCHASING_COMPANY name for a parent_products.company_code, or None."""
+    try:
+        return PURCHASING_COMPANY_BY_CODE.get(int(company_code))
+    except (TypeError, ValueError):
+        return None
+
 
 def format_mpn(mpn: str) -> str:
     """Format the mpn for sku creation / comparison."""
@@ -727,6 +741,16 @@ class ProductService:
                 )
             if season:
                 base_columns.append({"ColumnName": "FASHION_SEASON", "Value": season})
+            purchasing = purchasing_company_for(company_code)
+            if purchasing:
+                base_columns.append(
+                    {"ColumnName": PURCHASING_COMPANY_COLUMN, "Value": purchasing}
+                )
+            else:
+                logger.warning(
+                    f"No PURCHASING_COMPANY name for company {company_code}; "
+                    f"{parent_sku} is created without one"
+                )
 
             # All children already exist locally (add_skus succeeded), so the
             # product is created regardless of SellerCloud outcome.
@@ -1032,8 +1056,15 @@ class ProductService:
                 )
 
             async def copy_columns():
+                # PURCHASING_COMPANY comes from the sibling like every other column; the
+                # parent's company only fills it when the sibling has none.
                 await sellercloud_service.copy_custom_columns(
-                    template_child_sku, new_child_sku, overrides={"SIZE": size}
+                    template_child_sku,
+                    new_child_sku,
+                    overrides={"SIZE": size},
+                    defaults={
+                        PURCHASING_COMPANY_COLUMN: purchasing_company_for(parent["company_code"])
+                    },
                 )
 
             async def upload_image():
@@ -1249,8 +1280,15 @@ class ProductService:
                 )
 
             async def copy_columns():
+                # PURCHASING_COMPANY comes from the sibling like every other column; the
+                # parent's company only fills it when the sibling has none.
                 await sellercloud_service.copy_custom_columns(
-                    template_child_sku, new_child_sku, overrides={"SIZE": size}
+                    template_child_sku,
+                    new_child_sku,
+                    overrides={"SIZE": size},
+                    defaults={
+                        PURCHASING_COMPANY_COLUMN: purchasing_company_for(parent["company_code"])
+                    },
                 )
 
             async def upload_image():

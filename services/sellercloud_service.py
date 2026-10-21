@@ -627,7 +627,14 @@ class SellerCloudService:
         source_product_id: str,
         target_product_id: str,
         overrides: Optional[Dict[str, str]] = None,
+        defaults: Optional[Dict[str, str]] = None,
     ) -> None:
+        """Copy the source's custom columns onto the target.
+
+        `overrides` replaces a column the source has a value for. `defaults` fills a
+        column the source has no value for (absent, null or blank), and is ignored when
+        the source has one, so a sibling's value always wins.
+        """
         source_data = await self.get_catalog_item(
             source_product_id, only_required_fields=False
         )
@@ -645,6 +652,15 @@ class SellerCloudService:
                 if overrides and column_name in overrides:
                     value = overrides[column_name]
                 columns_to_copy.append({"ColumnName": column_name, "Value": value})
+
+        for column_name, value in (defaults or {}).items():
+            if not value:
+                continue
+            present = next((c for c in columns_to_copy if c["ColumnName"] == column_name), None)
+            if present is None:
+                columns_to_copy.append({"ColumnName": column_name, "Value": value})
+            elif not str(present["Value"] or "").strip():
+                present["Value"] = value
 
         if columns_to_copy:
             await self._make_request(
