@@ -460,7 +460,26 @@ class ListingSubmission(Model):
     )
     submitted_at = fields.DatetimeField(
         null=True,
-        description="When the submission completed (set by trigger on status change)",
+        description="When this submission was handed to the platform: the outbound "
+        "call returning, or the file being accepted. Stamped by record_step from the "
+        "platform's handover step (utils/listing_timestamps.py). No trigger sets it, "
+        "whatever this description said until 2026-10-14 - it was empty on every one "
+        "of prod's 14,663 rows",
+    )
+    listed_at = fields.DatetimeField(
+        null=True,
+        description="When the PLATFORM confirmed this listing is live. Stamped by "
+        "record_step from the platform's go-live step, which is not always the step "
+        "called 'listed' - see utils/listing_timestamps.py for the per-platform "
+        "mapping and for what the three guesses this replaces got wrong. NULL means "
+        "no go-live signal was ever observed, never 'not listed'",
+    )
+    listed_at_source = fields.CharField(
+        max_length=32,
+        null=True,
+        description="Which signal produced listed_at: the step name, or a backfill "
+        "marker. Exists so the column can never become the thing it replaced, a "
+        "timestamp nobody can tell the meaning of",
     )
 
     error = fields.TextField(

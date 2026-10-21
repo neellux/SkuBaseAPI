@@ -63,6 +63,7 @@ from services.shopify_client import (
     get_shopify_client,
     writes_enabled,
 )
+from utils.listing_timestamps import GO_LIVE_STEP
 from utils.submission_steps import record_step
 
 logger = logging.getLogger(__name__)
@@ -672,7 +673,10 @@ class GoatPoller(BasePoller):
         """
         conn = connections.get("default")
         ids, metas, steps = [], [], []
-        now = datetime.now(timezone.utc).isoformat()
+        # One reading, in both shapes: the text the step entries carry, and the datetime
+        # the listed_at bind needs (asyncpg rejects a string for a timestamptz param).
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
         for sub_id, info in found.items():
             ids.append(sub_id)
             metas.append(json.dumps({"goat_sku": info["goat_sku"], "stv": info["stv"]}))
@@ -689,12 +693,20 @@ class GoatPoller(BasePoller):
                        COALESCE(CASE WHEN jsonb_typeof(s.platform_meta -> 'steps') = 'array'
                                      THEN s.platform_meta -> 'steps' END, '[]'::jsonb) || v.step,
                        true),
-                   updated_at = CURRENT_TIMESTAMP
+                   updated_at = CURRENT_TIMESTAMP,
+                   -- The go-live stamp record_step would have applied. GOAT is the one
+                   -- platform whose go-live step cannot go through it (a different
+                   -- goat_sku per row), so the mapping is honoured here instead; first
+                   -- write wins, exactly as it does there.
+                   listed_at = COALESCE(s.listed_at, $4::timestamptz),
+                   listed_at_source = CASE
+                       WHEN s.listed_at IS NULL THEN $5::text
+                       ELSE s.listed_at_source END
               FROM (SELECT * FROM unnest($1::bigint[], $2::jsonb[], $3::jsonb[])
                       AS t(id, meta, step)) v
              WHERE s.id = v.id
             """,
-            [ids, metas, steps],
+            [ids, metas, steps, now_dt, GO_LIVE_STEP["goat"]],
         )
 
     # -- stage 3 -----------------------------------------------------------

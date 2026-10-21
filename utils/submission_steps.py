@@ -29,6 +29,14 @@ The append is a single jsonb UPDATE, so a whole batch is recorded in one
 statement and a later stage cannot wipe an earlier stage's entry the way
 `.update(platform_meta={...})` did.
 
+The same UPDATE stamps submitted_at and listed_at when the step being recorded is
+the platform's handover or its go-live step. The mapping, and why the go-live step
+differs per platform, is utils/listing_timestamps.py. Doing it here rather than in
+each poller is what makes the two columns consistent across both dispatch paths and
+all six platforms; the one write that cannot come through here is GOAT's SKU
+readback, which needs a per-row step entry and so stamps listed_at in its own
+statement (goat_poller._record_goat_skus).
+
 Callers that write the row through the ORM afterwards must pass `update_fields`
 without `platform_meta`, otherwise the instance's stale in-memory copy of the
 column overwrites the steps recorded here. Likewise, record_step must be called
@@ -44,11 +52,20 @@ from typing import Any
 
 from tortoise import connections
 
+from utils import listing_timestamps
+
 logger = logging.getLogger(__name__)
 
 # jsonb_set with create_missing=true adds `steps` on first use. The CASE guards
 # a pre-existing non-array `steps` value, which `||` would merge instead of
 # append.
+# $4/$5 are the platforms for which THIS step is the handover / the go-live
+# (utils/listing_timestamps.py); either may be empty, which stamps nothing. $6 is the
+# step entry's own `at`, so the column and the timeline can never disagree.
+#
+# Both stamps are first-write-wins: SET expressions all see the pre-UPDATE row, so a
+# step re-recorded after a requeue keeps the original instant, and the CASE on
+# listed_at_source sees the same old listed_at as the CASE on listed_at.
 _APPEND_STEP_SQL = (
     "UPDATE listing_submissions "
     "SET platform_meta = jsonb_set("
@@ -61,7 +78,16 @@ _APPEND_STEP_SQL = (
     "        ) || $3::jsonb, "
     "        true"
     "    ), "
-    "    updated_at = CURRENT_TIMESTAMP "
+    "    updated_at = CURRENT_TIMESTAMP, "
+    "    submitted_at = CASE "
+    "        WHEN submitted_at IS NULL AND platform_id = ANY($4::text[]) "
+    "        THEN $6::timestamptz ELSE submitted_at END, "
+    "    listed_at = CASE "
+    "        WHEN listed_at IS NULL AND platform_id = ANY($5::text[]) "
+    "        THEN $6::timestamptz ELSE listed_at END, "
+    "    listed_at_source = CASE "
+    "        WHEN listed_at IS NULL AND platform_id = ANY($5::text[]) "
+    "        THEN $7::text ELSE listed_at_source END "
     "WHERE id = ANY($1::bigint[])"
 )
 
@@ -102,10 +128,26 @@ async def record_step(
     if not ids:
         return
 
+    # Built before the UPDATE so the stamped columns reuse the entry's own `at`
+    # rather than a second clock reading. Parsed back to a datetime because asyncpg
+    # infers the type of a $n::timestamptz parameter and rejects a string for it; going
+    # through the entry's own text is also what guarantees the column and the timeline
+    # can never name different instants.
+    entry = new_step(step, **details)
+    stamped_at = datetime.fromisoformat(entry["at"])
+
     conn = connections.get("default")
     await conn.execute_query(
         _APPEND_STEP_SQL,
-        [ids, json.dumps(meta or {}), json.dumps([new_step(step, **details)])],
+        [
+            ids,
+            json.dumps(meta or {}),
+            json.dumps([entry]),
+            listing_timestamps.handoff_platforms(step),
+            listing_timestamps.go_live_platforms(step, details),
+            stamped_at,
+            step,
+        ],
     )
     logger.debug(f"recorded step '{step}' for {len(ids)} submission(s)")
 
