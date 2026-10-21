@@ -15,9 +15,9 @@ from models.api_models import (
     CostPriceResponse,
     CheckBrandMpnResponse,
     CountriesResponse,
-    PlatformLink,
     PlatformLinksResponse,
     ListingHistoryResponse,
+    ListingIdSaveRequest,
     PlatformDelistRequest,
     PlatformDelistResponse,
     CreateSkuRequest,
@@ -54,7 +54,7 @@ from services.product_service import ProductService
 from services.sellercloud_service import sellercloud_service
 from services.grailed_service import COUNTRY_CODE_MAP
 from services import alias_bulk_import_job_service
-from services import platform_delist_service
+from services import listing_id_service, platform_delist_service
 from services.platform_delist_service import DelistRefused
 from routes.batch_generation_routes import require_skubase_client
 from utils.load_app_data import add_user_data
@@ -602,6 +602,17 @@ async def _named_entry(entry: dict) -> dict:
     return await add_user_data(entry, keys=["created_by", "restored_by"], new_keys=["name"])
 
 
+async def _named_history(history: dict) -> dict:
+    # open_delists are copies of timeline events, so both need names.
+    events = [
+        event
+        for platform in history["platforms"]
+        for event in (*platform["timeline"], *platform["open_delists"])
+    ]
+    await add_user_data(events, keys=["user_id"], new_keys=["name"])
+    return history
+
+
 @router.get("/listing_history", response_model=ListingHistoryResponse)
 async def get_listing_history(
     sku: str = Query(..., description="Product SKU (parent or child)"),
@@ -612,15 +623,7 @@ async def get_listing_history(
     """
     try:
         parent_sku = await _parent_or_404(sku)
-        history = await platform_delist_service.get_history(parent_sku)
-        # open_delists are copies of timeline events, so both need names.
-        events = [
-            event
-            for platform in history["platforms"]
-            for event in (*platform["timeline"], *platform["open_delists"])
-        ]
-        await add_user_data(events, keys=["user_id"], new_keys=["name"])
-        return history
+        return await _named_history(await platform_delist_service.get_history(parent_sku))
     except DelistRefused as refused:
         raise _refused(refused)
     except HTTPException:
@@ -686,6 +689,55 @@ async def restore_platform_delist(
     except Exception:
         logger.exception("platform_delist/restore: failed for %s", id)
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/listing_ids",
+    response_model=ListingHistoryResponse,
+    dependencies=[Depends(require_skubase_client)],
+)
+async def save_listing_ids(body: ListingIdSaveRequest, request: Request):
+    """Save one platform's listing ids and delists for a product, as one recorded change.
+
+    Record-only (listing_id_service): a changed id replaces the stored one and records a
+    manual submission; a cleared id or a Delist records a delist. Answers with the fresh
+    listing history, so the page needs no second call. Refused, with nothing written, when
+    a value changed since the page loaded it (409), an id is in use (409), the platform is
+    locked (409), the product is busy (409), an id fails its format check (400), or the
+    database migration is not applied yet (503). A 500 "Saved. Reload to see it" means the
+    save committed and only the history read after it failed.
+    """
+    try:
+        parent_sku = await _parent_or_404(body.sku)
+        _saved, product, platform_config = await listing_id_service.save_listing_ids_with_inputs(
+            parent_sku,
+            body.platform_id,
+            [c.model_dump(by_alias=True) for c in body.changes],
+            body.delist,
+            body.comment,
+            request.state.user["id"],
+            delist_product=body.delist_product,
+        )
+    except DelistRefused as refused:
+        raise _refused(refused)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("listing_ids: failed for %s on %s", body.sku, body.platform_id)
+        raise HTTPException(status_code=500, detail="Internal server error")
+    # Committed. A failure from here on must not read as "not saved", which invites a
+    # second save: the UI treats exactly this detail as saved and reloads.
+    try:
+        # The save's own product and config; the history reads the state after the commit.
+        history = await platform_delist_service.get_history(
+            parent_sku, product=product, config=platform_config
+        )
+        return await _named_history(history)
+    except Exception:
+        logger.exception(
+            "listing_ids: saved, history read failed for %s on %s", parent_sku, body.platform_id
+        )
+        raise HTTPException(status_code=500, detail="Saved. Reload to see it")
 
 
 @router.get("/reassign/bulk/preview")

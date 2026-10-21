@@ -1453,14 +1453,19 @@ class ListingHistoryAttemptEvent(BaseModel):
     user_id: Optional[str] = Field(None, description="Who submitted it")
     user_name: Optional[str] = None
     submission_id: int
-    listing_id: str
+    listing_id: Optional[str] = Field(
+        None, description="Null on an id saved by hand while the product had no listing"
+    )
     batch_id: Optional[int] = None
     batch_comment: Optional[str] = None
     attempt_number: Optional[int] = None
     status: Optional[str] = Field(None, description="listing_submissions.status")
     platform_status: Optional[str] = None
     reviewed: bool = Field(False, description="A failure someone marked reviewed")
-    accepted: bool = Field(False, description="The platform took it (would close a delist)")
+    accepted: bool = Field(False, description="The platform took it. Closes a delist unless manual")
+    manual: bool = Field(
+        False, description="An id saved by hand, not sent by SkuBase (platform_status manual)"
+    )
     error: Optional[str] = Field(None, description="First line of the error, at most 160 chars")
     listed_at: Optional[datetime] = Field(
         None, description="When it went live, if it shows as listed"
@@ -1499,6 +1504,55 @@ ListingHistoryEvent = Annotated[
     Field(discriminator="kind"),
 ]
 
+# Where a platform keeps its listing id (R4): product is the parent presence row, size the
+# child rows. The service's ID EDITOR section is the reference.
+ListingIdLevel = Literal["product", "size"]
+
+
+class ListingHistoryIdField(BaseModel):
+    """One listing id in the id editor."""
+
+    id: Optional[str] = Field(
+        None,
+        description="As stored, except 1nventory gids show as their number. Send it back "
+        "unchanged as the value the edit started from",
+    )
+    editable: bool = Field(False, description="Can be changed or cleared now")
+    reason: Optional[str] = Field(None, description="Why not editable, one short line")
+    code: Optional[str] = Field(
+        None,
+        description="read_only, excluded, in_flight or awaiting_action (the row's lock_code), "
+        "restore_first (delisted) or other_parent (stored under another parent)",
+    )
+
+
+class ListingHistorySizeIdField(ListingHistoryIdField):
+    """A size in the id editor: its size-level id, and the delist Restore would undo.
+
+    On a platform with no size-level id, id is null and editable false with no reason;
+    delist_id and delist_size_count still apply (SPO, GOAT)."""
+
+    delist_id: Optional[str] = Field(
+        None, description="Newest open delist covering this size, what Restore takes"
+    )
+    delist_size_count: Optional[int] = Field(
+        None, description="How many sizes that delist covers, so how many Restore brings back"
+    )
+
+
+class ListingHistoryEditor(BaseModel):
+    """A platform row's listing ids and which can be edited (listing id edits U2)."""
+
+    levels: List[ListingIdLevel] = Field(
+        default_factory=list, description="Levels this platform keeps ids at. Empty for SPO"
+    )
+    product: Optional[ListingHistoryIdField] = Field(
+        None, description="The product-level id, null when the platform has none"
+    )
+    sizes: Dict[str, ListingHistorySizeIdField] = Field(
+        default_factory=dict, description="Child SKU -> its id field, for every SKU in sizes"
+    )
+
 
 class ListingHistoryPlatform(BaseModel):
 
@@ -1533,6 +1587,10 @@ class ListingHistoryPlatform(BaseModel):
     timeline: List[ListingHistoryEvent] = Field(
         default_factory=list, description="Attempts, delists and restores, newest first"
     )
+    editor: ListingHistoryEditor = Field(
+        default_factory=ListingHistoryEditor,
+        description="Listing ids at the platform's levels and what can be edited",
+    )
 
 
 class ListingHistoryResponse(BaseModel):
@@ -1553,7 +1611,13 @@ class ProductListingDate(BaseModel):
 
     platform_id: str
     source: ListingDateSource
-    listing_date: Optional[datetime] = Field(None, description="UTC, null when manual")
+    listing_date: Optional[datetime] = Field(
+        None,
+        description="When the platform put the listing live, UTC. Null when source is "
+        "manual (all we hold is a presence row, whose date is when a backfill noticed "
+        "the listing, not when it went live) and null on the rare skubase listing the "
+        "platform never gave a datable go-live signal for. Never a submission time",
+    )
 
 
 class ProductListingDatesResponse(BaseModel):
@@ -1587,6 +1651,43 @@ class PlatformDelistResponse(BaseModel):
     restored_at: Optional[datetime] = None
     restored_by: Optional[str] = None
     restored_by_name: Optional[str] = None
+
+
+class ListingIdChange(BaseModel):
+    """One listing id to change (services/listing_id_service.py)."""
+
+    model_config = {"populate_by_name": True}
+
+    level: ListingIdLevel = Field(..., description="product or size, as in the editor's levels")
+    sku: Optional[str] = Field(
+        None, description="Child SKU for a size; ignored for the product-level id"
+    )
+    from_: Optional[str] = Field(
+        None,
+        alias="from",
+        description="The editor's id as loaded, sent back unchanged. Null when it had none",
+    )
+    # Required but nullable: a body that leaves `to` out is a 422, never a clear (a delist).
+    to: Optional[str] = Field(
+        ..., description="The new id. Null or blank clears it, which delists (R13)"
+    )
+
+
+class ListingIdSaveRequest(BaseModel):
+    """POST /products/listing_ids: one platform's id changes and delists, saved together."""
+
+    platform_id: str
+    sku: str = Field(..., description="Product SKU (parent or child); the parent is saved")
+    changes: List[ListingIdChange] = Field(
+        default_factory=list, description="Only the fields the operator changed"
+    )
+    delist: List[str] = Field(
+        default_factory=list, description="Child SKUs to delist, with or without an id"
+    )
+    delist_product: bool = Field(False, description="Delist the whole product (one with no sizes)")
+    comment: Optional[str] = Field(
+        None, description="Optional note, up to 500 characters, kept on the save and the delist"
+    )
 
 
 class CreateSkuSize(BaseModel):

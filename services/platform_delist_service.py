@@ -9,6 +9,7 @@ calls a platform. Restore undoes one entry exactly, until the next attempt to th
 Plan: docs/plans/2026-09-30-1031-feat-product-listing-history-delist-plan.md (U3).
 Schema and the one definition of an OPEN delist: migrations/add_platform_delists.sql.
 Completion and the required write order: migrations/delist_aware_listing_completion.sql.
+Manual rows (ids saved by hand, below): migrations/listing_id_edits.sql.
 
 The decisions are pure functions over plain dicts shaped like the SQL rows below, so they
 can be table-tested; API/tests/ cannot import route modules. The routes (U4) only map
@@ -43,7 +44,12 @@ GET HISTORY PAYLOAD (get_history / build_history)
           "sizes": {"ALD-MSNK-0003/9": "listed", ...},      # every sku in top-level sizes
                                                   # "listed" | "delisted" | "none"
           "open_delists": [<delist event>, ...],  # open entries only, oldest first
-          "timeline": [<event>, ...]              # newest first
+          "timeline": [<event>, ...],             # newest first
+          "editor": {                             # see ID EDITOR
+            "levels": ["product", "size"],        # where this platform keeps ids, R4
+            "product": <field> | null,            # null: no product-level id
+            "sizes": {"ALD-MSNK-0003/9": <size field>, ...}   # every sku in top-level sizes
+          }
         }
       ]
     }
@@ -54,9 +60,11 @@ GET HISTORY PAYLOAD (get_history / build_history)
     add_user_data(events, ["user_id"], ["name"]) -> "user_name".
 
       attempt   {"kind": "attempt", "at": created_at, "user_id": submitted_by,
-                 "submission_id", "listing_id", "batch_id", "batch_comment",
-                 "attempt_number", "status", "platform_status", "reviewed": bool,
-                 "accepted": bool (is_accepted; closes a delist),
+                 "submission_id", "listing_id" (null: a manual row with no listing),
+                 "batch_id", "batch_comment", "attempt_number", "status",
+                 "platform_status", "reviewed": bool,
+                 "accepted": bool (is_accepted; a non-manual one closes a delist),
+                 "manual": bool (an id saved by hand, see MANUAL ROWS),
                  "error": first line, <= 160 chars | null,
                  "listed_at": KTD9 date if it shows as listed else null, "completed_at"}
       delist    {"kind": "delist", "at": created_at, "user_id": created_by,
@@ -93,18 +101,60 @@ ROW STATUS (R4, the catalog's vocabulary plus two), first match wins:
     A delisted size is not listed: there is no "delisted" row status. The size keeps
     the state "delisted" in `sizes` so the service can refuse a second delist of it.
 
-    "Accepted" is is_accepted, the Python mirror of platform_delist_closing_attempt:
-    success that is not a GOAT denial (a reviewed failure counts), or awaiting_action.
-    Anything else that finished (failed, a denial) counts as failed here.
+    "Accepted" is is_accepted: success that is not a GOAT denial (a reviewed failure
+    counts), or awaiting_action. Anything else that finished (failed, a denial) counts as
+    failed here. platform_delist_closing_attempt, the SQL test for closing a delist, is
+    the same except that a manual row never closes one.
 
 SIZE STATE: delisted if an open entry covers it (child_skus NULL covers all); else listed
 if a parent row or its child row exists, or, when the platform has no rows at all, an
 accepted attempt exists and no open entry removed rows (a platform that never recorded
 presence); else none.
 
-LISTED DATE (KTD9): the latest accepted attempt's `listed` step `at`, then its completed_at,
-then its updated_at. With no accepted attempt on any listing of the parent, the earliest
-first_seen_at of the presence rows, flagged listed_at_recorded (R5).
+LISTED DATE (KTD9): the listed_at of the latest accepted attempt that is not manual. With
+none on any listing of the parent, the earliest first_seen_at of the presence rows, flagged
+listed_at_recorded (R5), and recorded with no date when there are no presence rows either
+but a manual row says it is listed.
+
+MANUAL ROWS (listing id edits, docs/plans/2026-10-15-1256-feat-listing-history-tab-ids-plan.md,
+KTD1 to KTD3, KTD11, KTD12). An id saved by hand is a listing_submissions row with
+platform_status 'manual', inserted directly as success, on the product's newest listing or,
+with no listing, on none and tied to the parent by platform_meta.parent_sku. It is accepted,
+so the platform reads Listed. It never closes a delist or blocks its Restore, and it is
+never the SkuBase source or date of a listing. The edited presence row carries
+external_meta.manual_edit = {"at", "by", "submission_id"}, which Restore reads.
+
+ID EDITOR (listing id edits U2: R4, R5, R11, R15, R16, KTD10). Where each platform keeps
+its listing id (ID_LEVELS), and what the Listing history tab may change:
+
+    sellercloud          product: the SKU it was sent, read-only
+    grailed              size: the sheet row key, <child sku>_<MMDDYYYY>
+    spo                  none: SPO gives no id
+    ebay                 size: the item id
+    1nventory            product: the Shopify product gid; size: the variant gid
+    goat, goat_sneakers  product: the SKU (GOAT)
+
+    field         {"id", "editable", "reason", "code"}
+    size field    a field plus {"delist_id", "delist_size_count"}
+
+    id        the presence row's external_id as stored, except that a 1nventory gid of the
+              level's own kind shows as its bare number (display_id). The save sends it
+              back as the value it started from.
+    editable  false, with a one-line reason and its code, when
+                a platform-wide lock applies: the row's lock_reason and lock_code when
+                that is excluded, in_flight or awaiting_action, and "SellerCloud is
+                read-only" for read_only. Never not_listed or already_delisted, because
+                entering an id is how an unlisted size becomes listed
+                restore_first: the size is delisted, or an open delist took the product
+                row (KTD10)
+                other_parent: the size's row is stored under another parent, which a save
+                never moves (KTD7)
+              Always false, with no reason, at a level the platform keeps no id at.
+    A delisted size's id, and the product id after a delist took the product row, come
+    from the newest open entry's pre-image that holds one: the id Restore brings back.
+    delist_id, delist_size_count: the newest open entry covering the size, which Restore
+    undoes, and how many sizes it covers (a whole-product entry covers every size). Set on
+    every platform that has delists, SPO included, and null on a size not delisted.
 
 REFUSAL CODES (DelistRefused.code, also lock_code), with the HTTP status the route uses:
 
@@ -118,12 +168,15 @@ trigger that recomputes completion, so what exists at each statement matters (KT
 
     delist   lock, re-read, INSERT the entry with its pre-image, DELETE the rows, then
              INSERT split child rows and record them on the entry.
-    restore  lock, re-read, mark the entry restored, DELETE the rows it inserted, re-insert
-             its pre-image, recompute every listing of the parent with p_allow_unflag false
-             (a re-insert that conflicts inserts nothing and fires no trigger).
+    restore  lock, re-read, mark the entry restored, DELETE the rows it inserted (except
+             one whose id was saved by hand since), re-insert its pre-image, recompute
+             every listing of the parent with p_allow_unflag false (a re-insert that
+             conflicts inserts nothing and fires no trigger).
 
 Both run in one transaction under the per-product submit advisory lock (KTD5) and clear the
-catalog summary cache after commit (KTD11).
+catalog summary cache after commit (KTD11). The delist writes are write_delist, which the
+listing id save (services/listing_id_service.py) also runs, inside its own transaction and
+lock, so a delist and an id change made in one save commit together.
 """
 
 import asyncio
@@ -158,12 +211,22 @@ EXCLUDED = "excluded"
 ACCEPTED = "accepted"
 
 # Listing-date sources on the public API (/api/listing_dates). "skubase" means an attempt
-# SkuBase sent was accepted by the platform, so the date is a real listing date; "manual"
-# means nobody here listed it and all we hold is a presence row, whose first_seen_at is when
-# a backfill noticed it rather than when it went live, so that date is not published. The UI
-# calls the same two things SkuBase and External; these are the wire values, keep them.
+# SkuBase sent was accepted by the platform, so listing_date is that attempt's listed_at:
+# when the platform itself put it live. "manual" means nobody here listed it and all we
+# hold is a presence row, whose first_seen_at is when a backfill noticed it rather than
+# when it went live, so that date is not published. The UI calls the same two things
+# SkuBase and External; these are the wire values, keep them.
 SOURCE_SKUBASE = "skubase"
 SOURCE_MANUAL = "manual"
+
+# listing_submissions.platform_status of an id saved by hand (MANUAL ROWS). The SQL side
+# tests the same literal: migrations/listing_id_edits.sql and catalog_service.
+MANUAL_PLATFORM_STATUS = "manual"
+
+# The key a manual id save merges into the edited presence row's external_meta:
+# {"at": timestamptz text, "by": user id, "submission_id": the manual row's id}.
+# _DELETE_INSERTED_SQL reads `at` (KTD11).
+MANUAL_EDIT_META = "manual_edit"
 
 # Delist entry states in the timeline.
 OPEN = "open"
@@ -183,6 +246,47 @@ COMMENT_TOO_LONG = "comment_too_long"
 NOT_FOUND = "not_found"
 ALREADY_RESTORED = "already_restored"
 RESUBMITTED = "resubmitted"
+
+# Why an id cannot be edited, beside the platform-wide lock codes (ID EDITOR).
+RESTORE_FIRST = "restore_first"
+OTHER_PARENT = "other_parent"
+
+# The delist refusals that also lock id edits. Not listed and already delisted do not.
+_EDIT_LOCKS = frozenset({READ_ONLY, UNKNOWN_PLATFORM, EXCLUDED, IN_FLIGHT, AWAITING_ACTION})
+
+# R4: the levels each platform keeps a listing id at. product is the parent presence row,
+# size the child rows. A platform not named here keeps none.
+PRODUCT_LEVEL = "product"
+SIZE_LEVEL = "size"
+ID_LEVELS: Dict[str, Tuple[str, ...]] = {
+    "sellercloud": (PRODUCT_LEVEL,),
+    "grailed": (SIZE_LEVEL,),
+    "spo": (),
+    "ebay": (SIZE_LEVEL,),
+    "1nventory": (PRODUCT_LEVEL, SIZE_LEVEL),
+    "goat": (PRODUCT_LEVEL,),
+    "goat_sneakers": (PRODUCT_LEVEL,),
+}
+
+# 1nventory stores full Shopify gids; the editor shows the number.
+_SHOPIFY_GID_PREFIX = {
+    PRODUCT_LEVEL: "gid://shopify/Product/",
+    SIZE_LEVEL: "gid://shopify/ProductVariant/",
+}
+# ASCII only: \d also matches Arabic-Indic or fullwidth digits, which no platform issues.
+# listing_id_service checks eBay and Grailed ids with this same rule.
+ASCII_DIGITS = re.compile(r"[0-9]+")
+
+
+def gid_number(level: str, value: str) -> Optional[str]:
+    """The number of a Shopify gid of the level's own kind, or of bare ASCII digits; None
+    for anything else, a gid of the other kind included."""
+    prefix = _SHOPIFY_GID_PREFIX.get(level)
+    if prefix is None:
+        return None
+    number = value[len(prefix) :] if value.startswith(prefix) else value
+    return number if ASCII_DIGITS.fullmatch(number) else None
+
 
 # Same limit as the flag note, and the table's CHECK.
 COMMENT_MAX_LENGTH = 500
@@ -240,6 +344,10 @@ class ProductFacts:
     active: List[Dict[str, str]]
     inactive: Dict[str, str]
 
+    @property
+    def child_skus(self) -> List[str]:
+        return [c["sku"] for c in self.active] + list(self.inactive)
+
 
 @dataclass(frozen=True)
 class PlatformFacts:
@@ -284,6 +392,12 @@ def platform_label(platform_id: str) -> str:
     return PLATFORM_LABELS.get(platform_id, str(platform_id or "").upper())
 
 
+def allow_partial_submit(settings: Dict[str, Any], platform_id: str) -> bool:
+    """R8: the platform's allow_partial_submit, off when unset. settings is
+    app_settings.platform_settings."""
+    return bool((settings.get(platform_id) or {}).get("allow_partial_submit", False))
+
+
 def normalize_comment(comment: Optional[str]) -> Optional[str]:
     """The comment as stored: trimmed, and blank stored as NULL (R9).
 
@@ -300,12 +414,20 @@ def normalize_comment(comment: Optional[str]) -> Optional[str]:
 
 
 def is_accepted(status: Optional[str], platform_status: Optional[str], reviewed_at: Any) -> bool:
-    """The platform took this attempt: success that is not a GOAT denial, or eBay's
+    """Did the platform take this attempt: success that is not a GOAT denial, or eBay's
     awaiting_action. A reviewed failure counts, because reviewing resolves it
-    (mark_import_reviewed) and the catalog reads it as listed. The Python mirror of
-    platform_delist_closing_attempt; keep the two identical. reviewed_at stays in the
-    signature to match the SQL function."""
+    (mark_import_reviewed) and the catalog reads it as listed. So does a manual row, so a
+    platform reads Listed after an id is saved by hand.
+
+    Not the same question as platform_delist_closing_attempt, the SQL test of "does this
+    row close a delist": that one is identical except that a manual row never closes one
+    (migrations/listing_id_edits.sql). reviewed_at stays in the signature to match it."""
     return (status == "success" and platform_status != "denied") or status == "awaiting_action"
+
+
+def is_manual(attempt: Dict[str, Any]) -> bool:
+    """An id saved by hand rather than an attempt SkuBase sent (MANUAL ROWS)."""
+    return attempt.get("platform_status") == MANUAL_PLATFORM_STATUS
 
 
 def attempt_outcome(attempt: Dict[str, Any]) -> str:
@@ -352,26 +474,20 @@ def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
     return value.astimezone(timezone.utc)
 
 
-def listed_step_at(steps: Any) -> Optional[datetime]:
-    """The `at` of the first `listed` step in platform_meta.steps (submission_steps.py)."""
-    steps = _as_json(steps)
-    if not isinstance(steps, list):
-        return None
-    for step in steps:
-        if isinstance(step, dict) and step.get("step") == "listed":
-            parsed = _parse_ts(step.get("at"))
-            if parsed:
-                return parsed
-    return None
-
-
 def attempt_listed_at(attempt: Dict[str, Any]) -> Optional[datetime]:
-    """When the platform accepted this attempt (KTD9, R6). submitted_at is empty on prod."""
-    return (
-        listed_step_at(attempt.get("steps"))
-        or attempt.get("completed_at")
-        or attempt.get("updated_at")
-    )
+    """When the PLATFORM put this attempt live: listing_submissions.listed_at (KTD9, R6).
+
+    Read straight off the column, which record_step stamps from the platform's own
+    go-live step. None means no go-live signal was ever observed for this attempt, which
+    is a different thing from not being listed - listedness is size_states, never a date.
+
+    Until 2026-10-14 this guessed: the first step literally named `listed`, then
+    completed_at, then updated_at. All three were measurably the wrong instant, most of
+    them the submission's own timestamp; utils/listing_timestamps.py records what each
+    one got wrong and why the go-live step has to be chosen per platform.
+    """
+    value = attempt.get("listed_at")
+    return _parse_ts(value) if isinstance(value, str) else value
 
 
 def _latest_key(attempt: Dict[str, Any]) -> Tuple[datetime, int]:
@@ -383,19 +499,25 @@ def listed_date(
     attempts: Sequence[Dict[str, Any]], rows: Sequence[Dict[str, Any]]
 ) -> Tuple[Optional[datetime], bool]:
     """(date, recorded). recorded is True when no listing of the parent has an accepted
-    attempt and the date is the presence rows' first_seen_at (R5): a backfill date, not a
-    listing date. Decided from attempts, never from `source`, which the upsert keeps."""
+    attempt SkuBase sent and the date is the presence rows' first_seen_at (R5): a backfill
+    date, not a listing date. Decided from attempts, never from `source`, which the upsert
+    keeps.
+
+    Manual rows are left out (KTD12): an id saved by hand is not SkuBase listing it, so a
+    product SkuBase listed keeps its date after an id fix, and one that is only recorded
+    stays recorded, with no date when there is no presence row to date it by."""
     accepted = [
         a
         for a in attempts
         if is_accepted(a.get("status"), a.get("platform_status"), a.get("reviewed_at"))
     ]
-    if accepted:
-        return attempt_listed_at(max(accepted, key=_latest_key)), False
+    sent = [a for a in accepted if not is_manual(a)]
+    if sent:
+        return attempt_listed_at(max(sent, key=_latest_key)), False
     seen = [r["first_seen_at"] for r in rows if r.get("first_seen_at")]
     if seen:
         return min(seen), True
-    return None, False
+    return None, bool(accepted)
 
 
 def short_error(text: Optional[str]) -> Optional[str]:
@@ -648,6 +770,16 @@ def _read_only(platform_id: str) -> DelistRefused:
     return DelistRefused(f"{platform_label(platform_id)} cannot be delisted", READ_ONLY, 400)
 
 
+def _read_only_reason(platform_id: str) -> str:
+    """Why a read-only platform's ids cannot be edited: the editor's lock reason, and the
+    listing id save's refusal."""
+    return f"{platform_label(platform_id)} is read-only"
+
+
+def _unknown_size() -> DelistRefused:
+    return DelistRefused("Unknown size", UNKNOWN_SIZE, 400)
+
+
 def delist_refusal(
     platform_id: str, *, enabled: bool, excluded: bool, facts: PlatformFacts
 ) -> Optional[DelistRefused]:
@@ -750,7 +882,7 @@ def plan_delist(
         unknown = [s for s in selected if s not in facts.states]
         if unknown:
             logger.info("delist %s: unknown sizes %s", platform_id, unknown)
-            raise DelistRefused("Unknown size", UNKNOWN_SIZE, 400)
+            raise _unknown_size()
 
     active = [s["sku"] for s in size_list if s.get("active")]
     scope = delist_scope(expand_selection(selected, active, allow_partial), active)
@@ -772,9 +904,14 @@ def plan_delist(
 
 def attempted_since(entry: Dict[str, Any], attempts: Iterable[Dict[str, Any]]) -> bool:
     """Any attempt, of any status, on any listing of the parent, to the entry's platform,
-    created after it. The SQL form is the EXISTS in _RESTORE_READ_SQL."""
+    created after it. The SQL form is the EXISTS in _RESTORE_READ_SQL.
+
+    A manual row is not an attempt here: an id saved for a size still listed would
+    otherwise block the Restore of every open entry on the platform (R16)."""
     return any(
-        a.get("platform_id") == entry["platform_id"] and a["created_at"] > entry["created_at"]
+        a.get("platform_id") == entry["platform_id"]
+        and a["created_at"] > entry["created_at"]
+        and not is_manual(a)
         for a in attempts
     )
 
@@ -816,6 +953,7 @@ def _timeline(
                 "platform_status": a.get("platform_status"),
                 "reviewed": a.get("reviewed_at") is not None,
                 "accepted": accepted,
+                "manual": is_manual(a),
                 "error": short_error(a.get("error")),
                 "listed_at": attempt_listed_at(a) if accepted else None,
                 "completed_at": a.get("completed_at"),
@@ -861,6 +999,104 @@ def _timeline(
     return events
 
 
+def display_id(platform_id: str, level: str, value: Optional[str]) -> Optional[str]:
+    """The id as the editor shows it (ID EDITOR): as stored, except a 1nventory gid of the
+    level's own kind, which shows as its number. A gid of the other kind stays whole, so
+    a variant gid on the product row is visible as the wrong value it is."""
+    if value is None:
+        return None
+    value = str(value)
+    if platform_id == "1nventory":
+        return gid_number(level, value) or value
+    return value
+
+
+def _covering(open_entries: Sequence[Dict[str, Any]], sku: str) -> List[Dict[str, Any]]:
+    """The open entries that cover a size, newest first."""
+    return [
+        e for e in reversed(open_entries) if e.get("child_skus") is None or sku in e["child_skus"]
+    ]
+
+
+def _removed_id(covering: Sequence[Dict[str, Any]], sku: str) -> Optional[str]:
+    """The size's id from the newest covering entry whose pre-image holds one."""
+    for e in covering:
+        found = (_as_json(e.get("removed_child_ids")) or {}).get(sku)
+        if found:
+            return found
+    return None
+
+
+def id_editor(
+    platform_id: str,
+    *,
+    facts: PlatformFacts,
+    refusal: Optional[DelistRefused],
+    skus: Sequence[str],
+    rows: Sequence[Dict[str, Any]],
+    other_parent_rows: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """The row's "editor" (ID EDITOR). rows and other_parent_rows are this platform's."""
+    levels = ID_LEVELS.get(platform_id, ())
+    lock = refusal if refusal is not None and refusal.code in _EDIT_LOCKS else None
+    if lock is not None and lock.code == READ_ONLY:
+        lock_reason = _read_only_reason(platform_id)
+    else:
+        lock_reason = lock.message if lock is not None else None
+    open_entries = facts.open_entries
+
+    def field(level: str, value: Any, reason: Optional[str] = None, code: Optional[str] = None):
+        if lock is not None:
+            reason, code = lock_reason, lock.code
+        return {
+            "id": display_id(platform_id, level, value),
+            "editable": reason is None,
+            "reason": reason,
+            "code": code,
+        }
+
+    product = None
+    if PRODUCT_LEVEL in levels:
+        parent_row = next((r for r in rows if r.get("level") == "parent"), None)
+        if parent_row is not None:
+            value = parent_row.get("external_id")
+        else:
+            # KTD10: a delist took the product row, and its pre-image holds the id.
+            removed = (e.get("removed_parent_id") for e in reversed(open_entries))
+            value = next((v for v in removed if v), None)
+        whole_open = any(e.get("child_skus") is None for e in open_entries)
+        if whole_open or (open_entries and parent_row is None):
+            product = field(PRODUCT_LEVEL, value, "Restore first", RESTORE_FIRST)
+        else:
+            product = field(PRODUCT_LEVEL, value)
+
+    child_ids = {r["sku"]: r.get("external_id") for r in rows if r.get("level") == "child"}
+    elsewhere = {r["sku"]: r for r in other_parent_rows}
+    sizes: Dict[str, Dict[str, Any]] = {}
+    for sku in skus:
+        covering = _covering(open_entries, sku)
+        if SIZE_LEVEL not in levels:
+            out = {"id": None, "editable": False, "reason": None, "code": None}
+        elif covering:
+            value = child_ids.get(sku) or _removed_id(covering, sku)
+            out = field(SIZE_LEVEL, value, "Restore first", RESTORE_FIRST)
+        elif sku in elsewhere:
+            other = elsewhere[sku]
+            out = field(
+                SIZE_LEVEL,
+                other.get("external_id"),
+                f"Stored under {other['parent_sku']}",
+                OTHER_PARENT,
+            )
+        else:
+            out = field(SIZE_LEVEL, child_ids.get(sku))
+        newest = covering[0] if covering else None
+        out["delist_id"] = newest["id"] if newest else None
+        out["delist_size_count"] = len(newest.get("child_skus") or skus) if newest else None
+        sizes[sku] = out
+    return {"levels": list(levels), "product": product, "sizes": sizes}
+
+
 def platform_view(
     platform_id: str,
     *,
@@ -870,11 +1106,13 @@ def platform_view(
     attempts: Sequence[Dict[str, Any]],
     rows: Sequence[Dict[str, Any]],
     entries: Sequence[Dict[str, Any]],
+    other_parent_rows: Sequence[Dict[str, Any]] = (),
 ) -> Dict[str, Any]:
     """One platform's row of the history payload (module docstring)."""
     attempts = [a for a in attempts if a.get("platform_id") == platform_id]
     rows = [r for r in rows if r.get("platform_id") == platform_id]
     entries = [e for e in entries if e.get("platform_id") == platform_id]
+    other_parent_rows = [r for r in other_parent_rows if r.get("platform_id") == platform_id]
     facts = platform_facts(platform_id, size_list, attempts, rows, entries)
     excluded = bool(excluded_reasons)
     listed_at, recorded = listed_date(attempts, rows)
@@ -902,6 +1140,14 @@ def platform_view(
         "sizes": facts.states,
         "open_delists": [dict(by_id[i]) for i in open_ids if i in by_id],
         "timeline": timeline,
+        "editor": id_editor(
+            platform_id,
+            facts=facts,
+            refusal=refusal,
+            skus=[s["sku"] for s in size_list],
+            rows=rows,
+            other_parent_rows=other_parent_rows,
+        ),
     }
 
 
@@ -915,8 +1161,10 @@ def build_history(
     attempts: Sequence[Dict[str, Any]],
     rows: Sequence[Dict[str, Any]],
     entries: Sequence[Dict[str, Any]],
+    other_parent_rows: Sequence[Dict[str, Any]] = (),
 ) -> Dict[str, Any]:
-    """The whole payload from what get_history read. Pure."""
+    """The whole payload from what get_history read. Pure. other_parent_rows are the
+    children's rows stored under another parent (_OTHER_PARENT_SQL)."""
     shown = list(platforms)
     shown_set = set(shown)
     sizes = size_list(
@@ -936,6 +1184,7 @@ def build_history(
                 attempts=attempts,
                 rows=rows,
                 entries=entries,
+                other_parent_rows=other_parent_rows,
             )
             for p in shown
         ],
@@ -952,8 +1201,9 @@ def build_listing_dates(
 ) -> List[Dict[str, Any]]:
     """One entry per platform the parent is listed on RIGHT NOW. Pure.
 
-    A platform the product is not listed on is absent rather than present with a null date,
-    so a caller never has to tell "not listed" from "listed, date unknown". Listedness is
+    A platform the product is not listed on is absent rather than present with a null
+    date, so a null date never has to be read as "not listed" - it only ever means the
+    date is unknown, either withheld (manual) or never signalled. Listedness is
     `facts.anything_listed`, not the row status, because the status is a display precedence:
     an in-flight resubmission reads In progress over Listed, and a product that is live on
     the platform must not drop out of this list while a resubmit is in flight.
@@ -977,6 +1227,10 @@ def build_listing_dates(
                 "source": SOURCE_MANUAL if recorded else SOURCE_SKUBASE,
                 # Withheld on purpose when recorded: see SOURCE_MANUAL. The caller gets
                 # null rather than a backfill timestamp dressed up as a listing date.
+                # On the skubase side this is listed_at, the platform's own go-live
+                # instant, so it can also be null: the platform is live but never gave a
+                # signal we could date it by. Absence from this list, not a null date,
+                # is still the only thing that means "not listed".
                 "listing_date": None if recorded else _as_utc(listed_at),
             }
         )
@@ -987,23 +1241,31 @@ def build_listing_dates(
 # Reads
 # ---------------------------------------------------------------------------
 
-# Every attempt on every listing of the parent. $2 NULL means every platform.
+# Every attempt on every listing of the parent, and every manual row saved while the parent
+# had no listing, tied to it by platform_meta.parent_sku (KTD3). $2 NULL means every
+# platform. The listing ids are read first so each arm of the OR has its own index (the
+# listing_id unique key, and the partial index listing_id_edits.sql adds), instead of the
+# OR spanning both tables of a join.
 _ATTEMPTS_SQL = """
 SELECT s.id, s.listing_id::text AS listing_id, l.batch_id, b.comment AS batch_comment,
        l.created_at AS listing_created_at, s.platform_id, s.status, s.platform_status,
        s.reviewed_at, s.attempt_number, s.created_at, s.updated_at, s.completed_at,
        s.submitted_by, COALESCE(NULLIF(s.error_display, ''), s.error) AS error,
-       s.platform_meta -> 'steps' AS steps
-  FROM listings l
-  JOIN listing_submissions s ON s.listing_id = l.id
+       -- platform_meta.steps used to come over too, only to be scanned for a `listed`
+       -- entry. listed_at is that answer already decided, so the whole steps array no
+       -- longer crosses the wire for every attempt of every listing of the parent.
+       s.listed_at
+  FROM listing_submissions s
+  LEFT JOIN listings l ON l.id = s.listing_id
   LEFT JOIN batches b ON b.id = l.batch_id
- WHERE l.product_id = $1
+ WHERE (s.listing_id = ANY (ARRAY(SELECT x.id FROM listings x WHERE x.product_id = $1))
+        OR (s.listing_id IS NULL AND s.platform_meta ->> 'parent_sku' = $1))
    AND ($2::text IS NULL OR s.platform_id = $2::text)
  ORDER BY s.created_at, s.id
 """
 
 _PRESENCE_SQL = """
-SELECT e.id::text AS id, e.platform_id, e.level, e.sku, e.first_seen_at
+SELECT e.id::text AS id, e.platform_id, e.level, e.sku, e.external_id, e.first_seen_at
   FROM external_listing_ids e
  WHERE e.parent_sku = $1
    AND ($2::text IS NULL OR e.platform_id = $2::text)
@@ -1011,15 +1273,38 @@ SELECT e.id::text AS id, e.platform_id, e.level, e.sku, e.first_seen_at
 """
 
 # is_open comes from open_platform_delists(), the only definition of an open delist.
+# removed_parent_id and removed_child_ids ({sku: id}) are the ids the entry's pre-image
+# holds, which the id editor shows read-only until Restore (KTD10), rather than shipping
+# the whole pre-image.
 _ENTRIES_SQL = """
 SELECT d.id::text AS id, d.platform_id, d.parent_sku, d.child_skus, d.comment,
        d.created_by, d.created_at, d.restored_at, d.restored_by,
        jsonb_array_length(d.removed_rows) AS removed_count,
+       (SELECT r ->> 'external_id'
+          FROM jsonb_array_elements(d.removed_rows) r
+         WHERE r ->> 'level' = 'parent'
+         LIMIT 1) AS removed_parent_id,
+       (SELECT jsonb_object_agg(r ->> 'sku', r ->> 'external_id')
+          FROM jsonb_array_elements(d.removed_rows) r
+         WHERE r ->> 'level' = 'child' AND r ->> 'external_id' IS NOT NULL) AS removed_child_ids,
        d.id IN (SELECT o.id FROM open_platform_delists() o WHERE o.parent_sku = $1) AS is_open
   FROM platform_delists d
  WHERE d.parent_sku = $1
    AND ($2::text IS NULL OR d.platform_id = $2::text)
  ORDER BY d.created_at
+"""
+
+# The children's rows stored under ANOTHER parent: a child reassigned after its row was
+# recorded. _PRESENCE_SQL cannot see them, and a save never moves parent_sku (KTD7), so
+# the editor shows them read-only. The platform list lets the lookup use the
+# (platform_id, level, sku) key.
+_OTHER_PARENT_SQL = """
+SELECT e.platform_id, e.sku, e.parent_sku, e.external_id
+  FROM external_listing_ids e
+ WHERE e.platform_id = ANY($3::text[])
+   AND e.level = 'child'
+   AND e.sku = ANY($2::text[])
+   AND e.parent_sku <> $1
 """
 
 
@@ -1033,6 +1318,20 @@ async def _read_state(
     rows = await conn.execute_query_dict(presence_sql, [parent_sku, platform_id])
     entries = await conn.execute_query_dict(_ENTRIES_SQL, [parent_sku, platform_id])
     return list(attempts), list(rows), list(entries)
+
+
+async def _read_other_parent_rows(
+    conn: Any, parent_sku: str, child_skus: Sequence[str], platforms: Sequence[str]
+) -> List[Dict[str, Any]]:
+    """_OTHER_PARENT_SQL for the platforms with a size-level id (only the size editor reads
+    these rows), or nothing to ask when there are no children or no such platform."""
+    platforms = [p for p in platforms if SIZE_LEVEL in ID_LEVELS.get(p, ())]
+    if not child_skus or not platforms:
+        return []
+    rows = await conn.execute_query_dict(
+        _OTHER_PARENT_SQL, [parent_sku, list(child_skus), list(platforms)]
+    )
+    return list(rows)
 
 
 async def _size_rank(scheme: Optional[str]) -> Dict[str, Any]:
@@ -1109,20 +1408,35 @@ def _not_found() -> DelistRefused:
     return DelistRefused("Product not found", NOT_FOUND, 404)
 
 
-async def get_history(parent_sku: str) -> Dict[str, Any]:
+async def get_history(
+    parent_sku: str,
+    *,
+    product: Optional[ProductFacts] = None,
+    config: Optional[Tuple[List[str], Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """The history payload for a PARENT sku (the route resolves a child first).
 
     The three read groups are independent and read-only, so they run together: each
     query outside a transaction takes its own pooled connection. Never do this with a
     transaction's conn (delist, restore), which runs one statement at a time. An
     unknown product still answers 404 before any other read's error, as it did when
-    the reads ran one after another."""
+    the reads ran one after another. The exclusions and the rows stored under another
+    parent need the product, so they run together after it.
+
+    product and config (_load_platform_config's pair) are used as given when the caller
+    already loaded them (the listing id save); the state and exclusions are always read."""
 
     async def read_state():
         return await _read_state(connections.get("default"), parent_sku, None)
 
+    async def given(value):
+        return value
+
     product, config, state = await asyncio.gather(
-        _load_product(parent_sku), _load_platform_config(), read_state(), return_exceptions=True
+        _load_product(parent_sku) if product is None else given(product),
+        _load_platform_config() if config is None else given(config),
+        read_state(),
+        return_exceptions=True,
     )
     if isinstance(product, BaseException):
         raise product
@@ -1133,7 +1447,16 @@ async def get_history(parent_sku: str) -> Dict[str, Any]:
             raise result
     platforms, settings = config
     attempts, rows, entries = state
-    exclusions = await _exclusions(product, platforms)
+    exclusions, other_parent_rows = await asyncio.gather(
+        _exclusions(product, platforms),
+        _read_other_parent_rows(
+            connections.get("default"), parent_sku, product.child_skus, platforms
+        ),
+        return_exceptions=True,
+    )
+    for result in (exclusions, other_parent_rows):
+        if isinstance(result, BaseException):
+            raise result
     return build_history(
         parent_sku,
         platforms=platforms,
@@ -1143,6 +1466,7 @@ async def get_history(parent_sku: str) -> Dict[str, Any]:
         attempts=attempts,
         rows=rows,
         entries=entries,
+        other_parent_rows=other_parent_rows,
     )
 
 
@@ -1262,7 +1586,7 @@ async def delist(
     if not enabled:
         raise DelistRefused("Unknown platform", UNKNOWN_PLATFORM, 400)
     excluded = bool((await _exclusions(product, [platform_id])).get(platform_id))
-    allow_partial = bool((settings.get(platform_id) or {}).get("allow_partial_submit", False))
+    allow_partial = allow_partial_submit(settings, platform_id)
 
     async with in_transaction("default") as conn:
         await conn.execute_query(SUBMIT_LOCK_SQL, [parent_sku])
@@ -1290,37 +1614,20 @@ async def delist(
                 refused.code,
             )
             raise
-
-        created = (
-            await conn.execute_query_dict(
-                _INSERT_ENTRY_SQL,
-                [platform_id, parent_sku, plan.scope, comment, user_id, plan.remove_ids],
-            )
-        )[0]
-        entry_id = str(created["id"])
-        if plan.remove_ids:
-            await conn.execute_query(_DELETE_ROWS_SQL, [plan.remove_ids])
-        inserted = 0
-        if plan.insert_skus:
-            parent_row = next((r for r in rows if r.get("level") == "parent"), None)
-            meta = {"delist_id": entry_id, "split_from": parent_row["id"] if parent_row else None}
-            result = await conn.execute_query_dict(
-                _SPLIT_SQL,
-                [
-                    platform_id,
-                    parent_sku,
-                    plan.insert_skus,
-                    json.dumps(meta),
-                    entry_id,
-                    parent_row.get("first_seen_at") if parent_row else None,
-                ],
-            )
-            inserted = result[0]["inserted"] if result else 0
+        entry, inserted = await write_delist(
+            conn,
+            platform_id=platform_id,
+            parent_sku=parent_sku,
+            plan=plan,
+            rows=rows,
+            comment=comment,
+            user_id=user_id,
+        )
 
     _clear_summary_cache()
     logger.info(
         "delist %s: %s %s sizes=%s by %s, removed %d rows, inserted %d",
-        entry_id,
+        entry["id"],
         platform_id,
         parent_sku,
         plan.scope,
@@ -1328,7 +1635,52 @@ async def delist(
         len(plan.remove_ids),
         inserted,
     )
-    return _entry_out(
+    return entry
+
+
+async def write_delist(
+    conn: Any,
+    *,
+    platform_id: str,
+    parent_sku: str,
+    plan: DelistPlan,
+    rows: Sequence[Dict[str, Any]],
+    comment: Optional[str],
+    user_id: str,
+) -> Tuple[Dict[str, Any], int]:
+    """The delist core: write a planned delist on the CALLER's connection (WRITE ORDER).
+
+    The caller holds the transaction and SUBMIT_LOCK_SQL, read `rows` with lock_rows and
+    made `plan` from them (plan_delist), and clears the summary cache after commit. delist()
+    is one caller; the listing id save (listing_id_service) is the other, so a delist and
+    an id change land in one transaction under one lock (KTD5). Returns the entry and how
+    many split rows were inserted."""
+    created = (
+        await conn.execute_query_dict(
+            _INSERT_ENTRY_SQL,
+            [platform_id, parent_sku, plan.scope, comment, user_id, plan.remove_ids],
+        )
+    )[0]
+    entry_id = str(created["id"])
+    if plan.remove_ids:
+        await conn.execute_query(_DELETE_ROWS_SQL, [plan.remove_ids])
+    inserted = 0
+    if plan.insert_skus:
+        parent_row = next((r for r in rows if r.get("level") == "parent"), None)
+        meta = {"delist_id": entry_id, "split_from": parent_row["id"] if parent_row else None}
+        result = await conn.execute_query_dict(
+            _SPLIT_SQL,
+            [
+                platform_id,
+                parent_sku,
+                plan.insert_skus,
+                json.dumps(meta),
+                entry_id,
+                parent_row.get("first_seen_at") if parent_row else None,
+            ],
+        )
+        inserted = result[0]["inserted"] if result else 0
+    entry = _entry_out(
         {
             "id": entry_id,
             "platform_id": platform_id,
@@ -1339,9 +1691,10 @@ async def delist(
             "created_at": created.get("created_at"),
         }
     )
+    return entry, inserted
 
 
-_RESTORE_READ_SQL = """
+_RESTORE_READ_SQL = f"""
 SELECT d.id::text AS id, d.platform_id, d.parent_sku, d.child_skus, d.comment,
        d.created_by, d.created_at, d.restored_at, d.restored_by,
        EXISTS (
@@ -1351,6 +1704,8 @@ SELECT d.id::text AS id, d.platform_id, d.parent_sku, d.child_skus, d.comment,
             WHERE l.product_id = d.parent_sku
               AND s.platform_id = d.platform_id
               AND s.created_at > d.created_at
+              -- An id saved by hand is not a resubmit (attempted_since).
+              AND s.platform_status IS DISTINCT FROM '{MANUAL_PLATFORM_STATUS}'
        ) AS attempted_since
   FROM platform_delists d
  WHERE d.id = $1::uuid
@@ -1366,13 +1721,19 @@ RETURNING id::text AS id, platform_id, parent_sku, child_skus, comment, created_
           created_at, restored_at, restored_by
 """
 
-_DELETE_INSERTED_SQL = """
+# A split row whose id was saved by hand after the entry stays (KTD11, R16): it is a size
+# that was still listed, and its id is the one the operator set. The pre-image re-insert
+# below already keeps an edited row that is still there, because its conflict update only
+# ever lowers first_seen_at, and makes the same check for one a later entry removed.
+_DELETE_INSERTED_SQL = f"""
 DELETE FROM external_listing_ids e
  USING platform_delists d
  WHERE d.id = $1::uuid
    AND e.platform_id = d.platform_id
    AND e.parent_sku = d.parent_sku
    AND e.id IN (SELECT (r ->> 'id')::uuid FROM jsonb_array_elements(d.inserted_rows) r)
+   AND NOT COALESCE(
+           (e.external_meta -> '{MANUAL_EDIT_META}' ->> 'at')::timestamptz > d.created_at, false)
 """
 
 # Exactly the pre-image, id and timestamps included. A row re-added meanwhile (a relist
@@ -1383,8 +1744,9 @@ DELETE FROM external_listing_ids e
 # Stacked per-size entries: A splits the parent row into child rows, B removes one of
 # them. Restoring A deletes A's rows and puts the parent row back; restoring B afterwards
 # must not resurrect A's child row next to it. Restored in either order, the rows end up
-# exactly as before A.
-_REINSERT_SQL = """
+# exactly as before A, plus any split row whose id was saved by hand after A: that one is
+# re-inserted, as _DELETE_INSERTED_SQL keeps it when B is restored first.
+_REINSERT_SQL = f"""
 INSERT INTO external_listing_ids
 SELECT r.*
   FROM platform_delists d,
@@ -1397,6 +1759,9 @@ SELECT r.*
           AND o.parent_sku = d.parent_sku
           AND o.restored_at IS NOT NULL
           AND o.inserted_rows @> jsonb_build_array(jsonb_build_object('id', r.id))
+          AND NOT COALESCE(
+                  (r.external_meta -> '{MANUAL_EDIT_META}' ->> 'at')::timestamptz > o.created_at,
+                  false)
    )
 ON CONFLICT (platform_id, level, sku) DO UPDATE
    SET first_seen_at = LEAST(external_listing_ids.first_seen_at, EXCLUDED.first_seen_at)

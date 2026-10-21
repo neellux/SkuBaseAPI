@@ -1,21 +1,30 @@
 """external_listing_ids: "this parent is already on that platform".
 
 The second input to submit gating, beside platform_settings.<p>.allow_resubmit.
-A row asserts PRESENCE and only optionally carries a platform id, because half
-the platforms give us nothing usable:
+A row asserts PRESENCE and only optionally carries a platform id, because not
+every platform gives us one:
 
-    grailed      listing_submissions.external_id is ["<child sku>_<MMDDYYYY>"],
-                 our own sku plus a batch date. A Google Sheet row key, not a
-                 Grailed id. The AppScript's only action is addListings and it
-                 reads nothing back, so no Grailed id exists anywhere.
-    ebay         real item ids, child level only, external_id.item_ids{sku}
+    grailed      child rows carry the sheet key "<child sku>_<MMDDYYYY>", our
+                 own sku plus the sheet batch date: a Google Sheet row key, not a
+                 Grailed id, but the only one SkuBase has. addListings returns
+                 one per row it adds (added_references), and both Grailed capture
+                 paths store it on the child row (utils/grailed_keys.py). Rows
+                 from before that are filled once by
+                 scripts/backfill_grailed_sheet_keys.py. The parent row has none.
+    ebay         real item ids, child level only; submissions keep
+                 external_id.item_ids{sku}
     1nventory    product_gid (parent) + variant_gids{sku} (child)
-    goat         SKU (GOAT), but it lives in platform_meta.goat_sku
+    goat         SKU (GOAT) on the parent row; submissions keep it in
+                 platform_meta.goat_sku
     spo          nothing, ever. 0 of 2,291 rows
     sellercloud  the "ProductID" is the sku we sent it; listings.info_product_id
                  already holds it
 
-So external_id is nullable and every consumer keys on the row EXISTING.
+So external_id is nullable and every gate and completion check keys on the row
+EXISTING. record() COALESCEs, which only refuses to blank an id: any non-NULL id
+it is given overwrites the stored one. Ids saved by hand on the Listing history
+tab (source 'manual', external_meta.manual_edit) are written by
+listing_id_service in its own transaction, not by record().
 
 THE PRECEDENCE RULE (plan section 2.2). This module owns the submit-gate half:
 

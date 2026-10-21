@@ -75,6 +75,11 @@ PLATFORMS_CACHE_SECONDS = 60
 # not hide a relist in flight (AE7). A success after the entry that did not close it (a GOAT
 # denial, a reviewed failure) reads None. An exclusion still wins over all of it.
 #
+# A manual row (platform_status 'manual', an id saved by hand) is not one of those later
+# attempts: it never closes the delist, and it must not stand in front of the relist that
+# failed before it either, which the listing history still reads as Failed. With no open
+# delist it is a success like any other (listing id edits, KTD2).
+#
 # coverage_state_sql is the per-row form, used for the pills on one page of rows; the
 # excluded case is applied in Python afterwards, from the cache.
 # COVERAGE_CTE is the set form, used to filter the whole catalog: evaluating the per-row
@@ -92,7 +97,8 @@ _COVERAGE_TEMPLATE = """(SELECT CASE
         FROM listings l
         JOIN listing_submissions s ON s.listing_id = l.id
        WHERE l.product_id = {sku} AND s.platform_id = {platform}
-         AND (od.since IS NULL OR s.created_at > od.since)
+         AND (od.since IS NULL
+              OR (s.created_at > od.since AND s.platform_status IS DISTINCT FROM 'manual'))
        ORDER BY l.created_at DESC, s.attempt_number DESC
        LIMIT 1
   ), 'none')
@@ -128,7 +134,8 @@ COVERAGE_CTE = """excl AS (
 ),
 cov_listing AS (
     -- open_delists (OPEN_DELISTS_CTE): while a delist is open nothing reads listed and only
-    -- attempts after its newest entry count (KTD4, see _COVERAGE_TEMPLATE).
+    -- attempts after its newest entry count, never a manual row (KTD4, see
+    -- _COVERAGE_TEMPLATE).
     SELECT COALESCE(e.parent_sku, ls.product_id) AS sku,
            COALESCE(e.platform_id, ls.platform_id) AS platform_id,
            CASE WHEN e.parent_sku IS NOT NULL THEN 'listed'
@@ -147,7 +154,8 @@ cov_listing AS (
             JOIN listings l ON l.id = s.listing_id
             LEFT JOIN open_delists d ON d.parent_sku = l.product_id AND d.platform_id = s.platform_id
            WHERE s.platform_id = ANY({platforms})
-             AND (d.created_at IS NULL OR s.created_at > d.created_at)
+             AND (d.created_at IS NULL
+                  OR (s.created_at > d.created_at AND s.platform_status IS DISTINCT FROM 'manual'))
            ORDER BY l.product_id, s.platform_id, l.created_at DESC, s.attempt_number DESC
       ) ls ON ls.product_id = e.parent_sku AND ls.platform_id = e.platform_id
 ),
