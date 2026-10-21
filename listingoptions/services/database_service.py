@@ -815,6 +815,48 @@ class DatabaseService:
         return [str(r["internal_value"]) for r in rows]
 
     @staticmethod
+    async def type_divisions(
+        *,
+        parent_id: Any = None,
+        record_id: Any = None,
+        internal_values: Optional[List[str]] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Parent divisions for types, keyed by type name (by "" for a bare parent_id).
+
+        Exactly one of: parent_id (a parent row, for a type not saved yet), record_id
+        (a saved type), internal_values (type names, matched the way
+        internal_values_mapped_on_platform matches them). A type with no parent maps to
+        None; an unknown id or name is left out.
+        """
+        parents = DatabaseService._table("types_parents")
+        types = DatabaseService._table("types")
+        conn = Tortoise.get_connection("default")
+        try:
+            if parent_id is not None:
+                rows = await conn.execute_query_dict(
+                    f'SELECT \'\' AS type, division FROM "{parents}" WHERE id = $1',
+                    [uuid.UUID(str(parent_id))],
+                )
+            elif record_id is not None:
+                rows = await conn.execute_query_dict(
+                    f'SELECT t.type, p.division FROM "{types}" t '
+                    f'LEFT JOIN "{parents}" p ON p.id = t.parent_id WHERE t.id = $1',
+                    [uuid.UUID(str(record_id))],
+                )
+            elif internal_values:
+                rows = await conn.execute_query_dict(
+                    f'SELECT t.type, p.division FROM "{types}" t '
+                    f'LEFT JOIN "{parents}" p ON p.id = t.parent_id WHERE t.type = ANY($1)',
+                    [list(internal_values)],
+                )
+            else:
+                return {}
+        except ValueError:
+            # Not a uuid: no such row. The save itself reports the bad id.
+            return {}
+        return {str(r["type"]): r["division"] for r in rows}
+
+    @staticmethod
     async def insert_record(table_name: str, data: Dict[str, Any]) -> str:
         try:
             schema = await DatabaseService.get_table_schema(table_name)

@@ -13,7 +13,11 @@ from listingoptions.models.api_models import (
     DefaultListInternalValuesUpdate,
 )
 from listingoptions.services.database_service import DatabaseService
-from listingoptions.services.exclusive_platforms import applies_to, exclusive_counterpart
+from listingoptions.services.exclusive_platforms import (
+    applies_to,
+    division_route,
+    exclusive_counterpart,
+)
 import logging
 import json
 import csv
@@ -142,6 +146,28 @@ async def sync_default_internal_values(
         if counterpart and not applies_to(await DatabaseService.get_table_schema(table_name)):
             counterpart = None
         if counterpart:
+            # ...and the type's division picks which one (division_route): mapping
+            # here would also clear the exclusion the division put on it, below.
+            divisions = await DatabaseService.type_divisions(
+                internal_values=payload.internal_values
+            )
+            ruled_out = sorted(
+                value
+                for value, division in divisions.items()
+                if (division_route(division) or (None, None))[1] == payload.platform_id
+            )
+            if ruled_out:
+                names = []
+                for platform_id in (counterpart, payload.platform_id):
+                    platform = await DatabaseService.get_platform_by_id(platform_id)
+                    names.append(platform.name if platform else platform_id)
+                shown = ", ".join(ruled_out[:3])
+                if len(ruled_out) > 3:
+                    shown += f" and {len(ruled_out) - 3} more"
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Goes to {names[0]}, not {names[1]}: {shown}",
+                )
             already_mapped = await DatabaseService.internal_values_mapped_on_platform(
                 table_name, payload.internal_values, counterpart
             )

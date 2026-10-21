@@ -17,6 +17,12 @@ provenance, so removing a mapping does not lift the other platform's exclusion: 
 exclusion the rule added and one an operator ticked look the same.
 
 Applies only to EXCLUSIVE_TABLES. Brands and colours are mapped per platform as usual.
+
+Which of the pair a type goes to is decided by its parent's division (division_route):
+footwear to goat_sneakers, everything else to goat. Every type save adds the other one
+to its exclusions and refuses a mapping to it, so a new type is routed before anyone
+maps it. Moving a type to another division also lifts the exclusion its old division
+added. A type with no parent is left to its mappings alone.
 """
 
 from typing import Any, Final, Iterable, Mapping
@@ -29,6 +35,21 @@ EXCLUSIVE_PLATFORMS: Final[Mapping[str, str]] = {
     "goat": "goat_sneakers",
     "goat_sneakers": "goat",
 }
+
+
+FOOTWEAR_DIVISION: Final = "Footwear"
+
+
+def division_route(division: str | None) -> tuple[str, str] | None:
+    """(platform a type goes to, platform it is excluded from) for its parent's division.
+
+    None when the division is unknown (no parent): the rule decides nothing then.
+    """
+    if not division or not str(division).strip():
+        return None
+    if str(division).strip().lower() == FOOTWEAR_DIVISION.lower():
+        return "goat_sneakers", "goat"
+    return "goat", "goat_sneakers"
 
 
 def applies_to(table_schema: Any) -> bool:

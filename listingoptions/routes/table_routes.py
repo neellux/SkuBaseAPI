@@ -20,6 +20,7 @@ import time
 from listingoptions.services.database_service import DatabaseService
 from listingoptions.services.exclusive_platforms import (
     applies_to,
+    division_route,
     exclusive_counterpart,
     resolve_exclusive,
 )
@@ -70,6 +71,49 @@ async def _apply_exclusive_platforms(
             status_code=400, detail=f"Map to {names[0]} or {names[1]}, not both"
         )
     excluded_platform_ids.update(to_exclude)
+
+
+async def _apply_division_route(
+    table_schema,
+    main_record_data: Dict[str, Any],
+    platform_mappings: Dict[str, str],
+    excluded_platform_ids: set,
+    record_id: Optional[str] = None,
+) -> None:
+    """A type is excluded from the one of goat / goat_sneakers its division rules out.
+
+    Footwear goes to goat_sneakers, everything else to goat (division_route). Forced on
+    every save, and a mapping to the ruled-out platform is refused. On an update that
+    moves the type to another division, the exclusion the old division added is lifted.
+    """
+    if not applies_to(table_schema):
+        return
+    if "parent_id" in main_record_data:
+        parent_id = main_record_data.get("parent_id")
+        divisions = (
+            await DatabaseService.type_divisions(parent_id=parent_id) if parent_id else {}
+        )
+    else:
+        divisions = await DatabaseService.type_divisions(record_id=record_id) if record_id else {}
+    division = next(iter(divisions.values()), None)
+    route = division_route(division)
+    if route is None:
+        return
+    goes_to, ruled_out = route
+    if ruled_out in platform_mappings:
+        names = []
+        for platform_id in (goes_to, ruled_out):
+            platform = await DatabaseService.get_platform_by_id(platform_id)
+            names.append(platform.name if platform else platform_id)
+        raise HTTPException(
+            status_code=400, detail=f"{division} types go to {names[0]}, not {names[1]}"
+        )
+    if record_id is not None:
+        before = await DatabaseService.type_divisions(record_id=record_id)
+        old_route = division_route(next(iter(before.values()), None))
+        if old_route and old_route[1] != ruled_out:
+            excluded_platform_ids.discard(old_route[1])
+    excluded_platform_ids.add(ruled_out)
 
 
 @router.post("/create", response_model=SuccessResponse)
@@ -553,6 +597,9 @@ async def create_record(
             else:
                 main_record_data[key] = value
 
+        await _apply_division_route(
+            table_schema, main_record_data, parsed_platform_mappings, excluded_platform_ids
+        )
         await _apply_exclusive_platforms(
             table_schema, parsed_platform_mappings, excluded_platform_ids
         )
@@ -780,6 +827,13 @@ async def update_record(
             else:
                 main_record_data[key] = value
 
+        await _apply_division_route(
+            table_schema,
+            main_record_data,
+            parsed_platform_mappings,
+            excluded_platform_ids,
+            record_id=record_id,
+        )
         await _apply_exclusive_platforms(
             table_schema, parsed_platform_mappings, excluded_platform_ids
         )
