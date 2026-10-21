@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
 from config import config
@@ -12,6 +12,7 @@ from models.db_models import AppSettings, Listing, ListingSubmission
 from services.external_listing_service import ExternalListingService
 from services.listing_options_service import listing_options_service
 from services.template_render import build_field_value
+from utils.grailed_keys import sheet_keys_by_sku
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,35 @@ COUNTRY_CODE_MAP = country_codes = {
 }
 
 
+def presence_rows(
+    parent_sku: Optional[str],
+    child_skus: Iterable[Optional[str]],
+    keys_by_sku: Dict[str, str],
+    submission_id: Any,
+) -> List[Dict[str, Any]]:
+    """The presence rows of an accepted Grailed submission: a parent row plus one child row
+    per sku that went to the sheet. Without a parent sku there is no parent to assert, so
+    the child rows are dropped too rather than guessed at.
+
+    Each child row carries the sheet key sent for it (keys_by_sku, from added_references),
+    the only Grailed id there is. A size refreshed in place (updated_references) came back
+    with no key and sends NULL, which the upsert's COALESCE turns into "keep the stored
+    key". The parent row has no key of its own.
+    """
+    if not parent_sku:
+        return []
+    return [
+        {"level": "parent", "sku": parent_sku, "parent_sku": parent_sku,
+         "external_meta": {"submission_id": submission_id}},
+        *(
+            {"level": "child", "sku": sku, "parent_sku": parent_sku,
+             "external_id": keys_by_sku.get(sku)}
+            for sku in child_skus
+            if sku
+        ),
+    ]
+
+
 class GrailedService:
 
     PLATFORM_ID = "grailed"
@@ -374,25 +404,18 @@ class GrailedService:
                 if added_refs:
                     submission.external_id = added_refs
                 await submission.save()
-                # Same presence write as grailed_poller._run_chunk, and for the
-                # same reason: added_references omits children that were merely
-                # refreshed in place, so the row set is built from the products
-                # actually sent, not from the response. This path is dead while
-                # grailed.manual_fallback is true (it is, on prod), but the two
-                # must not diverge.
+                # added_references omits children that were merely refreshed in
+                # place, so the row set is built from the products actually sent,
+                # not from the response. This path is dead while
+                # grailed.manual_fallback is true (it is, on prod).
                 await ExternalListingService.record(
                     "grailed",
-                    [
-                        {"level": "parent", "sku": listing.product_id,
-                         "parent_sku": listing.product_id,
-                         "external_meta": {"submission_id": submission.id}},
-                        *(
-                            {"level": "child", "sku": p["sku"],
-                             "parent_sku": listing.product_id}
-                            for p in products
-                            if p.get("sku")
-                        ),
-                    ] if listing.product_id else [],
+                    presence_rows(
+                        listing.product_id,
+                        (p.get("sku") for p in products),
+                        sheet_keys_by_sku(added_refs),
+                        submission.id,
+                    ),
                 )
                 logger.info(
                     f"Grailed submission succeeded for listing {listing.id}: "
