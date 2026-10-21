@@ -1,7 +1,8 @@
 """Daily refresh of essx_shoot_list from SellerCloud scheduled task 339.
 
 Task 339 runs every 15 minutes, so the cycle reads its newest completed output rather than
-waiting on a run of its own. See services/essx_shoot_list_service.py for the rules.
+waiting on a run of its own. See services/essx_shoot_list_service.py for the rules. Only
+the stock columns are written here; photography keeps the photo columns.
 
 Scheduled with APScheduler at a fixed wall-clock time, mirroring daily_image_import_poller.
 """
@@ -30,7 +31,6 @@ class EssxShootListPoller:
         self.task_id: int = int(cfg.get("task_id", 339))
         # SellerCloud reports the task's run times in the account's own timezone.
         self.task_timezone: str = cfg.get("task_timezone", "America/New_York")
-        self.session_days: int = int(cfg.get("session_days", 5))
         self.max_age_hours: float = float(cfg.get("max_age_hours", 26))
         self.min_candidate_ratio: float = float(cfg.get("min_candidate_ratio", 0.5))
         self._schedule_hour: int = int(cfg.get("daily_hour", 6))
@@ -82,7 +82,6 @@ class EssxShootListPoller:
 
         return await refresh(**{
             "task_id": self.task_id,
-            "session_days": self.session_days,
             "max_age_hours": self.max_age_hours,
             "min_candidate_ratio": self.min_candidate_ratio,
             "task_timezone": self.task_timezone,

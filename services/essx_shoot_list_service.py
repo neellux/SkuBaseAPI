@@ -1,38 +1,42 @@
-"""The ESSX Store shoot list: stock at the Essx Store warehouse that has never been shot.
+"""The ESSX Store photo queue: stock at the Essx Store warehouse that has never been shot.
 
-Filled once a day from SellerCloud scheduled task 339, an inventory report with one row
-per child SKU and a physical quantity column per ESSX warehouse (Essx Annex, Essx NJ
+The table, essx_shoot_list, lives in the PHOTOGRAPHY database (lux_photography), reached
+here through the photography_db connection. Two apps write it, each only its own columns:
+
+    stock   this module, once a day       qtys, ListPrice, value, and the page's title,
+                                          size and size order
+    photo   PhotoManagementNew            state, session ids, photo batch, last session
+            services/photo_queue.py, on
+            every scan, batch, hide or
+            disable and once a minute
+
+so SkuBase reads no photography table but this one. A row inserted here takes the photo
+defaults (to_shoot, no sessions) and photography fills them in within a minute. The photo
+rules live with photography's decide() and in SkuBase/docs/essx_shoot_list.md.
+
+The stock comes from SellerCloud scheduled task 339, an inventory report with one row per
+child SKU and a physical quantity column per ESSX warehouse (Essx Annex, Essx NJ
 Warehouse, Essx Store) plus their Total. Read on 2026-10-20: 7,583 rows, Total equal to
 the three warehouses summed on every row, negatives included. The report has Cost but no
-ListPrice, so the price comes from the catalog grid.
+ListPrice, so the price comes from the catalog grid. Value = max(Total, 0) x ListPrice.
 
-A SKU is on the list (state `to_shoot`) when it has Essx Store qty > 0, its parent has no
-photography images, and photography has no pending session or open batch for it. Images,
-sessions and batches are all keyed on the PARENT in photography, so every size of a
-parent shares its state. Value = max(Total, 0) x ListPrice; the list is read by value.
-
-Sessions are tracked here rather than pushed by photography:
-
-    to_shoot    on the list; no session
-    shot        a session started within session_days and not in any batch yet. After
-                session_days with still no batch the id is cleared and the SKU is back
-                to to_shoot.
-    in_batch    the parent is in a photography batch that is not completed
-    has_images  photography images arrived; only a row that carries a session id gets here
-
-A row with a session id is kept when it drops off the list (shot, sold, moved), so the
-page can show what was shot. A row without one is deleted. Nothing outside this table is
-ever written.
+A SKU at the Essx Store is on the list while its parent has no images (no
+catalog_product_images row, SkuBase's mirror of photography's productimages) or while its
+row carries session ids, which means photography is tracking a shoot of it. A row that is
+no longer listed is kept only while it is past to_shoot and carries session ids, so the
+page can show what was shot; any other row is deleted. Nothing outside this table is ever
+written.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from tortoise import connections
 from tortoise.transactions import in_transaction
@@ -41,10 +45,14 @@ from services.product_value_service import parse_number
 
 logger = logging.getLogger(__name__)
 
+# The photo states photography writes (PhotoManagementNew services/photo_queue.py).
 TO_SHOOT = "to_shoot"
 SHOT = "shot"
 IN_BATCH = "in_batch"
 HAS_IMAGES = "has_images"
+
+# The connection the table is on: the photography database.
+QUEUE_DB = "photography_db"
 
 STORE_COLUMN = "Essx Store"
 ANNEX_COLUMN = "Essx Annex"
@@ -69,31 +77,6 @@ class ReportRow:
     nj: int
     store: int
     total: int
-
-
-@dataclass
-class Session:
-    id: str
-    started: datetime
-    batched: bool
-
-
-@dataclass
-class ParentFacts:
-    """Everything photography says about one parent, read once per cycle."""
-
-    has_images: bool = False
-    open_batch_id: Optional[int] = None
-    open_batch_session: Optional[str] = None
-    sessions: List[Session] = field(default_factory=list)  # newest first
-
-
-@dataclass(frozen=True)
-class Decision:
-    state: str
-    session_id: Optional[str]
-    session_started_at: Optional[datetime]
-    photo_batch_id: Optional[int]
 
 
 # -- pure ---------------------------------------------------------------------
@@ -150,64 +133,57 @@ def row_value(total: int, list_price: Optional[Decimal]) -> Decimal:
     return (Decimal(max(total, 0)) * list_price).quantize(Decimal("0.01"))
 
 
-def decide(
-    facts: Optional[ParentFacts],
-    *,
-    now: datetime,
-    session_days: int,
-    existing_session: Optional[Tuple[str, Optional[datetime]]] = None,
-    first_seen_at: Optional[datetime] = None,
-) -> Optional[Decision]:
-    """One parent's state, or None when the row should not exist.
+_SIZE_SUFFIX = re.compile(r"\s+SIZE\s+\S.*$", re.IGNORECASE)
 
-    `facts` None means the SKU has no parent in child_products: photography cannot be
-    checked, so it stays on the list. `existing_session` is what the row carries today.
+
+def clean_title(name: Optional[str], sku: Optional[str] = None) -> Optional[str]:
+    """A size's SellerCloud ProductName made into a title, for parents SkuBase has no title
+    for. Drops a leading copy of the SKU and the "SIZE 48 $1755" tail."""
+    if not name:
+        return None
+    text = name.strip()
+    if sku and text.lower().startswith(sku.lower()):
+        text = text[len(sku):].strip()
+    return _SIZE_SUFFIX.sub("", text).strip() or name
+
+
+def size_label(sku: str, parent: Optional[str]) -> str:
+    """The part of a child SKU after its parent, else the whole SKU."""
+    if parent and sku.lower().startswith(parent.lower() + "/"):
+        return sku[len(parent) + 1:]
+    return sku
+
+
+# Letter sizes in wear order, for a parent with no sizing scheme to read the order from.
+LETTER_SIZES = ["XXXS", "XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "XXXXL", "OS", "O/S"]
+_LETTER_RANK = {s: i for i, s in enumerate(LETTER_SIZES)}
+
+# size_rank bands. A rank is compared only within one parent, which has one scheme, so a
+# rank stays right whichever day it was written.
+_LETTER_BAND = 1_000_000
+_OTHER_BAND = 2_000_000
+UNKNOWN_SIZE_RANK = 9_000_000
+
+
+def size_rank(size: str, order: Mapping[str, int]) -> int:
+    """Sort key for a size within its parent, the order ListingView shows sizes in.
+
+    With a sizing scheme: the scheme's "order", and a size the scheme does not list after
+    every size it does. Without one: numbers ascending, then letter sizes in wear order,
+    then anything else. Ties fall back to the SKU.
     """
-    if facts is None:
-        return Decision(TO_SHOOT, None, None, None)
-
-    if facts.has_images:
-        # Only a row that was shot from this list is worth keeping once images exist.
-        if existing_session and existing_session[0]:
-            return Decision(HAS_IMAGES, existing_session[0], existing_session[1], None)
-        recent = next(
-            (s for s in facts.sessions
-             if first_seen_at is not None and s.started >= first_seen_at - timedelta(days=1)),
-            None,
-        )
-        if recent:
-            return Decision(HAS_IMAGES, recent.id, recent.started, None)
-        return None
-
-    if facts.open_batch_id is not None:
-        session_id = facts.open_batch_session
-        started = next((s.started for s in facts.sessions if s.id == session_id), None)
-        if session_id is None and facts.sessions:
-            session_id, started = facts.sessions[0].id, facts.sessions[0].started
-        return Decision(IN_BATCH, session_id, started, facts.open_batch_id)
-
-    cutoff = now - timedelta(days=session_days)
-    pending = next((s for s in facts.sessions if not s.batched and s.started >= cutoff), None)
-    if pending:
-        return Decision(SHOT, pending.id, pending.started, None)
-
-    return Decision(TO_SHOOT, None, None, None)
-
-
-def batch_session_for(session_map: Any, parent: str) -> Optional[str]:
-    """The newest session id photography recorded for `parent` in a batch, if any."""
-    if not isinstance(session_map, Mapping):
-        return None
-    ids = session_map.get(parent)
-    if isinstance(ids, str):
-        return ids or None
-    if isinstance(ids, Sequence) and ids:
-        return str(ids[-1])
-    return None
-
-
-def lower_map(skus: Iterable[str]) -> Dict[str, str]:
-    return {s.lower(): s for s in skus}
+    if order:
+        rank = order.get(size)
+        if rank is None:
+            rank = {k.lower(): v for k, v in order.items()}.get(size.lower())
+        return int(rank) if rank is not None else UNKNOWN_SIZE_RANK
+    try:
+        number = float(size.replace(",", "."))
+        return int(round(min(max(number, 0.0), 9_999.99) * 100))
+    except ValueError:
+        pass
+    letter = _LETTER_RANK.get(size.strip().upper())
+    return _LETTER_BAND + letter if letter is not None else _OTHER_BAND
 
 
 # -- reads --------------------------------------------------------------------
@@ -223,52 +199,16 @@ async def load_parents(skus: Sequence[str]) -> Dict[str, str]:
     return {r["sku"]: r["parent_sku"] for r in rows}
 
 
-async def load_facts(parents: Sequence[str]) -> Dict[str, ParentFacts]:
-    """Images from the catalog mirror, sessions and open batches from photography."""
-    facts = {p: ParentFacts() for p in parents}
+async def load_imaged_parents(parents: Sequence[str]) -> set:
+    """The parents that already have photography images, from SkuBase's own mirror of
+    productimages (catalog_sync_poller, every 15 minutes): the catalog's "No images" test."""
     if not parents:
-        return facts
-    wanted = list(parents)
-
-    for r in await connections.get("default").execute_query_dict(
+        return set()
+    rows = await connections.get("default").execute_query_dict(
         "SELECT parent_sku FROM catalog_product_images WHERE parent_sku = ANY($1::text[])",
-        [wanted],
-    ):
-        facts[r["parent_sku"]].has_images = True
-
-    photo = connections.get("photography_db")
-    for r in await photo.execute_query_dict(
-        "SELECT s.id::text AS id, s.product_id, s.start_time, "
-        "       EXISTS (SELECT 1 FROM image i "
-        "                WHERE i.session_id = s.id AND i.batch_id IS NOT NULL) AS batched "
-        "  FROM session s "
-        " WHERE s.product_id = ANY($1::text[]) AND NOT COALESCE(s.hidden, false) "
-        "   AND s.start_time IS NOT NULL "
-        " ORDER BY s.start_time DESC",
-        [wanted],
-    ):
-        if r["product_id"] in facts:
-            facts[r["product_id"]].sessions.append(
-                Session(r["id"], _aware(r["start_time"]), bool(r["batched"]))
-            )
-
-    for r in await photo.execute_query_dict(
-        "SELECT id, product_ids, session_id_map_all FROM batch "
-        " WHERE status IS DISTINCT FROM 'completed' AND product_ids && $1::text[] "
-        " ORDER BY id DESC",
-        [wanted],
-    ):
-        session_map = r["session_id_map_all"]
-        if isinstance(session_map, str):
-            import json
-
-            session_map = json.loads(session_map or "{}")
-        for parent in r["product_ids"] or []:
-            item = facts.get(parent)
-            if item is not None and item.open_batch_id is None:
-                item.open_batch_id = r["id"]
-                item.open_batch_session = batch_session_for(session_map, parent)
-    return facts
+        [list(parents)],
+    )
+    return {r["parent_sku"] for r in rows}
 
 
 async def load_list_prices(skus: Sequence[str]) -> Tuple[Dict[str, Decimal], set]:
@@ -284,34 +224,89 @@ async def load_list_prices(skus: Sequence[str]) -> Tuple[Dict[str, Decimal], set
     return prices, {s.lower() for s in untrusted}
 
 
-def _aware(value: Any) -> datetime:
-    if isinstance(value, datetime) and value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
+@dataclass
+class PageLookups:
+    """What the products and listing-options tables add to the page's rows."""
+
+    titles: Dict[str, str] = field(default_factory=dict)
+    schemes: Dict[str, str] = field(default_factory=dict)  # parent -> sizing scheme
+    child_sizes: Dict[str, str] = field(default_factory=dict)  # lowercased child sku -> size
+    size_orders: Dict[str, Dict[str, int]] = field(default_factory=dict)  # scheme -> size -> order
+
+
+async def page_lookups(parents: Sequence[str], child_skus: Sequence[str]) -> PageLookups:
+    """Titles, sizing schemes and child sizes (products database), and each scheme's size
+    order (listingoptions_sizing_schemes, the order ListingView sorts its sizes by).
+    Read-only, and read at refresh so the page reads nothing but the queue table."""
+    out = PageLookups()
+    product_db = connections.get("product_db")
+    parents = list(parents)
+    if parents:
+        for r in await product_db.execute_query_dict(
+            "SELECT sku, title, sizing_scheme FROM parent_products WHERE sku = ANY($1::text[])",
+            [parents],
+        ):
+            if r["title"]:
+                out.titles[r["sku"]] = r["title"]
+            if r["sizing_scheme"]:
+                out.schemes[r["sku"]] = r["sizing_scheme"]
+    if child_skus:
+        for r in await product_db.execute_query_dict(
+            "SELECT lower(sku) AS sku, size FROM child_products WHERE lower(sku) = ANY($1::text[])",
+            [[c.lower() for c in child_skus]],
+        ):
+            if r["size"]:
+                out.child_sizes[r["sku"]] = r["size"]
+    if parents:
+        # The listing's scheme first: it is the one ListingView sorts by.
+        for r in await connections.get("default").execute_query_dict(
+            "SELECT DISTINCT ON (product_id) product_id, data->>'SIZING_SCHEME' AS scheme "
+            "FROM listings WHERE product_id = ANY($1::text[]) "
+            "AND COALESCE(data->>'SIZING_SCHEME', '') <> '' "
+            "ORDER BY product_id, created_at DESC",
+            [parents],
+        ):
+            out.schemes[r["product_id"]] = r["scheme"]
+    schemes = sorted(set(out.schemes.values()))
+    if schemes:
+        for r in await connections.get("default").execute_query_dict(
+            'SELECT sizing_scheme, size, "order" FROM listingoptions_sizing_schemes '
+            "WHERE sizing_scheme = ANY($1::text[])",
+            [schemes],
+        ):
+            if r["order"] is not None:
+                out.size_orders.setdefault(r["sizing_scheme"], {})[r["size"]] = int(r["order"])
+    return out
+
+
+async def load_existing() -> Dict[str, Dict[str, Any]]:
+    rows = await connections.get(QUEUE_DB).execute_query_dict(
+        "SELECT sku, parent_sku, state, cardinality(session_ids)::int AS sessions, "
+        "list_price, as_of FROM essx_shoot_list"
+    )
+    return {r["sku"]: r for r in rows}
 
 
 # -- the refresh --------------------------------------------------------------
 
 
+# Stock and page columns only. A new row takes the photo columns' defaults, and an existing
+# row's photo columns are photography's: never touched here.
 UPSERT_SQL = """
 INSERT INTO essx_shoot_list (
     sku, parent_sku, product_name, brand, product_type, company, product_status,
     qty_essx_annex, qty_essx_nj, qty_essx_store, qty_total,
-    list_price, value, parent_value, state, session_id, session_started_at,
-    photo_batch_id, source_job_id, as_of
+    list_price, value, parent_value, title, size, size_rank, source_job_id, as_of
 )
 SELECT u.sku, u.parent_sku, u.product_name, u.brand, u.product_type, u.company,
        u.product_status, u.annex, u.nj, u.store, u.total, u.list_price, u.value,
-       u.parent_value, u.state, u.session_id, u.session_started_at, u.photo_batch_id,
-       $19, $20
+       u.parent_value, u.title, u.size, u.size_rank, $18, $19
   FROM unnest(
        $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
        $8::int[], $9::int[], $10::int[], $11::int[],
-       $12::numeric[], $13::numeric[], $14::numeric[], $15::text[], $16::uuid[],
-       $17::timestamptz[], $18::int[]
+       $12::numeric[], $13::numeric[], $14::numeric[], $15::text[], $16::text[], $17::int[]
   ) AS u(sku, parent_sku, product_name, brand, product_type, company, product_status,
-         annex, nj, store, total, list_price, value, parent_value, state, session_id,
-         session_started_at, photo_batch_id)
+         annex, nj, store, total, list_price, value, parent_value, title, size, size_rank)
 ON CONFLICT (sku) DO UPDATE SET
     parent_sku = EXCLUDED.parent_sku, product_name = EXCLUDED.product_name,
     brand = EXCLUDED.brand, product_type = EXCLUDED.product_type,
@@ -319,34 +314,25 @@ ON CONFLICT (sku) DO UPDATE SET
     qty_essx_annex = EXCLUDED.qty_essx_annex, qty_essx_nj = EXCLUDED.qty_essx_nj,
     qty_essx_store = EXCLUDED.qty_essx_store, qty_total = EXCLUDED.qty_total,
     list_price = EXCLUDED.list_price, value = EXCLUDED.value,
-    parent_value = EXCLUDED.parent_value, state = EXCLUDED.state,
-    session_id = EXCLUDED.session_id, session_started_at = EXCLUDED.session_started_at,
-    photo_batch_id = EXCLUDED.photo_batch_id, source_job_id = EXCLUDED.source_job_id,
+    parent_value = EXCLUDED.parent_value, title = EXCLUDED.title, size = EXCLUDED.size,
+    size_rank = EXCLUDED.size_rank, source_job_id = EXCLUDED.source_job_id,
     as_of = EXCLUDED.as_of
 """
 
-UPDATE_KEPT_SQL = """
-UPDATE essx_shoot_list t
-   SET state = u.state, session_id = u.session_id,
-       session_started_at = u.session_started_at, photo_batch_id = u.photo_batch_id
-  FROM unnest($1::text[], $2::text[], $3::uuid[], $4::timestamptz[], $5::int[])
-       AS u(sku, state, session_id, session_started_at, photo_batch_id)
- WHERE t.sku = u.sku
+# A row no longer listed goes unless photography is tracking a shoot of it. Judged on the
+# photo columns as they are at delete time, not as they were read: photography may have
+# added a session since.
+DELETE_SQL = """
+DELETE FROM essx_shoot_list
+ WHERE sku = ANY($1::text[])
+   AND (state = 'to_shoot' OR cardinality(session_ids) = 0)
+RETURNING sku
 """
-
-
-async def load_existing() -> Dict[str, Dict[str, Any]]:
-    rows = await connections.get("default").execute_query_dict(
-        "SELECT sku, parent_sku, session_id::text AS session_id, session_started_at, "
-        "first_seen_at, list_price, as_of FROM essx_shoot_list"
-    )
-    return {r["sku"]: r for r in rows}
 
 
 async def refresh(
     *,
     task_id: int,
-    session_days: int,
     max_age_hours: float,
     min_candidate_ratio: float,
     task_timezone: str = "America/New_York",
@@ -378,8 +364,8 @@ async def refresh(
     summary.update(job_id=job_id, report_age_h=round((now - completed_at).total_seconds() / 3600, 1))
 
     rows = parse_inventory_report(data)
-    candidates = [r for r in rows if r.store > 0]
-    summary.update(report_rows=len(rows), candidates=len(candidates))
+    at_store = [r for r in rows if r.store > 0]
+    summary.update(report_rows=len(rows), at_store=len(at_store))
 
     try:
         existing = await load_existing()
@@ -391,104 +377,98 @@ async def refresh(
         existing = {}
     last_as_of = max((e["as_of"] for e in existing.values()), default=None)
     last_count = sum(1 for e in existing.values() if e["as_of"] == last_as_of)
-    if not candidates or (last_count and len(candidates) < min_candidate_ratio * last_count):
-        summary["skipped"] = (
-            f"{len(candidates)} SKUs at {STORE_COLUMN}, against {last_count} last time"
-        )
-        logger.error(f"essx_shoot_list: skipped, {summary['skipped']}")
-        return summary
 
     # By lowercased SKU throughout: SellerCloud's spelling of a SKU is not guaranteed to
     # match the one stored yesterday, and the primary key is case-sensitive.
     existing_lc = {sku.lower(): e for sku, e in existing.items()}
-    candidate_lc = {r.sku.lower() for r in candidates}
-    kept = [e for sku, e in existing_lc.items() if sku not in candidate_lc]
-    parent_of = await load_parents([r.sku for r in candidates])
-    parents = sorted(
-        set(parent_of.values()) | {e["parent_sku"] for e in kept if e["parent_sku"]}
-    )
-    facts = await load_facts(parents)
-    prices, untrusted = await load_list_prices([r.sku for r in candidates])
-    summary["priced"] = len(prices)
+    parent_of = await load_parents([r.sku for r in at_store])
+    imaged = await load_imaged_parents(sorted(set(parent_of.values())))
 
-    def existing_session(e: Optional[Mapping[str, Any]]):
-        if e and e.get("session_id"):
-            return e["session_id"], e.get("session_started_at")
-        return None
-
-    upserts: List[Dict[str, Any]] = []
-    deletes: List[str] = []
-    for r in candidates:
+    listed: List[Tuple[ReportRow, Optional[Dict[str, Any]], Optional[str]]] = []
+    for r in at_store:
         e = existing_lc.get(r.sku.lower())
         parent = parent_of.get(r.sku.lower())
-        d = decide(
-            facts.get(parent) if parent else None, now=now, session_days=session_days,
-            existing_session=existing_session(e),
-            first_seen_at=e["first_seen_at"] if e else None,
-        )
-        if d is None:
-            if e:
-                deletes.append(e["sku"])
+        # Already photographed, and photography is not tracking a shoot of it from here.
+        if parent and parent in imaged and not (e and e["sessions"]):
             continue
+        listed.append((r, e, parent))
+    summary["listed"] = len(listed)
+
+    if not listed or (last_count and len(listed) < min_candidate_ratio * last_count):
+        summary["skipped"] = f"{len(listed)} SKUs to list, against {last_count} last time"
+        logger.error(f"essx_shoot_list: skipped, {summary['skipped']}")
+        return summary
+
+    listed_lc = {r.sku.lower() for r, _, _ in listed}
+    gone = [e["sku"] for sku, e in existing_lc.items() if sku not in listed_lc]
+
+    prices, untrusted = await load_list_prices([r.sku for r, _, _ in listed])
+    summary["priced"] = len(prices)
+    lookups = await page_lookups(
+        sorted({p for _, _, p in listed if p}), [r.sku for r, _, _ in listed]
+    )
+
+    upserts: List[Dict[str, Any]] = []
+    for r, e, parent in listed:
         price = prices.get(r.sku.lower())
         if price is None and r.sku.lower() in untrusted and e:
             price = e.get("list_price")
-        upserts.append({"row": r, "sku": e["sku"] if e else r.sku, "parent": parent,
-                        "decision": d, "price": price, "value": row_value(r.total, price)})
+        scheme = lookups.schemes.get(parent) if parent else None
+        size = lookups.child_sizes.get(r.sku.lower()) or size_label(r.sku, parent)
+        upserts.append({
+            "row": r,
+            "sku": e["sku"] if e else r.sku,
+            "parent": parent,
+            "price": price,
+            "value": row_value(r.total, price),
+            "title": (lookups.titles.get(parent) if parent else None)
+            or clean_title(r.product_name, r.sku),
+            "size": size,
+            "size_rank": size_rank(size, lookups.size_orders.get(scheme, {}) if scheme else {}),
+            "state": e["state"] if e else TO_SHOOT,
+        })
 
     parent_values: Dict[str, Decimal] = {}
     for u in upserts:
         key = u["parent"] or u["row"].sku
         parent_values[key] = parent_values.get(key, Decimal(0)) + u["value"]
 
-    updates: List[Tuple[str, Decision]] = []
-    for e in kept:
-        d = decide(
-            facts.get(e["parent_sku"]) if e["parent_sku"] else None, now=now,
-            session_days=session_days, existing_session=existing_session(e),
-            first_seen_at=e["first_seen_at"],
-        )
-        if d is None or d.session_id is None:
-            deletes.append(e["sku"])
-        else:
-            updates.append((e["sku"], d))
-
     states: Dict[str, int] = {}
     for u in upserts:
-        states[u["decision"].state] = states.get(u["decision"].state, 0) + 1
+        states[u["state"]] = states.get(u["state"], 0) + 1
     summary.update(
         states=states,
-        to_shoot_parents=len({u["parent"] or u["row"].sku for u in upserts
-                              if u["decision"].state == TO_SHOOT}),
-        kept_off_list=len(updates),
-        deleted=len(deletes),
+        listed_parents=len({u["parent"] or u["row"].sku for u in upserts}),
         inserted=sum(1 for u in upserts if u["row"].sku.lower() not in existing_lc),
+        not_listed=len(gone),
     )
     summary["top"] = [
-        (u["row"].sku, str(u["value"]), u["decision"].state)
+        (u["row"].sku, str(u["value"]), u["state"])
         for u in sorted(upserts, key=lambda u: u["value"], reverse=True)[:20]
     ]
 
-    plan = {"upserts": upserts, "parent_values": parent_values, "updates": updates,
-            "deletes": deletes, "job_id": job_id, "now": now}
+    plan = {"upserts": upserts, "parent_values": parent_values, "gone": gone,
+            "job_id": job_id, "now": now}
     if not execute:
         if return_plan:
             summary["plan"] = plan
         logger.info(f"essx_shoot_list: dry run {summary}")
         return summary
 
-    async with in_transaction("default") as conn:
-        await apply_plan(conn, plan)
+    async with in_transaction(QUEUE_DB) as conn:
+        deleted = await apply_plan(conn, plan)
+    summary["deleted"] = len(deleted)
+    summary["kept_off_list"] = len(gone) - len(deleted)
 
     logger.info(f"essx_shoot_list: refreshed {summary}")
     return summary
 
 
-async def apply_plan(conn: Any, plan: Mapping[str, Any]) -> None:
-    """Write one refresh. `conn` is anything with execute_query(sql, params), so the TEST
-    loader can run a plan computed from prod data against the TEST database."""
+async def apply_plan(conn: Any, plan: Mapping[str, Any]) -> List[str]:
+    """Write one refresh; returns the deleted SKUs. `conn` is anything with
+    execute_query(sql, params) and execute_query_dict(sql, params), so the TEST loader can
+    run a plan computed from prod data against the TEST database."""
     upserts, parent_values = plan["upserts"], plan["parent_values"]
-    updates, deletes = plan["updates"], plan["deletes"]
     if upserts:
         await conn.execute_query(UPSERT_SQL, [
             [u["sku"] for u in upserts],
@@ -505,22 +485,13 @@ async def apply_plan(conn: Any, plan: Mapping[str, Any]) -> None:
             [u["price"] for u in upserts],
             [u["value"] for u in upserts],
             [parent_values[u["parent"] or u["row"].sku] for u in upserts],
-            [u["decision"].state for u in upserts],
-            [u["decision"].session_id for u in upserts],
-            [u["decision"].session_started_at for u in upserts],
-            [u["decision"].photo_batch_id for u in upserts],
+            [u["title"] for u in upserts],
+            [u["size"] for u in upserts],
+            [u["size_rank"] for u in upserts],
             int(plan["job_id"]),
             plan["now"],
         ])
-    if updates:
-        await conn.execute_query(UPDATE_KEPT_SQL, [
-            [sku for sku, _ in updates],
-            [d.state for _, d in updates],
-            [d.session_id for _, d in updates],
-            [d.session_started_at for _, d in updates],
-            [d.photo_batch_id for _, d in updates],
-        ])
-    if deletes:
-        await conn.execute_query(
-            "DELETE FROM essx_shoot_list WHERE sku = ANY($1::text[])", [deletes]
-        )
+    if not plan["gone"]:
+        return []
+    rows = await conn.execute_query_dict(DELETE_SQL, [list(plan["gone"])])
+    return [r["sku"] for r in rows]
