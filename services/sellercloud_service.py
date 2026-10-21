@@ -947,7 +947,7 @@ class SellerCloudService:
     async def get_children_pricing(
         self, child_skus: List[str]
     ) -> Dict[str, Dict[str, Any]]:
-        """SitePrice / SiteCost / ListPrice per child, straight off /Catalog.
+        """SitePrice / SiteCost / ListPrice / CompanyID per child, straight off /Catalog.
 
         Safe to read while a SellerCloud submit is in flight for the same listing.
         Children are created by product_service during product and child creation, not by
@@ -982,6 +982,9 @@ class SellerCloudService:
                         "SitePrice": item.get("SitePrice"),
                         "SiteCost": item.get("SiteCost"),
                         "ListPrice": item.get("ListPrice"),
+                        # Free on the same row; the 1nventory submit reads it to tell an
+                        # ESSX product that has moved to nymilan.
+                        "CompanyID": item.get("CompanyID"),
                     }
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Parent-keyword price search failed for {parent}: {e}")
@@ -995,6 +998,7 @@ class SellerCloudService:
                     "SitePrice": item.get("SitePrice"),
                     "SiteCost": item.get("SiteCost"),
                     "ListPrice": item.get("ListPrice"),
+                    "CompanyID": item.get("CompanyID"),
                 }
         return out
 

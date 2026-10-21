@@ -53,9 +53,17 @@ PRICE_FIELD = "SitePrice"
 # reconcile and the daily values carry on rather than the whole cycle failing.
 DESCRIPTION_IMAGE_FIELD = "DescriptionImageURL"
 GALLERY_IMAGE_FIELD = "GalleryImageURL"
+# A fourth consumer: company_change_service reads each child's SellerCloud company off the
+# same export to catch ESSX products moving to nymilan. Verified 2026-10-20 (job 4318211,
+# 427 children across 182, 249 and mixed parents): CompanyID was non-blank on 427 of 427
+# and matched the grid's CompanyID on 427 of 427. PURCHASING_COMPANY is a custom column
+# holding company NAMES (ESSX, LUX, OAKWOOD), not ids. Optional like the image columns.
+COMPANY_FIELD = "CompanyID"
+PURCHASING_COMPANY_FIELD = "PURCHASING_COMPANY"
 EXPORT_FIELD_NAMES = [
     "ProductID", "UPC", QTY_FIELD, PRICE_FIELD,
     DESCRIPTION_IMAGE_FIELD, GALLERY_IMAGE_FIELD,
+    COMPANY_FIELD, PURCHASING_COMPANY_FIELD,
 ]
 REQUIRED_EXPORT_COLUMNS = ["ProductID", "UPC", QTY_FIELD, PRICE_FIELD]
 
@@ -90,6 +98,13 @@ class CustomExport:
     # sku -> the gallery image URL to make its description image. Only children that
     # have one image URL and not the other; empty when the columns were not returned.
     description_image_gaps: Dict[str, str] = field(default_factory=dict)
+    # sku -> SellerCloud CompanyID. Empty when the column was not returned, which
+    # `company_column` tells apart from a column that came back blank.
+    companies: Dict[str, int] = field(default_factory=dict)
+    # sku -> PURCHASING_COMPANY, only where it is non-blank.
+    purchasing: Dict[str, str] = field(default_factory=dict)
+    blank_company: int = 0
+    company_column: bool = False
 
 
 def parse_number(text: Optional[str]) -> Optional[Decimal]:
@@ -121,11 +136,17 @@ def parse_custom_export_tsv(data: bytes) -> CustomExport:
     # Optional, so a header without them simply yields no gaps.
     desc_i = header.index(DESCRIPTION_IMAGE_FIELD) if DESCRIPTION_IMAGE_FIELD in header else None
     gallery_i = header.index(GALLERY_IMAGE_FIELD) if GALLERY_IMAGE_FIELD in header else None
+    company_i = header.index(COMPANY_FIELD) if COMPANY_FIELD in header else None
+    purchasing_i = (
+        header.index(PURCHASING_COMPANY_FIELD) if PURCHASING_COMPANY_FIELD in header else None
+    )
 
     upcs: Dict[str, str] = {}
     rows: Dict[str, Dict[str, Any]] = {}
     description_image_gaps: Dict[str, str] = {}
-    returned = blank_qty = blank_price = 0
+    companies: Dict[str, int] = {}
+    purchasing: Dict[str, str] = {}
+    returned = blank_qty = blank_price = blank_company = 0
     for parts in reader:
         if len(parts) <= width:
             continue
@@ -153,6 +174,18 @@ def parse_custom_export_tsv(data: bytes) -> CustomExport:
             if gallery and not description:
                 description_image_gaps[sku] = gallery
 
+        if company_i is not None:
+            # Stripped for the same CRLF reason; a short row or junk counts as blank.
+            company = parse_number(parts[company_i]) if len(parts) > company_i else None
+            if company is not None and company == company.to_integral_value():
+                companies[sku] = int(company)
+            else:
+                blank_company += 1
+        if purchasing_i is not None and len(parts) > purchasing_i:
+            value = parts[purchasing_i].strip()
+            if value:
+                purchasing[sku] = value
+
     return CustomExport(
         upcs=upcs,
         rows=rows,
@@ -160,6 +193,10 @@ def parse_custom_export_tsv(data: bytes) -> CustomExport:
         blank_qty=blank_qty,
         blank_price=blank_price,
         description_image_gaps=description_image_gaps,
+        companies=companies,
+        purchasing=purchasing,
+        blank_company=blank_company,
+        company_column=company_i is not None,
     )
 
 

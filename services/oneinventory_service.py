@@ -238,17 +238,36 @@ class OneInventoryService:
             "item_weight_oz": float(weight) if weight is not None else None,
         }
 
-    async def _is_essx(self, parent_sku: str) -> bool:
-        """True when the parent belongs to EssxNYC, read from parent_products.company_code.
+    async def _is_essx(
+        self, parent_sku: str, prices: Mapping[str, Mapping[str, Any]] | None = None
+    ) -> bool:
+        """True when the parent belongs to EssxNYC and has not moved to nymilan.
 
-        The products database, not SkuBase's own. Never inferred from the SKU string.
+        The company comes from parent_products.company_code, in the products database, not
+        SkuBase's own. Never inferred from the SKU string. That column is the ORIGINAL
+        company and nothing updates it, so an ESSX parent is checked again against the
+        live SellerCloud companies already on `prices` (get_children_pricing): one child
+        moved to nymilan means the whole product has (company_change_service). A product
+        with no live company to read stays ESSX, the safe side.
         """
         conn = connections.get("product_db")
         rows = await conn.execute_query_dict(
             "SELECT company_code FROM parent_products WHERE sku = $1 LIMIT 1",
             [parent_sku],
         )
-        return bool(rows) and rows[0]["company_code"] == ESSX_COMPANY_CODE
+        if not (rows and rows[0]["company_code"] == ESSX_COMPANY_CODE):
+            return False
+
+        from services.company_change_service import counts_as_moved
+
+        live_companies = ((p or {}).get("CompanyID") for p in (prices or {}).values())
+        if counts_as_moved(parent_sku, live_companies):
+            logger.info(
+                "1inventory: %s is ESSX in SkuBase but has moved to nymilan in SellerCloud; "
+                "treating it as nymilan", parent_sku,
+            )
+            return False
+        return True
 
     async def _load_size_order(self, sizing_scheme: str | None) -> dict[str, int]:
         """size -> position, so the variant rail is not alphabetical.
@@ -604,7 +623,7 @@ class OneInventoryService:
             data.get("list_price"), weight_oz,
         )
 
-        is_essx = await self._is_essx(product_id)
+        is_essx = await self._is_essx(product_id, prices)
         tags = self.build_tags(
             taxonomy.get("gender"), taxonomy.get("wholesale"), is_essx=is_essx
         )
@@ -700,6 +719,10 @@ class OneInventoryService:
                     handle=build_handle(brand, title, product_id),
                     status=DRAFT_STATUS if is_essx else PRODUCT_STATUS,
                 )
+            if not result.get("created") and (existing.get("status") or "").upper() == "DRAFT":
+                result["activated"] = await self._activate_moved_essx(
+                    admin, existing["id"], product_id
+                )
         else:
             stage = "create"
             result = await self._create(
@@ -735,6 +758,25 @@ class OneInventoryService:
             published.get("on", "-"), published.get("available", "-"),
         )
         return result
+
+    async def _activate_moved_essx(self, admin: ShopifyAdmin, gid: str, parent_sku: str) -> str:
+        """The daily company sync's flip, for a draft this submit just updated.
+
+        _update never sends status, so an ESSX draft whose product has since moved to
+        nymilan would otherwise stay a draft. Only a draft still tagged ESSX is touched;
+        an untagged draft is a human park. Never raises: the update itself succeeded, and
+        the daily sync finds the tag again tomorrow.
+        """
+        from services.company_change_service import activate_essx_draft
+
+        try:
+            outcome = await activate_essx_draft(admin, await admin.get_product(gid))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("1inventory: %s could not be activated (%s): %s", parent_sku, gid, exc)
+            return "failed"
+        if outcome in ("flipped", "untagged"):
+            logger.info("1inventory: %s moved off ESSX; %s %s", parent_sku, gid, outcome)
+        return outcome
 
     async def _create(
         self,

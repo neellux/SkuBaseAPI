@@ -4,8 +4,8 @@ Runs on a cron (default 04:30 America/New_York). Each cycle:
   1. Pull active child SKUs + DB UPC/keyword state.
   2. Pull SellerCloud alias state via ExportStandardInfo Kind=2 (50k SKU batches).
   3. Pull SellerCloud UPC state via ExportCustomInfo (job + poll + download). The same
-     export carries the daily parent values and the description-image gaps, so neither
-     costs a second export.
+     export carries the daily parent values, the description-image gaps and each child's
+     company (for company_change_service), so none of them costs a second export.
   4. Reconcile (see services/daily_sellercloud_sync_service.py).
   5. Apply safety gates (allowlist, per-cycle caps, % drift guard, runtime).
   6. Write XLSX + rollback CSV to reports_dir.
@@ -101,6 +101,11 @@ class DailySellercloudSyncPoller:
         )
         self.write_rollback_csv_flag: bool = bool(cfg.get("write_rollback_csv", True))
 
+        # ESSX -> nymilan company moves ride on the same export. Their own section, since
+        # their execute gates Shopify and SellerCloud writes this poller never makes.
+        # Parsed lazily: company_change_service pulls in the 1nventory and Shopify stack.
+        self.company_sync_cfg: dict = dict(config.get("company_change_sync") or {})
+
         # Where reports go
         default_reports_dir = str(Path(__file__).resolve().parent.parent / "logs" / "daily_sellercloud_sync")
         self.reports_dir: str = cfg.get("reports_dir", default_reports_dir)
@@ -191,12 +196,17 @@ class DailySellercloudSyncPoller:
             )
             await self._write_values(export, len(all_skus))
             await self._repair_description_images(export)
+            company_started = time.perf_counter()
+            company_sync = await self._sync_company_changes(export, len(all_skus))
+            # The company step has its own time budget; it must not eat the reconcile's.
+            deadline += time.perf_counter() - company_started
 
             if not self.reconcile_enabled:
                 logger.info(f"{self.name}: reconcile_enabled=false; values only this cycle")
                 return {
                     "cycle_id": cycle_id,
                     "values_only": True,
+                    "company_sync": company_sync,
                     "elapsed_seconds": round(time.perf_counter() - cycle_started, 2),
                 }
 
@@ -265,6 +275,7 @@ class DailySellercloudSyncPoller:
                 "blocked": blocked,
                 "skipped": skipped,
                 "xlsx": str(xlsx_path),
+                "company_sync": company_sync,
             }
             logger.info(f"{self.name}: cycle {cycle_id} done — {summary}")
             return summary
@@ -351,11 +362,22 @@ class DailySellercloudSyncPoller:
     async def _fetch_sc_custom_export(self, skus: list[str], deadline: float):
         """Run ExportCustomInfo with all SKUs in one queued job.
 
-        One export serves two consumers: the UPC column feeds reconcile, and
+        One export serves several consumers: the UPC column feeds reconcile,
         AggregateQty and SitePrice feed the daily parent values
-        (product_value_service), so valuing the whole catalog costs no second export.
-        Parsed by header name, off the event loop.
+        (product_value_service), and CompanyID feeds company_change_service, so none of
+        them costs a second export. Parsed by header name, off the event loop.
         """
+        tsv_bytes = await self.download_custom_export(skus, deadline)
+
+        from services.product_value_service import parse_custom_export_tsv
+
+        # ~160k rows, so parsed off the event loop. By header name only, with no positional
+        # fallback: SellerCloud inserts ProductName unasked, and with the value columns
+        # appended the old last-column fallback would read prices as UPCs.
+        return await asyncio.to_thread(parse_custom_export_tsv, tsv_bytes)
+
+    async def download_custom_export(self, skus: list[str], deadline: float) -> bytes:
+        """The raw ExportCustomInfo TSV. Split out so a script can keep the file."""
         from services.product_value_service import EXPORT_FIELD_NAMES
 
         await sellercloud_internal_service._ensure_authenticated()
@@ -389,14 +411,7 @@ class DailySellercloudSyncPoller:
 
         file_id = await self._resolve_job_output_file(client, base_url, job_id)
         pretty = f"{job_id}.txt"
-        tsv_bytes = await self._download_file(file_id, pretty)
-
-        from services.product_value_service import parse_custom_export_tsv
-
-        # ~160k rows, so parsed off the event loop. By header name only, with no positional
-        # fallback: SellerCloud inserts ProductName unasked, and with the value columns
-        # appended the old last-column fallback would read prices as UPCs.
-        return await asyncio.to_thread(parse_custom_export_tsv, tsv_bytes)
+        return await self._download_file(file_id, pretty)
 
     async def _write_values(self, export, requested: int) -> None:
         """Store the daily parent values from this cycle's export.
@@ -412,6 +427,25 @@ class DailySellercloudSyncPoller:
             pass  # logged at ERROR by write_parent_values; the previous values stay
         except Exception:  # noqa: BLE001
             logger.exception(f"{self.name}: writing parent values failed; the previous values stay")
+
+    async def _sync_company_changes(self, export, requested: int) -> Optional[dict]:
+        """ESSX parents that moved to nymilan: activate on 1nventory, move the other sizes.
+
+        Never raises. The UPC reconcile this cycle exists for must not fail over it, and
+        run_company_sync already catches its own errors; this is the second net.
+        """
+        try:
+            from services.company_change_service import Settings, run_company_sync
+
+            settings = Settings.from_config(self.company_sync_cfg)
+            if not settings.enabled:
+                return None
+            return await run_company_sync(
+                export, requested, settings=settings, reports_dir=self.reports_dir
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(f"{self.name}: company change sync failed")
+            return {"error": "company change sync failed"}
 
     async def _repair_description_images(self, export) -> None:
         """Give every child with an image and no description image one, from this export.
