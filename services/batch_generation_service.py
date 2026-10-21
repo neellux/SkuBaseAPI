@@ -166,8 +166,9 @@ SELECT b.photography_batch_id IS NOT NULL AS from_photography,
 #
 # Not copied, on purpose: submitted, submitted_at, submitted_by and error (the copy has not
 # been submitted), required_platforms (NULL, so the platforms the product is not on yet are
-# required; recompute_listing_submitted may freeze it just after), batch_id, created_by and
-# assigned_to (this batch's).
+# required; recompute_listing_submitted may freeze it just after), blocked_platforms (the
+# copy's own submit asks SellerCloud again), batch_id, created_by and assigned_to (this
+# batch's).
 #
 # data takes the eBay answers, which only ever name keys that were empty in the source, and
 # ai_response gains them so the form shows them as AI suggestions. original_data is carried

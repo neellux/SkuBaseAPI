@@ -760,6 +760,77 @@ async def get_mapping_status(
     }
 
 
+# listings.blocked_platforms is not on the Listing model (a bare save() would write it back
+# stale), so it is written here in SQL. Both are no-ops when the listing already says so,
+# and RETURNING tells the caller whether completion needs recomputing.
+BLOCK_PLATFORM_SQL = """
+UPDATE listings SET blocked_platforms = blocked_platforms || jsonb_build_array($2::text)
+ WHERE id = $1::uuid AND NOT blocked_platforms ? $2::text
+RETURNING id
+"""
+UNBLOCK_PLATFORM_SQL = """
+UPDATE listings SET blocked_platforms = blocked_platforms - $2::text
+ WHERE id = $1::uuid AND blocked_platforms ? $2::text
+RETURNING id
+"""
+
+
+async def _ebay_block(
+    listing_model: Listing,
+    platforms: List[str],
+    enabled_platforms: List[str],
+    excluded: set,
+) -> Optional[bool]:
+    """Whether this submit should record eBay as blocked on the listing: True to block,
+    False to clear, None to leave it as it is.
+
+    SellerCloud's eBayEnabled, off on any active child, makes eBay refuse the publish
+    outright, so the listing view locks the eBay pill and leaves eBay out of the submit.
+    Completion still required it, so the listing stayed pending after going out everywhere
+    else and parked at the head of the value queue, where every submit handed the operator
+    back to it (MSK-WOTW-0041, 2026-10-21). The block is what lets listing_required_platforms
+    subtract eBay, the way it already subtracts a company eBay does not list.
+
+    Only asked when it can matter, because it costs a SellerCloud catalog read (1-3s, on a
+    request the queue hand-off waits for): eBay enabled, left out of this submit, not
+    already excluded for the brand, type or company, and no eBay row on the listing. A row
+    is already the eBay answer either way.
+
+    A submit that sends eBay clears the block: the operator is listing it there now. A
+    failed read changes nothing, which leaves the listing pending as it was before.
+    """
+    if "ebay" not in enabled_platforms:
+        return None
+    if "ebay" in platforms:
+        return False
+    if "ebay" in excluded:
+        return None
+    company = listing_model.company_code
+    if company is not None and company != EBAY_COMPANY_CODE:
+        return None
+    if await ListingSubmission.filter(listing=listing_model, platform_id="ebay").exists():
+        return None
+
+    try:
+        children_data = await sellercloud_service.get_product_children(
+            listing_model.product_id
+        )
+    except Exception as e:  # noqa: BLE001 - never fails the submit
+        logger.warning(
+            f"eBayEnabled check failed for {listing_model.product_id}, leaving eBay "
+            f"required: {type(e).__name__}: {e}"
+        )
+        return None
+
+    not_enabled = EbayService.not_ebay_enabled(children_data.get("children") or [])
+    if not_enabled:
+        logger.info(
+            f"Blocking eBay on listing {listing_model.id} ({listing_model.product_id}): "
+            f"not eBay Enabled in SellerCloud: {', '.join(not_enabled)}"
+        )
+    return bool(not_enabled)
+
+
 @router.post("/submit")
 async def submit_listing(
     request: Request,
@@ -1116,6 +1187,14 @@ async def submit_listing(
                 },
             )
 
+    # Read before the lock, not under it: it can be a SellerCloud round trip.
+    ebay_block = await _ebay_block(
+        listing_model,
+        platforms,
+        settings.platforms if settings and settings.platforms else [],
+        excluded,
+    )
+
     submission_records = {}
     # Platforms presence gates as of the read under the lock. With `gated` it
     # decides which of the two 409s an empty submit gets.
@@ -1131,6 +1210,25 @@ async def submit_listing(
                 [listing_model.product_id or str(listing_id)],
             )
             await Listing.select_for_update().using_db(conn).get(id=listing_id)
+
+            # Before the rows below, so the listing completes inside this transaction, as
+            # the queue hand-off assumes. Recomputed here rather than left to the rows'
+            # insert triggers, because a submit that inserts nothing fires none.
+            #
+            # Needs migrations/listing_blocked_platforms.sql: without the column, every
+            # submit that names eBay fails here, so the migration goes out first.
+            block_changed = False
+            if ebay_block is not None:
+                block_changed = bool(
+                    await conn.execute_query_dict(
+                        BLOCK_PLATFORM_SQL if ebay_block else UNBLOCK_PLATFORM_SQL,
+                        [str(listing_model.id), "ebay"],
+                    )
+                )
+            if block_changed:
+                await conn.execute_query(
+                    "SELECT recompute_listing_submitted($1::uuid)", [str(listing_model.id)]
+                )
 
             # Presence and open delists again, on this transaction, AFTER the lock
             # (KTD5). These reads decide; the ones before the mapping gates only
