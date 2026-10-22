@@ -4,7 +4,7 @@ The table, essx_shoot_list, lives in the PHOTOGRAPHY database (lux_photography),
 here through the photography_db connection. Two apps write it, each only its own columns:
 
     stock   this module, once a day       qtys, ListPrice, value, and the page's title,
-                                          size and size order
+                                          MPN, size and size order
     photo   PhotoManagementNew            state, session ids, photo batch, last session
             services/photo_queue.py, on
             every scan, batch, hide or
@@ -229,13 +229,14 @@ class PageLookups:
     """What the products and listing-options tables add to the page's rows."""
 
     titles: Dict[str, str] = field(default_factory=dict)
+    mpns: Dict[str, str] = field(default_factory=dict)  # parent -> parent_products.mpn
     schemes: Dict[str, str] = field(default_factory=dict)  # parent -> sizing scheme
     child_sizes: Dict[str, str] = field(default_factory=dict)  # lowercased child sku -> size
     size_orders: Dict[str, Dict[str, int]] = field(default_factory=dict)  # scheme -> size -> order
 
 
 async def page_lookups(parents: Sequence[str], child_skus: Sequence[str]) -> PageLookups:
-    """Titles, sizing schemes and child sizes (products database), and each scheme's size
+    """Titles, MPNs, sizing schemes and child sizes (products database), and each scheme's size
     order (listingoptions_sizing_schemes, the order ListingView sorts its sizes by).
     Read-only, and read at refresh so the page reads nothing but the queue table."""
     out = PageLookups()
@@ -243,11 +244,13 @@ async def page_lookups(parents: Sequence[str], child_skus: Sequence[str]) -> Pag
     parents = list(parents)
     if parents:
         for r in await product_db.execute_query_dict(
-            "SELECT sku, title, sizing_scheme FROM parent_products WHERE sku = ANY($1::text[])",
+            "SELECT sku, title, mpn, sizing_scheme FROM parent_products WHERE sku = ANY($1::text[])",
             [parents],
         ):
             if r["title"]:
                 out.titles[r["sku"]] = r["title"]
+            if r["mpn"] and r["mpn"].strip():
+                out.mpns[r["sku"]] = r["mpn"].strip()
             if r["sizing_scheme"]:
                 out.schemes[r["sku"]] = r["sizing_scheme"]
     if child_skus:
@@ -296,17 +299,19 @@ UPSERT_SQL = """
 INSERT INTO essx_shoot_list (
     sku, parent_sku, product_name, brand, product_type, company, product_status,
     qty_essx_annex, qty_essx_nj, qty_essx_store, qty_total,
-    list_price, value, parent_value, title, size, size_rank, source_job_id, as_of
+    list_price, value, parent_value, title, mpn, size, size_rank, source_job_id, as_of
 )
 SELECT u.sku, u.parent_sku, u.product_name, u.brand, u.product_type, u.company,
        u.product_status, u.annex, u.nj, u.store, u.total, u.list_price, u.value,
-       u.parent_value, u.title, u.size, u.size_rank, $18, $19
+       u.parent_value, u.title, u.mpn, u.size, u.size_rank, $19, $20
   FROM unnest(
        $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[],
        $8::int[], $9::int[], $10::int[], $11::int[],
-       $12::numeric[], $13::numeric[], $14::numeric[], $15::text[], $16::text[], $17::int[]
+       $12::numeric[], $13::numeric[], $14::numeric[], $15::text[], $16::text[],
+       $17::text[], $18::int[]
   ) AS u(sku, parent_sku, product_name, brand, product_type, company, product_status,
-         annex, nj, store, total, list_price, value, parent_value, title, size, size_rank)
+         annex, nj, store, total, list_price, value, parent_value, title, mpn, size,
+         size_rank)
 ON CONFLICT (sku) DO UPDATE SET
     parent_sku = EXCLUDED.parent_sku, product_name = EXCLUDED.product_name,
     brand = EXCLUDED.brand, product_type = EXCLUDED.product_type,
@@ -314,7 +319,8 @@ ON CONFLICT (sku) DO UPDATE SET
     qty_essx_annex = EXCLUDED.qty_essx_annex, qty_essx_nj = EXCLUDED.qty_essx_nj,
     qty_essx_store = EXCLUDED.qty_essx_store, qty_total = EXCLUDED.qty_total,
     list_price = EXCLUDED.list_price, value = EXCLUDED.value,
-    parent_value = EXCLUDED.parent_value, title = EXCLUDED.title, size = EXCLUDED.size,
+    parent_value = EXCLUDED.parent_value, title = EXCLUDED.title, mpn = EXCLUDED.mpn,
+    size = EXCLUDED.size,
     size_rank = EXCLUDED.size_rank, source_job_id = EXCLUDED.source_job_id,
     as_of = EXCLUDED.as_of
 """
@@ -423,6 +429,7 @@ async def refresh(
             "value": row_value(r.total, price),
             "title": (lookups.titles.get(parent) if parent else None)
             or clean_title(r.product_name, r.sku),
+            "mpn": lookups.mpns.get(parent) if parent else None,
             "size": size,
             "size_rank": size_rank(size, lookups.size_orders.get(scheme, {}) if scheme else {}),
             "state": e["state"] if e else TO_SHOOT,
@@ -486,6 +493,7 @@ async def apply_plan(conn: Any, plan: Mapping[str, Any]) -> List[str]:
             [u["value"] for u in upserts],
             [parent_values[u["parent"] or u["row"].sku] for u in upserts],
             [u["title"] for u in upserts],
+            [u["mpn"] for u in upserts],
             [u["size"] for u in upserts],
             [u["size_rank"] for u in upserts],
             int(plan["job_id"]),

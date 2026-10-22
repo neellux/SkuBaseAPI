@@ -6,7 +6,7 @@ GET /essx_shoot_list/summary    counts per state for the header and the state to
 Query parameters only. One row per PARENT: photography shoots parents, and every size of
 a parent shares one state (services/essx_shoot_list_service.py). Read-only, and reads ONE
 table: essx_shoot_list in the photography database, where photography keeps the shoot
-details and the daily refresh stores the titles, sizes and size order. Registered with the
+details and the daily refresh stores the titles, MPNs, sizes and size order. Registered with the
 auth service under view_batches, like the catalog GETs.
 """
 
@@ -47,6 +47,7 @@ g AS (
     SELECT COALESCE(t.parent_sku, t.sku) AS parent,
            bool_or(t.parent_sku IS NOT NULL) AS known_parent,
            (array_agg(t.title ORDER BY t.as_of DESC, t.sku))[1] AS title,
+           (array_agg(t.mpn ORDER BY t.as_of DESC, t.sku))[1] AS mpn,
            (array_agg(t.product_name ORDER BY t.sku))[1] AS product_name,
            (array_agg(t.brand ORDER BY t.sku))[1] AS brand,
            (array_agg(t.product_type ORDER BY t.sku))[1] AS product_type,
@@ -71,7 +72,7 @@ g AS (
                'sku', t.sku, 'size', t.size, 'store', t.qty_essx_store, 'total', t.qty_total,
                'list_price', t.list_price, 'value', t.value, 'at_store', t.as_of = l.as_of
            ) ORDER BY t.size_rank NULLS LAST, t.sku) AS sizes,
-           lower(string_agg(concat_ws(' ', t.sku, t.parent_sku, t.title, t.product_name,
+           lower(string_agg(concat_ws(' ', t.sku, t.parent_sku, t.mpn, t.title, t.product_name,
                                       t.brand, t.product_type,
                                       array_to_string(t.session_ids, ' ')), ' ')) AS haystack
       FROM essx_shoot_list t CROSS JOIN latest l
@@ -94,6 +95,7 @@ class ShootListRow(BaseModel):
     parent: str
     known_parent: bool
     title: Optional[str] = None
+    mpn: Optional[str] = None
     brand: Optional[str] = None
     product_type: Optional[str] = None
     company: Optional[str] = None
@@ -162,6 +164,7 @@ def _row(r: Dict[str, Any]) -> ShootListRow:
         parent=r["parent"],
         known_parent=bool(r["known_parent"]),
         title=r["title"] or r["product_name"],
+        mpn=r["mpn"],
         brand=r["brand"],
         product_type=r["product_type"],
         company=r["company"],
@@ -196,7 +199,7 @@ def _row(r: Dict[str, Any]) -> ShootListRow:
 
 @router.get("/products", response_model=List[ShootListRow])
 async def get_shoot_list(
-    search: Optional[str] = Query(None, max_length=100, description="SKU, title, brand or session id"),
+    search: Optional[str] = Query(None, max_length=100, description="SKU, MPN, title, brand or session id"),
     state: Optional[List[str]] = Query(
         None, description="to_shoot, shot, in_batch or has_images (repeat the key for several)"
     ),
