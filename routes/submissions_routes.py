@@ -546,6 +546,9 @@ def _build_import_detail(
             data = listing.data or {}
             title = data.get("title") or data.get("name")
             skus = list((data.get("child_size_overrides") or {}).keys())
+        # eBay rows hold an object here; Grailed rows hold a plain list of sheet
+        # references, which carries no ids.
+        external = sub.external_id if isinstance(sub.external_id, dict) else {}
         details.append(
             ImportListingDetail(
                 submission_id=sub.id,
@@ -559,8 +562,8 @@ def _build_import_detail(
                 skus=skus,
                 updated_skus=(sub.platform_meta or {}).get("updated_references") or [],
                 image_count=(image_counts or {}).get(product_id or "", 0),
-                item_ids=(sub.external_id or {}).get("item_ids") or None,
-                revised_skus=(sub.external_id or {}).get("revised") or None,
+                item_ids=external.get("item_ids") or None,
+                revised_skus=external.get("revised") or None,
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )
