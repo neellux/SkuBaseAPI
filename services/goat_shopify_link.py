@@ -13,6 +13,14 @@ outside SkuBase reads both to keep the product on GOAT. So, for goat and goat_sn
 
 Each runs after the SkuBase change commits, and the dispatcher logs anything it raises.
 
+THE STV SWITCH (get_stv, set_stv; GOAT only, STV_PLATFORMS). The Listings tab reads gsync
+live and adds or removes it: the tag IS the product's STV. SkuBase's own note of it, the
+GOAT presence row's external_meta.stv, is nearly empty on prod (backfilled rows never had
+one), so nothing reads it; set_stv merges the confirmed value into it with stv_edit
+{"at", "by", "previous"}. The switch is locked unless the parent is listed on GOAT and
+settled (platform_delist_service.listing_lock), then needs the 1nventory product (WHICH
+PRODUCT) and [goat] execute. A change is read back from Shopify before it is answered.
+
 WHICH PRODUCT. 1nventory's product presence row, then 1nventory's latest successful
 submission (what goat_poller._product_gids reads), then a variant SKU search. A product
 is used only when one of its variant SKUs is a child of the parent: a mistyped 1nventory
@@ -508,3 +516,176 @@ async def after_id_change(
     logger.info(
         "goat shopify: %s GOAT ID %s -> %s on %s", parent_sku, previous, goat_id, gid
     )
+
+
+# ---------------------------------------------------------------------------
+# The STV switch
+# ---------------------------------------------------------------------------
+
+# GOAT only: GOAT Sneakers' sheet has had no STV since 2026-10-23.
+STV_PLATFORMS = (GOAT.platform_id,)
+
+NOT_LISTED_REASON = "Not listed on GOAT"
+NOT_ENABLED_REASON = "GOAT is not enabled"
+NO_PRODUCT_REASON = "Not on 1nventory"
+SYNC_OFF_REASON = "Shopify sync is off"
+CHECK_FAILED = "Could not check Shopify"
+UPDATE_FAILED = "Could not update Shopify"
+
+# Refusal codes, beside platform_delist_service's.
+NO_PRODUCT = "no_product"
+SYNC_OFF = "sync_off"
+SHOPIFY_FAILED = "shopify_failed"
+
+# The key set_stv merges into the GOAT presence row's external_meta beside stv.
+STV_EDIT_META = "stv_edit"
+
+# Leaves the presence rows' recompute triggers alone: they fire on insert, delete and a
+# parent_sku change only.
+_STV_RECORD_SQL = """
+UPDATE external_listing_ids
+   SET external_meta = external_meta || $3::jsonb, updated_at = now()
+ WHERE platform_id = $1 AND level = 'parent' AND parent_sku = $2
+"""
+
+
+def _delists():
+    """platform_delist_service, imported at call time: it imports platform_actions, which
+    imports this module, so an import at the top breaks whichever of the two loads first."""
+    from services import platform_delist_service
+
+    return platform_delist_service
+
+
+def stv_answer(stv: Optional[bool], reason: Optional[str] = None) -> Dict[str, Any]:
+    """The switch's payload: stv None when unknown; can_change only with no reason."""
+    return {"stv": stv, "can_change": reason is None and stv is not None, "reason": reason}
+
+
+def stv_lock_reason(refusal: Any) -> str:
+    """platform_delist_service.listing_lock's refusal in the switch's words."""
+    pds = _delists()
+    if refusal.code in (pds.NOT_LISTED, pds.ALREADY_DELISTED):
+        return NOT_LISTED_REASON
+    if refusal.code == pds.UNKNOWN_PLATFORM:
+        return NOT_ENABLED_REASON
+    return refusal.message
+
+
+async def _stv_product(parent_sku: str, child_skus: Sequence[str], settings: Dict[str, Any]):
+    """(admin, the parent's 1nventory product or None). Raises what Shopify raises."""
+    admin = await _admin()
+    product, _found_by, foreign = await _find_product(
+        connections.get("default"),
+        admin,
+        parent_sku,
+        child_skus,
+        settings["namespace"],
+        settings["key"],
+    )
+    if product is None and foreign:
+        logger.warning("goat stv: %s 1nventory ids %s carry none of its SKUs", parent_sku, foreign)
+    return admin, product
+
+
+async def get_stv(parent_sku: str, platform_id: str = GOAT.platform_id) -> Dict[str, Any]:
+    """The parent's STV as Shopify has it now: gsync on its 1nventory product.
+
+    Asks Shopify nothing unless the parent is listed on GOAT and settled (not delisted, no
+    submission in flight or awaiting action). A Shopify read that fails answers stv None
+    with a reason, so the Listings tab still draws.
+    """
+    product, refusal = await _delists().listing_lock(parent_sku, platform_id)
+    if refusal is not None:
+        return stv_answer(None, stv_lock_reason(refusal))
+    settings = _settings(platform_id)
+    try:
+        _, found = await _stv_product(parent_sku, product.child_skus, settings)
+    except Exception:
+        logger.exception("goat stv: reading %s from Shopify failed", parent_sku)
+        return stv_answer(None, CHECK_FAILED)
+    if found is None:
+        return stv_answer(None, NO_PRODUCT_REASON)
+    stv = settings["tag"] in found["tags"]
+    return stv_answer(stv, None if settings["execute"] else SYNC_OFF_REASON)
+
+
+async def _record_stv(platform_id: str, parent_sku: str, stv: bool, previous: bool, user_id: Any):
+    """Note the confirmed value on the GOAT presence row, with who and when. Never raises:
+    Shopify already holds the change, and that is what the tab reads. Nothing reads this
+    note back (a later read-back writes GOAT's sheet value over stv)."""
+    meta = {
+        "stv": stv,
+        STV_EDIT_META: {
+            "at": _now(),
+            "by": str(user_id) if user_id is not None else None,
+            "previous": previous,
+        },
+    }
+    try:
+        affected, _rows = await connections.get("default").execute_query(
+            _STV_RECORD_SQL, [platform_id, parent_sku, json.dumps(meta)]
+        )
+    except Exception:
+        logger.exception("goat stv: %s set on Shopify, presence row not updated", parent_sku)
+        return
+    if not affected:
+        logger.info("goat stv: %s has no %s presence row, nothing noted", parent_sku, platform_id)
+
+
+async def set_stv(
+    parent_sku: str, stv: bool, user_id: Any, platform_id: str = GOAT.platform_id
+) -> Dict[str, Any]:
+    """Turn STV on or off: add or remove gsync on the parent's 1nventory product, read the
+    product back, and answer with what Shopify now holds, never with what was asked for.
+
+    Raises platform_delist_service.DelistRefused: 409 while the switch is locked (not listed
+    and settled on GOAT, not on 1nventory, [<platform>] execute false), 502 when Shopify
+    failed or did not take the change, with nothing noted. The check and the write are not
+    under the submit lock: a submission starting in between can only lead to stage 3 adding
+    gsync later, which it does whenever GOAT ticks STV anyway.
+    """
+    pds = _delists()
+    product, refusal = await pds.listing_lock(parent_sku, platform_id)
+    if refusal is not None:
+        raise pds.DelistRefused(stv_lock_reason(refusal), refusal.code)
+    settings = _settings(platform_id)
+    if not settings["execute"]:
+        raise pds.DelistRefused(SYNC_OFF_REASON, SYNC_OFF)
+    try:
+        admin, found = await _stv_product(parent_sku, product.child_skus, settings)
+    except Exception:
+        logger.exception("goat stv: reading %s from Shopify failed", parent_sku)
+        raise pds.DelistRefused(CHECK_FAILED, SHOPIFY_FAILED, 502)
+    if found is None:
+        raise pds.DelistRefused(NO_PRODUCT_REASON, NO_PRODUCT)
+
+    gid, tag = found["id"], settings["tag"]
+    previous = tag in found["tags"]
+    if previous == stv:
+        return stv_answer(stv)
+
+    _arm(platform_id)
+    try:
+        if stv:
+            await admin.add_tags(gid, [tag])
+        else:
+            await admin.remove_tags(gid, [tag])
+        after = await admin.product_metafield(gid, settings["namespace"], settings["key"])
+    except Exception:
+        logger.exception("goat stv: setting %s to %s on %s failed", parent_sku, stv, gid)
+        raise pds.DelistRefused(UPDATE_FAILED, SHOPIFY_FAILED, 502)
+    now = after is not None and tag in after["tags"]
+    if now != stv:
+        logger.error(
+            "goat stv: %s read back %s on %s after setting %s",
+            parent_sku,
+            "no product" if after is None else now,
+            gid,
+            stv,
+        )
+        raise pds.DelistRefused(UPDATE_FAILED, SHOPIFY_FAILED, 502)
+
+    await _record_stv(platform_id, parent_sku, stv, previous, user_id)
+    logger.info("goat stv: %s %s -> %s on %s by %s", parent_sku, previous, stv, gid, user_id)
+    return stv_answer(stv)

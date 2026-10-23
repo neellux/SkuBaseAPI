@@ -1709,6 +1709,24 @@ class ListingIdSaveRequest(BaseModel):
     )
 
 
+class GoatStvResponse(BaseModel):
+    """GET and POST /products/goat_stv: the product's STV, the gsync tag on its 1nventory
+    Shopify product (goat_shopify_link.get_stv / set_stv)."""
+
+    stv: Optional[bool] = Field(
+        None, description="As Shopify has it now; null when not known (see reason)"
+    )
+    can_change: bool = Field(False, description="The switch can be used now")
+    reason: Optional[str] = Field(None, description="Why not, one short line")
+
+
+class GoatStvRequest(BaseModel):
+    """POST /products/goat_stv: turn STV on or off."""
+
+    sku: str = Field(..., description="Product SKU (parent or child); the parent is set")
+    stv: bool
+
+
 class CreateSkuSize(BaseModel):
 
     size: str = Field(..., min_length=1, description="Size value")

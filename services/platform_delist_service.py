@@ -1473,6 +1473,36 @@ async def get_history(
     )
 
 
+async def listing_lock(
+    parent_sku: str, platform_id: str
+) -> Tuple[ProductFacts, Optional[DelistRefused]]:
+    """(the product, why the platform is not listed and settled for it right now, or None),
+    for an action on the live listing itself (goat_stv). The delist's rules (delist_refusal)
+    without exclusion, which does not matter here: a platform can be excluded and still
+    listed. Raises DelistRefused (404) for an unknown product."""
+
+    async def read_state():
+        return await _read_state(connections.get("default"), parent_sku, platform_id)
+
+    product, config, state = await asyncio.gather(
+        _load_product(parent_sku), _load_platform_config(), read_state(), return_exceptions=True
+    )
+    if isinstance(product, BaseException):
+        raise product
+    if product is None:
+        raise _not_found()
+    for result in (config, state):
+        if isinstance(result, BaseException):
+            raise result
+    platforms, _settings = config
+    attempts, rows, entries = state
+    facts = platform_facts(platform_id, size_list(product, rows, entries), attempts, rows, entries)
+    refusal = delist_refusal(
+        platform_id, enabled=platform_id in platforms, excluded=False, facts=facts
+    )
+    return product, refusal
+
+
 async def get_listing_dates(parent_sku: str) -> List[Dict[str, Any]]:
     """build_listing_dates for a PARENT sku (the route resolves a child first).
 

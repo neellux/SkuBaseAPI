@@ -18,6 +18,8 @@ from models.api_models import (
     PlatformLinksResponse,
     ListingHistoryResponse,
     ListingIdSaveRequest,
+    GoatStvRequest,
+    GoatStvResponse,
     PlatformDelistRequest,
     PlatformDelistResponse,
     CreateSkuRequest,
@@ -54,7 +56,7 @@ from services.product_service import ProductService
 from services.sellercloud_service import sellercloud_service
 from services.grailed_service import COUNTRY_CODE_MAP
 from services import alias_bulk_import_job_service
-from services import listing_id_service, platform_delist_service
+from services import goat_shopify_link, listing_id_service, platform_delist_service
 from services.platform_delist_service import DelistRefused
 from routes.batch_generation_routes import require_skubase_client
 from utils.load_app_data import add_user_data
@@ -741,6 +743,50 @@ async def save_listing_ids(body: ListingIdSaveRequest, request: Request):
             "listing_ids: saved, history read failed for %s on %s", parent_sku, body.platform_id
         )
         raise HTTPException(status_code=500, detail="Saved. Reload to see it")
+
+
+# GOAT's STV switch on the Listings tab (goat_shopify_link, THE STV SWITCH): the gsync tag
+# on the 1nventory Shopify product, read live and set there. Registered like
+# /listing_history (view_catalog) and /listing_ids (manage_batches).
+
+
+@router.get("/goat_stv", response_model=GoatStvResponse)
+async def get_goat_stv(
+    sku: str = Query(..., description="Product SKU (parent or child)"),
+):
+    """Whether the product is STV on GOAT, as Shopify has it now, and whether it can be
+    changed. A Shopify read that fails answers stv null with a reason, not an error."""
+    try:
+        return await goat_shopify_link.get_stv(await _parent_or_404(sku))
+    except DelistRefused as refused:
+        raise _refused(refused)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("goat_stv: read failed for %s", sku)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.post(
+    "/goat_stv",
+    response_model=GoatStvResponse,
+    dependencies=[Depends(require_skubase_client)],
+)
+async def set_goat_stv(body: GoatStvRequest, request: Request):
+    """Turn STV on or off: adds or removes the gsync tag on the 1nventory Shopify product,
+    then answers with what Shopify holds after the write. Refused (409) while GOAT is not
+    listed and settled, the product is not on 1nventory, or [goat] execute is off; 502 when
+    Shopify failed or did not take the change, with nothing recorded."""
+    try:
+        parent_sku = await _parent_or_404(body.sku)
+        return await goat_shopify_link.set_stv(parent_sku, body.stv, request.state.user["id"])
+    except DelistRefused as refused:
+        raise _refused(refused)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("goat_stv: set %s failed for %s", body.stv, body.sku)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.get("/reassign/bulk/preview")
