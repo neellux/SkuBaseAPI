@@ -17,7 +17,8 @@ the quiet-period gate. Everything else is the Sheets API.
 
 CALL BUDGET, which is part of the design rather than an implementation detail:
 
-    flush        4 calls, ANY batch size  (list tabs, copyTo, rename, append)
+    flush        5 calls, ANY batch size  (template header, list tabs, copyTo, rename,
+                                           append)
     readback     1 call when nothing changed (files.get modifiedTime)
                  2 calls when it did       (+ one batchGet for ALL open tabs)
     dashboard    1 call, and only when a count actually changed
@@ -47,7 +48,8 @@ SCOPES: Final = [
 ]
 
 # The read-back needs STV, Denied, SKU (GOAT), Style Code and Custom SKU, which
-# are columns A..E. Row 1 is included so each tab's own header row resolves the
+# are columns A..E (goat_sneakers has no STV, so its four are A..D and E is spare).
+# Row 1 is included so each tab's own header row resolves the
 # column positions - never fixed offsets, since GOAT can insert columns.
 #
 # The row bound matters. The template carries checkbox validation to row 1000, and
@@ -73,7 +75,7 @@ def tab_title_for(when: datetime | None = None, suffix: str = "") -> str:
     """`9.4.2026` - M.D.YYYY, unpadded, matching the Master Sheet dashboard. Eastern date.
 
     `suffix` is what tells two platforms' tabs apart when they share a spreadsheet:
-    goat_sneakers writes `9.4.2026 - Shoes`.
+    goat_sneakers writes `9.4.2026 - Sneakers`.
     """
     d = when.astimezone(EASTERN) if when else datetime.now(EASTERN)
     return f"{d.month}.{d.day}.{d.year}{suffix}"
@@ -276,14 +278,38 @@ class GoatSheets:
             out[title] = value_range.get("values") or []
         return out
 
+    async def template_header(self) -> list[Any]:
+        """Row 1 of the template tab, the header every new batch tab is copied with.
+
+        By data filter because the template tab is known by its gid, not its title.
+        """
+        self._require_configured()
+        data = await self._request(
+            "POST",
+            f"{SHEETS}/{self.template_file_id}/values:batchGetByDataFilter",
+            "values.batchGetByDataFilter",
+            json={
+                "dataFilters": [{"gridRange": {
+                    "sheetId": self.template_tab_id, "startRowIndex": 0, "endRowIndex": 1,
+                }}],
+                "valueRenderOption": "UNFORMATTED_VALUE",
+                "majorDimension": "ROWS",
+            },
+        )
+        ranges = data.get("valueRanges") or [{}]
+        values = (ranges[0].get("valueRange") or {}).get("values") or [[]]
+        return values[0]
+
     # -- writes ------------------------------------------------------------
 
     async def create_tab(self, desired_title: str) -> dict[str, Any]:
         """Copy the template tab into the spreadsheet and rename it.
 
-        copyTo rather than duplicating a local template tab, so a column change on
-        the template (STV and Denied were added this way) reaches the next batch
-        with no deploy. The copy arrives as "Copy of <template>", hence the rename.
+        copyTo rather than duplicating a local template tab, so a formatting or
+        validation change on the template reaches the next batch with no deploy. A
+        column change needs the code's layout changed with it: the poller checks
+        template_header first. The copy arrives as "Copy of <template>", hence the
+        rename.
 
         Titles must be unique within a spreadsheet, so a second batch on the same
         day becomes `9.4.2026 (2)`.

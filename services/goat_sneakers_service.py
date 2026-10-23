@@ -1,4 +1,4 @@
-"""GOAT Sneakers row building. One row per PARENT listing, 13 fixed columns.
+"""GOAT Sneakers row building. One row per PARENT listing, 12 fixed columns.
 
 The second GOAT-family platform. The flow is goat's and goat_poller runs both; only
 the sheet layout is different, and this module holds that layout plus the SellerCloud
@@ -6,8 +6,9 @@ quantity export its Qty column needs. Everything shared
 (the lookups, the brand gate, the gender map, the cell cleaning, the read-back) lives
 in goat_service and is used from there under this platform's own id.
 
-What the Shoes layout drops from goat's 20 columns, and why it matters here:
+What the Sneakers layout drops from goat's 20 columns, and why it matters here:
 
+    STV                          so the 1nventory sync never adds the gsync tag
     Main Color                   so there is no colour mapping to require
     Size Range, Size Unit        so a sizing scheme needs no GOAT code
     Season, Product Type, Composition, Care Instructions, Country of Manufacture
@@ -26,8 +27,9 @@ and adds:
              (load_quantities), not stored on the listing. A size with none is left
              out of Sizes, and a product with none at all fails its row.
 
-Columns A..E are the same five goat reads back (STV, Denied, SKU (GOAT), Style Code,
-Custom SKU), which is what lets the read-back and the 1nventory sync run unchanged.
+Columns A..D are four of the five goat reads back (Denied, SKU (GOAT), Style Code,
+Custom SKU). The read-back finds them by header name and reads a missing STV as
+unticked, which is what lets it and the 1nventory sync run unchanged.
 """
 
 from dataclasses import dataclass
@@ -44,8 +46,8 @@ LABEL: Final = "GOAT Sneakers"
 
 # Column order IS the sheet. Verified against the live template tab
 # ("PT Sheet Template - Goat Sneakers", gid 0) on 2026-10-14, after Qty was added back.
+# STV removed 2026-10-23 at the user's request.
 SHEET_HEADERS: Final[tuple[str, ...]] = (
-    "STV",
     "Denied",
     "SKU (GOAT)",
     "Style Code",
@@ -85,7 +87,6 @@ _NO_SCHEME: Final = SizingScheme(goat_code=None, region_code=None)
 class GoatSneakersRow:
     """One sheet row. Field order matches SHEET_HEADERS exactly."""
 
-    stv: bool = False
     denied: bool = False
     goat_sku: str = ""
     style_code: str = ""

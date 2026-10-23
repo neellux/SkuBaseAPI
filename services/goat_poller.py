@@ -109,10 +109,14 @@ class GoatVariant:
     # and the poller's own cadence.
     config_section: str
     poller_section: str
-    # Appended to the dated tab title, so two platforms can share one spreadsheet.
+    # Appended to the dated tab title and the email subject, so two platforms can share
+    # one spreadsheet.
     tab_suffix: str
     default_sources: Mapping[str, str]
     build_row: Callable[[str, Mapping[str, Any], goat_service.GoatLookups], Any]
+    # The columns build_row's cells are written under, in order. A batch is only written
+    # when the template's header starts with exactly these (see _build_and_write_batch).
+    sheet_headers: tuple[str, ...]
     # BasePoller turns a poller ON when its config section is missing. goat keeps that
     # (its config comment documents it). A variant added later must not inherit it: a
     # deploy that reaches a server before its config does would start a poller with no
@@ -136,6 +140,7 @@ GOAT = GoatVariant(
     tab_suffix="",
     default_sources=goat_service.DEFAULT_SOURCES,
     build_row=goat_service.build_row,
+    sheet_headers=goat_service.SHEET_HEADERS,
     enabled_without_config=True,
 )
 
@@ -145,9 +150,10 @@ GOAT_SNEAKERS = GoatVariant(
     name="GoatSneakersPoller",
     config_section="goat_sneakers",
     poller_section="goat_sneakers_poller",
-    tab_suffix=" - Shoes",
+    tab_suffix=" - Sneakers",
     default_sources=goat_sneakers_service.DEFAULT_SOURCES,
     build_row=goat_sneakers_service.build_row,
+    sheet_headers=goat_sneakers_service.SHEET_HEADERS,
     enabled_without_config=False,
     load_quantities=goat_sneakers_service.load_quantities,
 )
@@ -428,6 +434,10 @@ class GoatPoller(BasePoller):
             return {"submission_count": 0, "product_import_id": import_id}
 
         try:
+            # Cells are written by position, so a template whose columns no longer match
+            # this code's layout would put every value under the wrong header. That is
+            # what a template edited ahead of (or behind) a deploy looks like.
+            await self._check_template_header()
             tab = await self.sheets.create_tab(tab_title_for(suffix=self.variant.tab_suffix))
         except (GoatTransientError, GoatPermanentError) as exc:
             logger.warning("%s: tab creation failed: %s", self.tag, exc.detail)
@@ -469,6 +479,19 @@ class GoatPoller(BasePoller):
         await self._notify_batch_ready(tab, written, import_id)
         return {"submission_count": written, "product_import_id": import_id,
                 "sheet_url": tab["sheet_url"]}
+
+    async def _check_template_header(self) -> None:
+        """Raise unless the template's header starts with this variant's columns.
+
+        Columns to the right of ours are allowed: nothing is written there.
+        """
+        expected = list(self.variant.sheet_headers)
+        header = [str(name).strip() for name in await self.sheets.template_header()]
+        if header[: len(expected)] != expected:
+            raise GoatPermanentError(
+                f"{self.tag}: the sheet template's columns do not match this version",
+                detail=f"template header {header}, expected {expected}",
+            )
 
     async def _batch_upload_pending(self, force: bool = False) -> dict[str, Any]:
         import_id, ids = await self.begin_batch(force=force)
