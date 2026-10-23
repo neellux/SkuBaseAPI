@@ -40,14 +40,18 @@ from typing import Any, Mapping, Sequence
 import httpx
 from tortoise import connections
 
+from config import config
 from models.db_models import AppSettings
 from services.external_listing_service import ExternalListingService
+from services.goat_service import validate_goat_sku
 from services.sellercloud_service import GENDER_MAPPING, sellercloud_service
 from services.shopify_admin import ShopifyAdmin
 from services.shopify_client import (
     ShopifyError,
     ShopifySemanticError,
+    enable_writes,
     get_shopify_client,
+    writes_enabled,
 )
 from services.template_render import render_template, resolve_field_template
 
@@ -113,6 +117,22 @@ PRODUCT_STATUS = "ACTIVE"
 DRAFT_STATUS = "DRAFT"
 OPTION_NAME = "Size"
 INVENTORY_POLICY = "DENY"
+
+# The parent's GOAT ID and STV, from SkuBase's GOAT record (external_listing_ids;
+# external_meta.stv). Each platform id is also its config section: metafield namespace and
+# key, gsync tag, and the `execute` switch GOAT's stage 3 obeys. No parent is on both
+# (prod, 2026-10-23), and a delist deletes the row. GOAT Sneakers has no STV.
+GOAT_PLATFORMS: tuple[str, ...] = ("goat", "goat_sneakers")
+STV_PLATFORMS: tuple[str, ...] = ("goat",)
+_GOAT_ID_SQL = """
+SELECT platform_id, external_id,
+       COALESCE(external_meta -> 'stv' = 'true'::jsonb, false) AS stv
+  FROM external_listing_ids
+ WHERE platform_id = ANY($1::text[]) AND level = 'parent' AND parent_sku = $2
+   AND COALESCE(external_id, '') <> ''
+ ORDER BY updated_at DESC
+ LIMIT 1
+"""
 
 # Used when app_settings.field_templates has no "1nventory" key yet. The description is
 # byte-for-byte the SellerCloud template, which is not a coincidence: the AppScript reads
@@ -744,6 +764,7 @@ class OneInventoryService:
 
         stage = "writeback"
         result["writeback"] = await self._write_back(result)
+        result["goat"] = await self._link_goat(admin, result["product_gid"], product_id)
 
         # Read the counts back off `result`, NOT from locals. The leave-alone branch never
         # runs the publish, so `on`/`available` are unbound there and referencing them
@@ -777,6 +798,78 @@ class OneInventoryService:
         if outcome in ("flipped", "untagged"):
             logger.info("1inventory: %s moved off ESSX; %s %s", parent_sku, gid, outcome)
         return outcome
+
+    async def _link_goat(
+        self, admin: ShopifyAdmin, gid: str, parent_sku: str
+    ) -> dict[str, Any] | None:
+        """Put the parent's GOAT ID on the product as goat.goat_sku, and gsync when its GOAT
+        record says STV, as GOAT's stage 3 does.
+
+        Stage 3 links a product only while the GOAT submission waits for one, so a GOAT ID
+        saved by hand or backfilled, or a product created again after a delete, would stay
+        unlinked. gsync is only ever added: a record without STV leaves the tag as it is.
+
+        Returns {"goat_sku", "previous", "platform", "gsync"} when something was written
+        (gsync True when the tag was added), {"error"} when a write failed, None when there
+        was nothing to write. Never raises: the product is listed.
+        """
+        try:
+            rows = await connections.get("default").execute_query_dict(
+                _GOAT_ID_SQL, [list(GOAT_PLATFORMS), parent_sku]
+            )
+            if not rows:
+                return None
+            platform_id, raw, stv = rows[0]["platform_id"], rows[0]["external_id"], rows[0]["stv"]
+            goat_sku = validate_goat_sku(raw)
+            if not goat_sku:
+                logger.warning(
+                    "1inventory: %s's %s ID %r is not usable, not written to %s",
+                    parent_sku, platform_id, raw, gid,
+                )
+                return None
+            settings = config.get(platform_id, {})
+            if not settings.get("execute", False):
+                logger.warning(
+                    "1inventory: [%s] execute is false, %s's GOAT ID not written to %s",
+                    platform_id, parent_sku, gid,
+                )
+                return None
+            namespace = settings.get("metafield_namespace", "goat")
+            key = settings.get("metafield_key", "goat_sku")
+            tag = settings.get("gsync_tag", "gsync")
+            product = await admin.product_metafield(gid, namespace, key) or {}
+            field = product.get("metafield") or {}
+            previous = field.get("value")
+            set_id = previous != goat_sku
+            add_tag = (
+                bool(stv) and platform_id in STV_PLATFORMS
+                and tag not in (product.get("tags") or [])
+            )
+            if not (set_id or add_tag):
+                return None
+            if not writes_enabled():
+                enable_writes(f"1nventory submit, [{platform_id}] execute=true")
+            if set_id:
+                failures = await admin.set_metafields([{
+                    "ownerId": gid,
+                    "namespace": namespace,
+                    "key": key,
+                    "type": field.get("type") or "single_line_text_field",
+                    "value": goat_sku,
+                }])
+                if failures:
+                    raise RuntimeError(next(iter(failures.values())))
+            if add_tag:
+                await admin.add_tags(gid, [tag])
+        except Exception as exc:                                        # noqa: BLE001
+            logger.error("1inventory: %s's GOAT link not written to %s: %s", parent_sku, gid, exc)
+            return {"error": str(exc)[:300]}
+        logger.info(
+            "1inventory: %s GOAT ID %s -> %s%s on %s",
+            parent_sku, previous, goat_sku, ", gsync added" if add_tag else "", gid,
+        )
+        return {"goat_sku": goat_sku, "previous": previous, "platform": platform_id,
+                "gsync": add_tag}
 
     async def _create(
         self,
@@ -1049,6 +1142,7 @@ class OneInventoryService:
                 "published": result.get("published"),
                 "writeback_ok": len(writeback.get("ok") or []),
                 "writeback_failed": len(writeback.get("failed") or []),
+                "goat": result.get("goat"),
             },
         )
 

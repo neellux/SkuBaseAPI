@@ -673,13 +673,18 @@ class GoatPoller(BasePoller):
             #
             # This runs at the read-back, not at submit, which is the right moment:
             # a row parked in the sheet with no SKU (GOAT) yet is not on GOAT.
+            #
+            # stv is what a 1nventory submit re-applies as gsync, so it is stored only
+            # from a tab that has the column. GOAT Sneakers has no STV, so its rows
+            # carry none rather than an unticked default.
+            has_stv = goat_service.COL_STV in index
             await ExternalListingService.record(
                 self.platform_id,
                 [
                     {"level": "parent", "sku": info["parent_sku"],
                      "parent_sku": info["parent_sku"],
                      "external_id": info["goat_sku"],
-                     "external_meta": {"stv": info["stv"]}}
+                     "external_meta": {"stv": info["stv"]} if has_stv else {}}
                     for info in approved.values()
                     if info.get("parent_sku")
                 ],

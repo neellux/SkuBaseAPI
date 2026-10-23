@@ -183,6 +183,9 @@ _INVISIBLE = re.compile(r"[​‌‍⁠﻿\xa0]")
 # GOAT SKUs observed on the 1nventory store look like `FG05S18D 99LN 0099`.
 _GOAT_SKU_ALLOWED = re.compile(r"^[A-Za-z0-9 ._/-]+$")
 MAX_GOAT_SKU_LENGTH: Final = 64
+# A numeric GOAT SKU that went through a spreadsheet as a float: `198402265506.0`. 71 of
+# them were on the 1nventory store until 2026-10-23.
+_FLOAT_GOAT_SKU = re.compile(r"^(\d+)\.0+$")
 
 
 def clean_cell(value: Any) -> str:
@@ -627,6 +630,7 @@ def validate_goat_sku(raw: Any) -> str | None:
     value = clean_cell(raw)
     if not value:
         return None
+    value = _FLOAT_GOAT_SKU.sub(r"\1", value)
     if len(value) > MAX_GOAT_SKU_LENGTH:
         logger.warning("GOAT: ignoring over-long GOAT SKU (%d chars)", len(value))
         return None
