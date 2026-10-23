@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import traceback
+from enum import StrEnum
 from typing import Any, Dict, Iterable, List, Optional
 
 import httpx
@@ -231,6 +232,20 @@ COUNTRY_CODE_MAP = country_codes = {
 }
 
 
+class GrailedStage(StrEnum):
+    """platform_status values of a Grailed submission, kept here so the poller and any
+    label map agree (as GoatStage does for GOAT).
+
+    `submitting` and `sent` are both status `processing`: `submitting` is the claim-to-
+    AppScript window the stale sweep may requeue; `sent` means the AppScript accepted the
+    rows and the submission waits for Grailed's own result file, with no timeout.
+    """
+
+    SUBMITTING = "submitting"
+    SENT = "sent"
+    LISTED = "listed"
+
+
 def presence_rows(
     parent_sku: Optional[str],
     child_skus: Iterable[Optional[str]],
@@ -401,8 +416,8 @@ class GrailedService:
             if response_data.get("success"):
                 submission.status = "success"
                 added_refs = response_data.get("added_references", [])
-                if added_refs:
-                    submission.external_id = added_refs
+                # The object shape grailed_poller writes, so readers see one shape.
+                submission.external_id = {"references": list(added_refs or [])}
                 await submission.save()
                 # added_references omits children that were merely refreshed in
                 # place, so the row set is built from the products actually sent,

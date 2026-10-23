@@ -26,10 +26,13 @@ step called `listed`:
   sellercloud  the submit call is synchronous and SellerCloud accepts the product
                outright, so the handover IS the go-live.
   1nventory    same shape: the Shopify write returns the product_gid.
-  grailed      the AppScript writes the row to the sheet and nothing ever calls
-               back, so the sheet write is the only signal that exists. Recorded
-               deliberately (operator decision, 2026-10-14) rather than left null:
-               it is the best proxy available, and listed_at_source says so.
+  grailed      async. The AppScript writes the row to the sheet (`sent`); Grailed's
+               own processor then reads the sheet about every two hours and writes a
+               result file to Drive, and `listed` is recorded, dated at that run, once
+               a result shows the listing was created (services/grailed_poller.py,
+               results check). With results tracking off, `listed` follows `sent` at
+               accept, which is the old sheet-write proxy (operator decision,
+               2026-10-14).
   spo          async. The import poller confirms the upload COMPLETE, and only
                then is the product live.
   ebay         async, and `published` only means SellerCloud QUEUED the publish
@@ -47,12 +50,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-# The outbound call returned / the file was handed over. Three platforms submit
+# The outbound call returned / the file was handed over. Two platforms submit
 # synchronously, so their handover and their go-live are the same step.
 HANDOFF_STEP: dict[str, str] = {
     "sellercloud": "listed",
     "1nventory": "listed",
-    "grailed": "listed",
+    "grailed": "sent",
     "spo": "products_uploading",
     "ebay": "submitting",
     "goat": "sheet_written",

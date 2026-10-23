@@ -1154,6 +1154,15 @@ class ImportSummary(BaseModel):
     status_counts: Dict[str, int] = Field(
         default_factory=dict, description="Count of submissions per status"
     )
+    waiting_count: int = Field(
+        0,
+        description="Grailed rows the AppScript accepted that wait on Grailed's results "
+        "(status processing, platform_status sent). Already inside status_counts.processing; "
+        "0 for every other platform",
+    )
+    oldest_waiting_at: Optional[datetime] = Field(
+        None, description="Earliest platform_meta.uploaded_at among those waiting rows"
+    )
     created_at: Optional[datetime] = Field(
         None,
         description="When the import was uploaded to the platform (falls back to earliest submission created_at for legacy imports)",
@@ -1249,9 +1258,15 @@ class ImportListingDetail(BaseModel):
     )
     item_ids: Optional[Dict[str, str]] = Field(
         None,
-        description="Per-child-SKU platform item id ({sku: id}); eBay item numbers, which "
+        description="Per-child-SKU platform item id ({sku: id}). eBay item numbers, which "
         "the UI counts against `skus` to show how much of an import is actually listed "
-        "before an operator downloads its image revise file",
+        "before an operator downloads its image revise file; Grailed listing ids of the "
+        "sizes Grailed reported live, on success and failure alike",
+    )
+    uploaded_at: Optional[datetime] = Field(
+        None,
+        description="When the platform accepted this row's batch (platform_meta.uploaded_at); "
+        "the UI counts a waiting Grailed row's age from it",
     )
     revised_skus: Optional[List[str]] = Field(
         None,

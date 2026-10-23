@@ -630,6 +630,8 @@ async def get_submission_status(
             "error_display": sub.error_display,
             "platform_status": sub.platform_status,
             "external_id": sub.external_id,
+            # The batch accept time, so the pill can say how long a row has waited.
+            "uploaded_at": (sub.platform_meta or {}).get("uploaded_at"),
         }
         for pid, sub in platforms.items()
     }

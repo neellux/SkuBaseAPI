@@ -629,6 +629,46 @@ class PlatformFlushState(Model):
         return f"PlatformFlushState({self.platform})"
 
 
+class GrailedResultRun(Model):
+    """One Grailed processor run read from the Grailed processing Drive folder.
+
+    A record of the runs the results check has read, one row per run. It is not what decides
+    re-reading: each waiting submission has its own cursor (platform_meta
+    grailed_results_cursor and its evidence), so a run can be read again for a row that was
+    behind it and is still recorded once. Created by API/migrations/add_grailed_result_runs.sql;
+    see services/grailed_poller.py and docs/grailed_integration.md.
+    """
+
+    id = fields.BigIntField(pk=True)
+    run_key = fields.CharField(
+        max_length=32, unique=True, description='From the file names, e.g. "2026-10-15--06h30" (UTC)'
+    )
+    run_at = fields.DatetimeField(
+        description="Earlier Drive createdTime of the run's two files; the name stamp when missing"
+    )
+    success_file_id = fields.CharField(max_length=128, null=True)
+    errors_file_id = fields.CharField(max_length=128, null=True)
+    success_rows = fields.IntField(null=True, description="NULL = file missing, 0 = empty")
+    error_rows = fields.IntField(
+        null=True, description="NULL = file missing or unusable (a partial run), 0 = empty"
+    )
+    date_folder = fields.CharField(max_length=32, null=True)
+    status = fields.CharField(
+        max_length=16,
+        default="processed",
+        description="processed | partial (error file unusable, its errors read as unknown) | unreadable",
+    )
+    detail = fields.TextField(null=True)
+    processed_at = fields.DatetimeField(auto_now_add=True)
+    created_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "grailed_result_runs"
+
+    def __str__(self):
+        return f"GrailedResultRun({self.run_key})"
+
+
 class InternalPlatformAction(StrEnum):
     """Actions the consignment pipeline can take against a parent product.
 

@@ -92,13 +92,14 @@ _APPEND_STEP_SQL = (
 )
 
 
-def new_step(step: str, **details: Any) -> dict[str, Any]:
+def new_step(step: str, *, at: datetime | None = None, **details: Any) -> dict[str, Any]:
     """A single step entry, for seeding platform_meta at row creation.
 
     Used where record_step cannot be: inside the transaction that INSERTs the
-    submission, a second connection would block on the uncommitted row.
+    submission, a second connection would block on the uncommitted row. `at` is when
+    the step happened, now unless given.
     """
-    entry: dict[str, Any] = {"step": step, "at": datetime.now(timezone.utc).isoformat()}
+    entry: dict[str, Any] = {"step": step, "at": (at or datetime.now(timezone.utc)).isoformat()}
     entry.update({k: v for k, v in details.items() if v is not None})
     return entry
 
@@ -108,9 +109,14 @@ async def record_step(
     step: str,
     *,
     meta: dict[str, Any] | None = None,
+    at: datetime | None = None,
     **details: Any,
 ) -> None:
     """Append one `step` entry to each submission's platform_meta.steps.
+
+    `at` is when the step happened, now unless given. The Grailed results check passes the
+    time of the processor run that reported the listing, so a check that catches up hours
+    later still dates the go-live correctly; the stamped columns use the same instant.
 
     `meta` merges into the top level of platform_meta, for keys read directly by
     the dashboard (product_import_id, uploaded_at, file_name, sku_errors).
@@ -133,7 +139,7 @@ async def record_step(
     # infers the type of a $n::timestamptz parameter and rejects a string for it; going
     # through the entry's own text is also what guarantees the column and the timeline
     # can never name different instants.
-    entry = new_step(step, **details)
+    entry = new_step(step, at=at, **details)
     stamped_at = datetime.fromisoformat(entry["at"])
 
     conn = connections.get("default")
@@ -184,3 +190,20 @@ def last_step(submission: Any) -> str | None:
         return None
     entry = steps[-1]
     return entry.get("step") if isinstance(entry, dict) else None
+
+
+def first_step_at(platform_meta: dict[str, Any] | None, step: str) -> datetime | None:
+    """When the earliest `step` entry on a submission was recorded, or None if it has none.
+
+    Grailed's results check counts results from the attempt's first `sending`: a resend
+    after an interrupted flush records another one, but the first call may have landed.
+    """
+    steps = (platform_meta or {}).get("steps") or []
+    if not isinstance(steps, list):
+        return None
+    times = [
+        datetime.fromisoformat(entry["at"])
+        for entry in steps
+        if isinstance(entry, dict) and entry.get("step") == step and entry.get("at")
+    ]
+    return min(times) if times else None

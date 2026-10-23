@@ -29,6 +29,7 @@ from services import platform_reconcile_service
 from services import spo_service as spo_service_module
 from services.ebay_poller import ebay_poller
 from services.grailed_poller import grailed_poller
+from services.grailed_service import GrailedStage
 from services.goat_poller import GOAT_POLLERS
 from services.scheduled_flush import schedule_summary
 from services.spo_poller import spo_poller
@@ -88,6 +89,37 @@ def _effective_import_status(status_counts: dict[str, int] | None) -> str:
     if counts.get(SubmissionStatus.FAILED, 0) > 0:
         return SubmissionStatus.FAILED
     return SubmissionStatus.SUCCESS
+
+
+def _parse_iso(raw: Any) -> datetime | None:
+    """An ISO timestamp from platform_meta, or None when it is missing or malformed."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grailed_waiting(group: list[ListingSubmission]) -> tuple[int, datetime | None]:
+    """(count, oldest accept time) of an import's rows waiting on Grailed's result files.
+
+    status_counts counts by status only, and `submitting` (still being sent) and `sent`
+    (accepted, waiting on Grailed) are both processing, so the wait is counted from
+    platform_status. The status check is not redundant: a failure decided from the results
+    keeps platform_status `sent`.
+    """
+    waiting = [
+        s
+        for s in group
+        if s.status == SubmissionStatus.PROCESSING and s.platform_status == GrailedStage.SENT
+    ]
+    started = [
+        at
+        for at in (_parse_iso((s.platform_meta or {}).get("uploaded_at")) for s in waiting)
+        if at is not None
+    ]
+    return len(waiting), min(started, default=None)
 
 
 async def _get_platform_settings_for(platform_id: str) -> dict[str, Any]:
@@ -221,18 +253,12 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         batch_number = None
         for s in group:
             meta = s.platform_meta or {}
-            raw = meta.get("uploaded_at")
-            if raw:
-                try:
-                    uploaded_ats.append(datetime.fromisoformat(raw))
-                except (TypeError, ValueError):
-                    pass
+            if (uploaded := _parse_iso(meta.get("uploaded_at"))) is not None:
+                uploaded_ats.append(uploaded)
             for step in reversed(meta.get("steps") or []):
                 if step.get("step") in _BATCH_CLAIM_STEPS and step.get("at"):
-                    try:
-                        batch_claimed_ats.append(datetime.fromisoformat(step["at"]))
-                    except (TypeError, ValueError):
-                        pass
+                    if (claimed := _parse_iso(step["at"])) is not None:
+                        batch_claimed_ats.append(claimed)
                     break
             if not stored_file_name and meta.get("file_name"):
                 stored_file_name = meta["file_name"]
@@ -253,6 +279,10 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
         if not file_name and platform_id == "spo" and created_at is not None:
             file_name = f"spo_products_{created_at.strftime('%Y%m%d_%H%M%S')}.xlsx"
 
+        waiting_count, oldest_waiting_at = (
+            _grailed_waiting(group) if platform_id == "grailed" else (0, None)
+        )
+
         imports.append(
             ImportSummary(
                 import_id=import_id,
@@ -262,6 +292,8 @@ async def _aggregate_platform(platform_id: str) -> dict[str, Any]:
                 file_name=file_name,
                 batch_number=batch_number,
                 status_counts=dict(status_counts),
+                waiting_count=waiting_count,
+                oldest_waiting_at=oldest_waiting_at,
                 created_at=created_at,
                 updated_at=max((s.updated_at for s in group), default=None),
             )
@@ -546,8 +578,8 @@ def _build_import_detail(
             data = listing.data or {}
             title = data.get("title") or data.get("name")
             skus = list((data.get("child_size_overrides") or {}).keys())
-        # eBay rows hold an object here; Grailed rows hold a plain list of sheet
-        # references, which carries no ids.
+        # eBay and results-tracked Grailed rows hold an object here; legacy Grailed rows
+        # hold a plain list of sheet references, which carries no ids.
         external = sub.external_id if isinstance(sub.external_id, dict) else {}
         details.append(
             ImportListingDetail(
@@ -564,6 +596,7 @@ def _build_import_detail(
                 image_count=(image_counts or {}).get(product_id or "", 0),
                 item_ids=external.get("item_ids") or None,
                 revised_skus=external.get("revised") or None,
+                uploaded_at=_parse_iso((sub.platform_meta or {}).get("uploaded_at")),
                 updated_at=sub.updated_at,
                 reviewed_at=sub.reviewed_at,
             )

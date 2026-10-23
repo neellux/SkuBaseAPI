@@ -4,12 +4,13 @@ The second input to submit gating, beside platform_settings.<p>.allow_resubmit.
 A row asserts PRESENCE and only optionally carries a platform id, because not
 every platform gives us one:
 
-    grailed      child rows carry the sheet key "<child sku>_<MMDDYYYY>", our
-                 own sku plus the sheet batch date: a Google Sheet row key, not a
-                 Grailed id, but the only one SkuBase has. addListings returns
-                 one per row it adds (added_references), and both Grailed capture
-                 paths store it on the child row (utils/grailed_keys.py). Rows
-                 from before that are filled once by
+    grailed      child rows carry the real Grailed listing id once Grailed's own
+                 result file reports the size live (results tracking,
+                 services/grailed_poller.py), and until then, or for a size never
+                 reported, the sheet key "<child sku>_<MMDDYYYY>": our own sku plus
+                 the sheet batch date, a Google Sheet row key from addListings'
+                 added_references (utils/grailed_keys.py). Rows from before keys
+                 were captured are filled once by
                  scripts/backfill_grailed_sheet_keys.py. The parent row has none.
     ebay         real item ids, child level only; submissions keep
                  external_id.item_ids{sku}
